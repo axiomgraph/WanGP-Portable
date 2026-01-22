@@ -1,7 +1,10 @@
 name: Build WanGP Portable
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - sage-attention
+      workflow_dispatch:
 
 jobs:
   build-portable:
@@ -53,6 +56,26 @@ jobs:
           
           # Create folders for packages
           mkdir python_embedded\Lib\site-packages
+
+      # Clone python3 headers/libs and merge into embedded Python
+      - name: Add Include and Libs to Embedded Python
+        shell: pwsh
+        run: |
+          git clone https://github.com/axiomgraph/python3.git python3-src
+
+          if (Test-Path python3-src\Include) {
+          Copy-Item python3-src\Include python_embedded\Include -Recurse -Force
+          Write-Host "✅ Copied Include folder."
+          } else {
+          Write-Host "⚠️ Include folder not found in python3 repo."
+          }
+
+          if (Test-Path python3-src\Libs) {
+          Copy-Item python3-src\Libs python_embedded\Libs -Recurse -Force
+          Write-Host "✅ Copied Libs folder."
+          } else {
+          Write-Host "⚠️ Libs folder not found in python3 repo."
+          }
 
       # Install pip directly into Lib\site-packages
       - name: Install pip
