@@ -89,6 +89,17 @@ jobs:
         run: |
           python_embedded\python.exe -m pip install --upgrade pip 
           python_embedded\python.exe -m pip install torch==2.7.1 torchvision torchaudio --index-url ${{ env.TORCH_INDEX }}
+
+      # Install Triton for Windows (required for SageAttention)
+      - name: Install triton-windows
+        run: |
+          python_embedded\python.exe -m pip install triton-windows
+
+      # Install SageAttention (CUDA 12.8, Torch 2.7.1, Python 3.10)
+      - name: Install SageAttention
+        run: |
+          python_embedded\python.exe -m pip install https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows/sageattention-2.2.0+cu128torch2.7.1-cp310-cp310-win_amd64.whl
+
           
       # Install FilterPy
       - name: Install FilterPy
