@@ -26,7 +26,22 @@ WanGP supports the Wan (and derived models), Hunyuan Video, Flux, Qwen, Z-Image,
 
 ## 🔥 Latest Updates : 
 
-### January 19th 2026: WanGP v10.42, The Cost Saver
+### January 23th 2026: WanGP v10.50, Music for your Hearts
+
+WanGP Special *TTS* (Text To Speech) Release:
+
+- **Heart Mula**: *Suno* quality song with lyrics on your local PC. You can generate up to 4 min of music.
+
+- **Qwen 3 TTS**: you can either do *Voice Cloning*, *Generate a Custom Voice based on a Prompt* or use a *Predefined Voice*
+
+- **TTS Features**:
+   - **Early stop** : you can abort a gen, while still keeping what has been generated (will work only for TTS models which are *Autoregressive Models*, no need to ask that for Image/Video gens which are *Diffusion Models*)
+   - **Specialized Prompt Enhancers**: if you enter the prompt in Heart Mula *"a song about AI generation"*, *WanGP Prompt Enhancer* will generate the corresponding masterpiece for you. Likewise you can enhance "A speech about AI generation" when using Qwen3 TTS or ChatterBox.
+   - **Custom Output folder for Audio Gens**: you can now choose a different folder for the *Audio Outputs*
+   - **Default Memory Profile for Audio Models**: TTS models can get very slow if you use profile 4 (being autoregressive models, they will need to load all the layers one per one to generate one single audio token then rinse & repeat). On the other hand, they dont't need as much VRAM, so you can now define a more agressive profile (3+ for instance)
+
+
+### January 20th 2026: WanGP v10.43, The Cost Saver
 *GPUs are expensive, RAM is expensive, SSD are expensive, sadly we live now in a GPU & RAM poor.*
 
 WanGP comes again to the rescue:
@@ -44,12 +59,15 @@ WanGP comes again to the rescue:
 
 - **Flux 2 Klein 4B & 9B**: try these distilled models as fast as Z_Image if not faster but with out of the box image edition capabiltities
 
+- **Flux 2 & Qwen Outpainting + Lanpaint**: the inpaint mode of these models support now *outpainting* + more combination possible with *Lanpaint* 
+
 - **RAM Optimizations for multi minutes Videos**: processing, saving, spatial & Temporal upsampling very long videos should require much less RAM. 
 
 - **Text Encoder Cache**: if you are asking a Text prompt already used recently with the current model, it will be taken straight from a cache. The cache is optimized to consume little RAM. It wont work with certain models such as Qwen where the Text Prompt is combined internally with an Image.
 
 *update 10.41*: added Flux 2 klein\
-*update 10.42*: added RAM optimizations & Text Encoder Cache 
+*update 10.42*: added RAM optimizations & Text Encoder Cache\
+*update 10.43*: added outpainting for Qwen & Flux 2, Lanpaint for Flux 2
 
 ### January 15th 2026: WanGP v10.30, The Need for Speed ...
 
