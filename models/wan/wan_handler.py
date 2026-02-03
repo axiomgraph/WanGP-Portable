@@ -89,45 +89,45 @@ class family_handler():
         return {"wan":(0, "Wan2.1"), "wan2_2":(1, "Wan2.2") }
 
     @staticmethod
-    def register_lora_cli_args(parser):
+    def register_lora_cli_args(parser, lora_root):
         parser.add_argument(
             "--lora-dir-i2v",
             type=str,
-            default=os.path.join("loras", "wan_i2v"),
-            help="Path to a directory that contains Wan i2v Loras "
+            default=None,
+            help=f"Path to a directory that contains Wan i2v Loras (default: {os.path.join(lora_root, 'wan_i2v')})"
         )
         parser.add_argument(
             "--lora-dir",
             type=str,
-            default=os.path.join("loras", "wan"),
-            help="Path to a directory that contains Wan t2v Loras"
+            default=None,
+            help=f"Path to a directory that contains Wan t2v Loras (default: {os.path.join(lora_root, 'wan')})"
         )
         parser.add_argument(
             "--lora-dir-wan-1-3b",
             type=str,
-            default=os.path.join("loras", "wan_1.3B"),
-            help="Path to a directory that contains Wan 1.3B Loras"
+            default=None,
+            help=f"Path to a directory that contains Wan 1.3B Loras (default: {os.path.join(lora_root, 'wan_1.3B')})"
         )
         parser.add_argument(
             "--lora-dir-wan-5b",
             type=str,
-            default=os.path.join("loras", "wan_5B"),
-            help="Path to a directory that contains Wan 5B Loras"
+            default=None,
+            help=f"Path to a directory that contains Wan 5B Loras (default: {os.path.join(lora_root, 'wan_5B')})"
         )
         parser.add_argument(
             "--lora-dir-wan-i2v",
             type=str,
-            default=os.path.join("loras", "wan_i2v"),
-            help="Path to a directory that contains Wan i2v Loras"
+            default=None,
+            help=f"Path to a directory that contains Wan i2v Loras (default: {os.path.join(lora_root, 'wan_i2v')})"
         )
 
     @staticmethod
-    def get_lora_dir(base_model_type, args):
+    def get_lora_dir(base_model_type, args, lora_root):
         i2v = test_class_i2v(base_model_type) and not test_i2v_2_2(base_model_type)
-        wan_dir = getattr(args, "lora_dir_wan", None) or getattr(args, "lora_dir", None) or os.path.join("loras", "wan")
-        wan_i2v_dir = getattr(args, "lora_dir_wan_i2v", None) or getattr(args, "lora_dir_i2v", None) or os.path.join("loras", "wan_i2v")
-        wan_1_3b_dir = getattr(args, "lora_dir_wan_1_3b", None) or os.path.join("loras", "wan_1.3B")
-        wan_5b_dir = getattr(args, "lora_dir_wan_5b", None) or os.path.join("loras", "wan_5B")
+        wan_dir = getattr(args, "lora_dir_wan", None) or getattr(args, "lora_dir", None) or os.path.join(lora_root, "wan")
+        wan_i2v_dir = getattr(args, "lora_dir_wan_i2v", None) or getattr(args, "lora_dir_i2v", None) or os.path.join(lora_root, "wan_i2v")
+        wan_1_3b_dir = getattr(args, "lora_dir_wan_1_3b", None) or os.path.join(lora_root, "wan_1.3B")
+        wan_5b_dir = getattr(args, "lora_dir_wan_5b", None) or os.path.join(lora_root, "wan_5B")
 
         if i2v:
             return wan_i2v_dir
@@ -276,6 +276,8 @@ class family_handler():
                             ("flowmatch causvid", "causvid"),
                             ("lcm + ltx", "lcm"), ]
         })
+
+        extra_model_def["self_refiner"] = base_model_type in ["t2v_2_2", "i2v_2_2", "i2v", "t2v", "flf2v_720p"]
 
         if i2v:
             extra_model_def["motion_amplitude"] = True
@@ -785,7 +787,7 @@ class family_handler():
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
         if ui_defaults.get("sample_solver", "") == "": 
             ui_defaults["sample_solver"] = "unipc"
-
+        
         if settings_version < 2.24:
             if (model_def.get("multiple_submodels", False) or ui_defaults.get("switch_threshold", 0) > 0) and ui_defaults.get("guidance_phases",0)<2:
                 ui_defaults["guidance_phases"] = 2
@@ -860,6 +862,12 @@ class family_handler():
                 "sliding_window_size": 81, 
                 "sliding_window_overlap" : 4,
             })
+
+        if model_def.get("self_refiner",False) and settings_version < 2.47:
+            ui_defaults["self_refiner_setting"] = 0
+            ui_defaults["self_refiner_plan"] = ""
+            # ui_defaults["self_refiner_f_uncertainty"] = 0.2
+            # ui_defaults["self_refiner_certain_percentage"] = 0.999
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):

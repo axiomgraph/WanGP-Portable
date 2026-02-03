@@ -81,10 +81,15 @@ class family_handler():
 
         extra_model_def = {
             "image_outputs" : True,
-            "no_negative_prompt" : flux2 or not (flux_chroma or flux_chroma_radiance),
+            "no_negative_prompt" :  flux_chroma or flux_chroma_radiance,
             "flux-model": flux_model,
             "flux2": flux2,
         }
+        if flux_chroma or flux_chroma_radiance:
+            extra_model_def["guidance_max_phases"] = 1
+        else:
+            extra_model_def["NAG"] = True
+            extra_model_def["no_negative_prompt"] = False
         supports_inpaint = flux_kontext or flux_schnell or flux_dev or flux2
         if supports_inpaint:
             extra_model_def["inpaint_support"] = True
@@ -149,8 +154,6 @@ class family_handler():
             extra_model_def["profiles_dir"] = ["flux2_klein_4b"] if flux2_klein_4b else ["flux2_klein_9b"]
         else:
             extra_model_def["profiles_dir"] = [] if (flux_schnell or flux2) else ["flux"]
-        if flux_chroma or flux_chroma_radiance:
-            extra_model_def["guidance_max_phases"] = 1
         if flux_chroma_radiance:
             extra_model_def["radiance"] = True
         elif not flux_schnell and not flux2_klein:
@@ -260,41 +263,41 @@ class family_handler():
         return {"flux":(100, "Flux 1"), "flux2":(101, "Flux 2")}
 
     @staticmethod
-    def register_lora_cli_args(parser):
+    def register_lora_cli_args(parser, lora_root):
         parser.add_argument(
             "--lora-dir-flux",
             type=str,
-            default=os.path.join("loras", "flux"),
-            help="Path to a directory that contains flux images Loras"
+            default=None,
+            help=f"Path to a directory that contains flux images Loras (default: {os.path.join(lora_root, 'flux')})"
         )
         parser.add_argument(
             "--lora-dir-flux2",
             type=str,
-            default=os.path.join("loras", "flux2"),
-            help="Path to a directory that contains flux2 images Loras"
+            default=None,
+            help=f"Path to a directory that contains flux2 images Loras (default: {os.path.join(lora_root, 'flux2')})"
         )
         parser.add_argument(
             "--lora-dir-flux2-klein-4b",
             type=str,
-            default=os.path.join("loras", "flux2_klein_4b"),
-            help="Path to a directory that contains Flux 2 Klein 4B Loras"
+            default=None,
+            help=f"Path to a directory that contains Flux 2 Klein 4B Loras (default: {os.path.join(lora_root, 'flux2_klein_4b')})"
         )
         parser.add_argument(
             "--lora-dir-flux2-klein-9b",
             type=str,
-            default=os.path.join("loras", "flux2_klein_9b"),
-            help="Path to a directory that contains Flux 2 Klein 9B Loras"
+            default=None,
+            help=f"Path to a directory that contains Flux 2 Klein 9B Loras (default: {os.path.join(lora_root, 'flux2_klein_9b')})"
         )
 
     @staticmethod
-    def get_lora_dir(base_model_type, args):
+    def get_lora_dir(base_model_type, args, lora_root):
         if base_model_type == "flux2_klein_4b":
-            return args.lora_dir_flux2_klein_4b
+            return getattr(args, "lora_dir_flux2_klein_4b", None) or os.path.join(lora_root, "flux2_klein_4b")
         if base_model_type == "flux2_klein_9b":
-            return args.lora_dir_flux2_klein_9b
+            return getattr(args, "lora_dir_flux2_klein_9b", None) or os.path.join(lora_root, "flux2_klein_9b")
         if test_flux2(base_model_type):
-            return args.lora_dir_flux2
-        return args.lora_dir_flux
+            return getattr(args, "lora_dir_flux2", None) or os.path.join(lora_root, "flux2")
+        return getattr(args, "lora_dir_flux", None) or os.path.join(lora_root, "flux")
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
@@ -342,7 +345,7 @@ class family_handler():
                 "repoId" : "DeepBeepMeep/HunyuanVideo", 
                 "sourceFolderList" :  [  "clip_vit_large_patch14",   ],
                 "fileList" :[ 
-                                ["config.json", "merges.txt", "model.safetensors", "preprocessor_config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.json"],
+                                ["text_config.json", "merges.txt", "model.safetensors", "preprocessor_config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.json"],
                                 ]
                 },
                 {  
@@ -356,7 +359,7 @@ class family_handler():
                     {  
                     "repoId" : "DeepBeepMeep/Flux", 
                     "sourceFolderList" :  ["siglip-so400m-patch14-384"],
-                    "fileList" : [ ["config.json", "preprocessor_config.json", "model.safetensors"] ]   
+                    "fileList" : [ ["vision_config.json", "preprocessor_config.json", "model.safetensors"] ]   
                     }]
 
 
