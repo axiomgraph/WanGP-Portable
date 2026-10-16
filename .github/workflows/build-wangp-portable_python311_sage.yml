@@ -83,8 +83,10 @@ jobs:
       # Install core dependencies (Torch, SageAttention)
       - name: Install Torch
         run: |
-          python_embedded\python.exe -m pip install --upgrade pip 
-          python_embedded\python.exe -m pip install torch==2.10.0 torchvision torchaudio --index-url ${{ env.TORCH_INDEX }}
+          python_embedded\python.exe -m pip install --upgrade pip
+          python_embedded\python.exe -m pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url ${{ env.TORCH_INDEX }}
+          python_embedded\python.exe -c "import torch; print('Torch after installation:', torch.__version__)"
+
 
       # Install Triton for Windows (required for SageAttention)
       - name: Install triton-windows
@@ -104,7 +106,10 @@ jobs:
       # Install remaining requirements
       - name: Install requirements
         run: |
-          python_embedded\python.exe -m pip install -r WanGP-Portable\Wan2GP\requirements.txt
+          python_embedded\python.exe -m pip install -c torch-constraints.txt -r WanGP-Portable\Wan2GP\requirements.txt
+          python_embedded\python.exe -m pip show torch torchvision torchaudio
+          python_embedded\python.exe -m pip check
+
 
       # Verify PyTorch Versions
       - name: Verify PyTorch versions
