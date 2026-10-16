@@ -11,7 +11,7 @@ jobs:
      TORCH_INDEX: https://download.pytorch.org/whl/cu130
      
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
 
@@ -89,7 +89,7 @@ jobs:
       # Install Triton for Windows (required for SageAttention)
       - name: Install triton-windows
         run: |
-          python_embedded\python.exe -m pip install triton-windows
+          python_embedded\python.exe -m pip install -U "triton-windows>=3.6,<3.7"
 
       # Install SageAttention 
       - name: Install SageAttention
@@ -159,7 +159,7 @@ jobs:
             Get-ChildItem -Recurse -Filter *.7z
 
       - name: Create or Update Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.new_tag }}
           files: WanGP-Portable_Python311_Cu13_Sage.7z.*
