@@ -27,6 +27,8 @@ from diffusers.utils import BaseOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from diffusers.utils.torch_utils import randn_tensor
 
+from shared.kernels import vae_ops
+
 
 class Snake1d(nn.Module):
     """
@@ -43,24 +45,12 @@ class Snake1d(nn.Module):
         self.logscale = logscale
 
     def forward(self, hidden_states, preserve_input: bool = False):
+        """x + sin(a x)^2 / (b + 1e-9) through the shared Snake operation, in place on the input unless preserve_input."""
         shape = hidden_states.shape
         hidden_states = hidden_states.reshape(shape[0], shape[1], -1)
-
-        alpha = self.alpha if not self.logscale else torch.exp(self.alpha)
-        beta = self.beta if not self.logscale else torch.exp(self.beta)
-        inv_beta = (beta + 1e-9).reciprocal()
-
-        use_inplace = (not preserve_input) and (not torch.is_grad_enabled())
-        wave = torch.empty_like(hidden_states)
-        torch.mul(hidden_states, alpha, out=wave)
-        torch.sin_(wave)
-        wave.mul_(wave)
-        wave.mul_(inv_beta)
-        if use_inplace:
-            hidden_states.add_(wave)
-            return hidden_states.reshape(shape)
-        wave.add_(hidden_states)
-        return wave.reshape(shape)
+        if preserve_input:
+            hidden_states = hidden_states.clone()
+        return vae_ops.snake_(hidden_states, self.alpha, self.beta, log_scale=self.logscale).reshape(shape)
 
 
 class OobleckResidualUnit(nn.Module):

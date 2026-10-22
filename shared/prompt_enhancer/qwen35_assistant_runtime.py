@@ -13,9 +13,9 @@ from uuid import uuid4
 
 import torch
 
-from shared.llm_engines.nanovllm import SamplingParams
-from shared.llm_engines.nanovllm.engine.block_manager import BlockManager
-from shared.llm_engines.nanovllm.engine.sequence import Sequence, SequenceStatus
+from shared.llm_engines.lmgp import SamplingParams
+from shared.llm_engines.lmgp.engine.block_manager import BlockManager
+from shared.llm_engines.lmgp.engine.sequence import Sequence, SequenceStatus
 from shared.prompt_enhancer import qwen35_text
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 
@@ -920,7 +920,7 @@ class Qwen35AssistantRuntime:
         engine.reserve_runtime(prompt_len=max_context_tokens, max_tokens=max_new_tokens, cfg_scale=1.0, min_model_len=min_model_len)
         engine._ensure_llm()
         if engine._llm is None:
-            raise RuntimeError("Assistant NanoVLLM runtime is not available.")
+            raise RuntimeError("Assistant LM engine runtime is not available.")
         self._log(f"Assistant engine ready after reserve: {self._describe_engine_state(engine)}")
         return engine
 

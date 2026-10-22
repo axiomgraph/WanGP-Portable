@@ -5,9 +5,13 @@ import weakref
 from . import allocator
 
 _clients = weakref.WeakKeyDictionary()
+HEADROOM = 256 << 20  # the allocator leaves this much free beyond a new allocation (vram_headroom)
 
 
 def _reclaim(size, device):
+    # what the allocation of size bytes misses, the VRAM it may still take deducted (its size when the room did not refuse it)
+    room = allocator.room(device)
+    size = size + HEADROOM - room if room < size + HEADROOM else size
     freed = 0
     for client, _ in sorted(list(_clients.items()), key=lambda item: item[1]):
         freed += client.on_pressure(max(0, size - freed))

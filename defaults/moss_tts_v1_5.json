@@ -1,0 +1,23 @@
+{
+    "model": {
+        "name": "TTS MOSS-TTS v1.5 8B",
+        "architecture": "moss_tts_v1_5",
+        "description": "Multilingual speech and optional reference voice cloning, with explicit pauses and pronunciation control. Native 24 kHz mono audio.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/MOSS_TTS_v1_5_8B_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/MOSS_TTS_v1_5_8B_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Hello! The morning light is coming through the window, and it is a wonderful time to begin something new.",
+    "alt_prompt": "English",
+    "audio_prompt_type": "",
+    "model_mode": 0,
+    "duration_seconds": 30,
+    "pause_seconds": 0.2,
+    "temperature": 1.7,
+    "top_k": 25,
+    "top_p": 0.8,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 1,
+    "prompt_enhancer": ""
+}

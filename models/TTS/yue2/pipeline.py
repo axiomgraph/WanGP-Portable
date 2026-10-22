@@ -9,12 +9,12 @@ from mmgp import offload
 from tqdm import tqdm
 from transformers import Qwen3Config
 
-from shared.llm_engines.nanovllm.token_generation import TokenGenerationEngine
+from shared.llm_engines.lmgp.token_generation import TokenGenerationEngine
 from shared.utils.loras_mutipliers import update_loras_slists
 
 from .modules import YuE2Config
 from .protocol import ABC_END, MUSIC_END, CONTEXT, GenerationConfig, SongRequest, token_prefixes, negative_prefix, chunk_ranges
-from .composition import composition_source
+from .composition import read_abc, resolve_source, validate_source
 from .sampling import YuE2LogitsProcessor
 from .tokenization_yue2 import YuE2TextTokenizer
 from .transformer import YuE2AR, YuE2Acoustic
@@ -27,11 +27,11 @@ class YuE2Pipeline:
     sample_rate = 48000
     frame_rate = 25
 
-    def __init__(self, ar_weights, acoustic_weights, tokenizer_path, vae_weights, vae_config, dtype, vae_dtype, lm_decoder_engine, scoring_checkpoint=None, hum_weights=None, hum_encoder_weights=None):
+    def __init__(self, ar_weights, acoustic_weights, tokenizer_path, vae_weights, vae_config, dtype, vae_dtype, lm_features, scoring_checkpoint=None, hum_weights=None, hum_encoder_weights=None):
         directory = Path(__file__).parent
         self._interrupt = False
         self._early_stop = False
-        self.lm_decoder_engine = lm_decoder_engine
+        self.lm_features = lm_features
         self.scoring_checkpoint = scoring_checkpoint
         self.hum = None
         self.hum_encoder = None
@@ -55,19 +55,20 @@ class YuE2Pipeline:
         for model, filename, precision in ((self.text_encoder, ar_weights, dtype), (self.transformer, acoustic_weights, dtype), (self.vae, vae_weights, vae_dtype)):
             offload.load_model_data(model, filename, default_dtype=precision, writable_tensors=False)
             model.eval().requires_grad_(False)
-        self.text_encoder.configure_engine(lm_decoder_engine, self._abort_requested)
-        self.transformer.engine = lm_decoder_engine
+        self.text_encoder._mm_pinned_pool = True  # registered as text_encoder but decodes token by token: its blocks enter MMGP's pinned pool
+        self.text_encoder.configure_engine(lm_features, self._abort_requested)
+        self.transformer.flash = lm_features.flash
         self.transformer.abort_fn = self._abort_requested
         self.vae._model_dtype = vae_dtype
         self.vae._offload_hooks = ["decode", "decode_tiled"]
         self.vae.get_VAE_tile_size = self.get_vae_tile_size
         self._vae_abort_handles = [block.register_forward_hook(self._abort_after_block) for block in self.vae.decoder.layers]
         self.tokenizer = YuE2TextTokenizer(tokenizer_path)
-        self.engine = TokenGenerationEngine(self.text_encoder, ar_weights, self.tokenizer, enforce_eager=lm_decoder_engine == "legacy")
+        self.engine = TokenGenerationEngine(self.text_encoder, ar_weights, self.tokenizer, enforce_eager=not lm_features.graphs)
         self.lora_target = YuE2LoraTarget(self.text_encoder, self.transformer)
         self._ar_lora_signature = None
-        print(f"[YuE2] AR LM engine: {lm_decoder_engine} (CUDA graphs: {'off' if lm_decoder_engine == 'legacy' else 'on'}; Triton decoder kernels: {'on' if lm_decoder_engine == 'vllm' else 'off'}; attention: {'FlashAttention 2' if lm_decoder_engine == 'vllm' else 'PyTorch SDPA'}).")
-        print(f"[YuE2] Acoustic flow: PyTorch midpoint solver; attention: {'FlashAttention 2' if lm_decoder_engine == 'vllm' else 'PyTorch SDPA'}; CUDA graphs: off.")
+        print(f"[YuE2] AR LM: {lm_features.describe()}.")
+        print(f"[YuE2] Acoustic flow: PyTorch midpoint solver; attention: {'FlashAttention 2' if lm_features.flash else 'PyTorch SDPA'}; CUDA graphs: off.")
         self.generation_config = GenerationConfig()
         self.last_plan = None
         self.last_latents = None
@@ -146,27 +147,16 @@ class YuE2Pipeline:
         self._interrupt = self._early_stop = False
         self.last_plan = self.last_latents = None
         self.last_truncated = {}
-        mode = "melody" if self.hum is not None else ("full", "melody", "off", "full")[model_mode]
-        if self.hum is None and model_mode == 3:
-            input_prompt = normalize_instrumental_prompt(input_prompt)
+        source = "A" if self.hum is not None else resolve_source(audio_prompt_type, input_custom, custom_settings=custom_settings)
         if self.hum is None:
-            audio_prompt_type = composition_source(audio_prompt_type, input_custom is not None)
-        extend_score = self.hum is None and "2" in audio_prompt_type
-        using_abc = "1" in audio_prompt_type and "A" not in audio_prompt_type
-        if using_abc and input_custom is None:
-            raise ValueError("Upload an ABC score for the selected composition source.")
-        if (using_abc or "A" in audio_prompt_type) and mode == "off":
-            raise ValueError("A source score requires a composition planning mode.")
-        if extend_score and ("0" in audio_prompt_type or not (using_abc or "A" in audio_prompt_type)):
-            raise ValueError("Score extension requires an ABC score or source audio.")
+            validate_source(source, model_mode, input_custom, audio_guide)
+            if model_mode == 3:
+                input_prompt = normalize_instrumental_prompt(input_prompt)
+        mode = "melody" if self.hum is not None else ("full", "melody", "off", "full")[model_mode]
         carrier = None
         midi = None
         side_files = {}
-        abc = ""
-        if using_abc:
-            abc = Path(input_custom).read_text(encoding="utf-8-sig").strip()
-            if not abc:
-                raise ValueError("The ABC score file is empty.")
+        abc = read_abc(input_custom, mode == "melody") if source in ("1", "12") else ""
         maximum = int(duration_seconds * self.frame_rate)
         sampling = replace(self.generation_config.semantic, max_tokens=maximum, min_tokens=min(200, maximum - 1), temperature=temperature, top_k=top_k, top_p=top_p)
         try:
@@ -197,20 +187,15 @@ class YuE2Pipeline:
                             raise InterruptedError("Hum encoding interrupted")
                     carrier = self.hum_encoder.encode(audio, VAE_tile_size, self._abort_requested, report_encode)
                 del audio
-            if "A" in audio_prompt_type:
+            if source in ("A", "A2"):
                 from .sheetsage2.scoring import score_audio
                 self.engine.release_runtime_allocations()
                 offloadobj.unload_all()
                 abc, midi = score_audio(audio_guide, self.scoring_checkpoint, mode == "melody", callback, self._abort_requested)
             request = SongRequest(style=alt_prompt, lyrics=input_prompt, cot=mode, abc=abc or None, cfg_scale=guide_scale, seed=seed)
-            if (self.hum is not None and model_mode == 0) or extend_score:
-                if self.hum is not None:
-                    from .hum import open_hum_score
-                    opening = open_hum_score(abc)
-                else:
-                    # Keep both voices and rests when continuing the source notation.
-                    opening = abc.rstrip() + "\n"
-                partial = self.tokenizer.encode(opening)
+            if self.hum is not None and model_mode == 0:
+                from .hum import open_hum_score
+                partial = self.tokenizer.encode(open_hum_score(abc))
                 request = replace(request, abc=None)
                 continuation = self._tokens(token_prefixes(request, self.tokenizer) + partial, self.generation_config.abc, seed, "abc", callback)
                 abc_ids = partial + continuation
@@ -220,7 +205,18 @@ class YuE2Pipeline:
             elif mode == "off":
                 abc_ids = []
             elif abc:
-                abc_ids = self.tokenizer.encode(abc)
+                if source in ("12", "A2"):
+                    # Keep the complete supplied notation in the model's open ABC span.
+                    # Append only new tokens; existing voices, rests and headers stay intact.
+                    abc_ids = self.tokenizer.encode(abc.rstrip() + "\n")
+                    open_score = token_prefixes(replace(request, abc=None), self.tokenizer) + abc_ids
+                    continuation = self._tokens(open_score, self.generation_config.abc, seed, "abc", callback)
+                    abc_ids += continuation
+                    abc = self.tokenizer.decode(abc_ids)
+                    midi = None
+                    request = replace(request, abc=abc)
+                else:
+                    abc_ids = self.tokenizer.encode(abc)
             else:
                 abc_ids = self._tokens(token_prefixes(request, self.tokenizer), self.generation_config.abc, seed, "abc", callback)
                 abc = self.tokenizer.decode(abc_ids)

@@ -11,15 +11,9 @@ from einops import rearrange
 from torch import nn
 
 from .ops import patchify, unpatchify
-from .resnet import ResnetBlock3D, UNetMidBlock3D
+from .resnet import ResnetBlock3D, UNetMidBlock3D, _norm_act
 from .sampling import DepthToSpaceUpsample, SpaceToDepthDownsample
 from shared.kernels import vae_ops
-
-from ..common.normalization import PixelNorm
-
-def _norm_act(norm, act, x):
-    x_list, x = [x], None
-    return vae_ops.pixel_norm_silu(x_list, norm, act, channel_norm=isinstance(norm, PixelNorm) and norm.dim == 1)
 
 
 def _conv(conv, parts):

@@ -4,9 +4,8 @@ import math
 
 import torch
 
-from shared.llm_engines.cudagraph_kit import CUDAGraphRunner
-from shared.llm_engines.nanovllm.utils.context import reset_context, set_context
-from shared.llm_engines.nanovllm.vllm_support import probe_vllm_runtime
+from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
+from shared.llm_engines.lmgp.utils.context import reset_context, set_context
 
 
 _VLLM_TRITON_SHAPES = {
@@ -25,38 +24,34 @@ class MiniMaxMusic3SemanticAcceleration:
     audio_code_offset = 151675
     semantic_vocab_size = 16384
 
-    def __init__(self, language_model, rvq_depth_decoder, engine: str, device: torch.device):
+    def __init__(self, language_model, rvq_depth_decoder, features, device: torch.device):
         self.language_model = language_model
         self.rvq_depth_decoder = rvq_depth_decoder
-        self.engine = engine
+        self.features = features  # the LM decoder optimizations (LMFeatures)
         self.device = device
-        self._runner = CUDAGraphRunner("minimax_music3:qwen3_decode", self._decode_step)
+        # MMGP graphs of the decoding step (the whole step while the LM is in VRAM, otherwise layer by layer, streamed or kept)
+        self._runner = AutoRegressiveCudaGraphKit("minimax_music3_lm", owner=language_model)
         self._capacity = 0
         self._blocks_per_sequence = 0
         self._block_tables = None
+        self._positions = self._slots = self._context_lens = self._sequence_offsets = None
         self._next_position = 0
         self._configure_kernels()
 
     def _configure_kernels(self):
-        use_vllm = self.engine == "vllm"
-        if use_vllm:
-            probe = probe_vllm_runtime()
-            if not probe["supported"]:
-                raise RuntimeError("MiniMax Music 3 vllm mode requires both FlashAttention2 and Triton")
+        triton, flash = self.features.triton, self.features.flash
         from shared.kernels.quanto_int8_triton import configure_tiny_m_shape_overrides
 
-        configure_tiny_m_shape_overrides(_VLLM_TRITON_SHAPES if use_vllm else None)
+        configure_tiny_m_shape_overrides(_VLLM_TRITON_SHAPES if triton else None)
         for layer in self.language_model.model.layers:
             attention = layer.self_attn.attn
-            attention.flash_attn_varlen_func = attention.flash_attn_varlen_func if use_vllm else None
-            attention.flash_attn_with_kvcache = attention.flash_attn_with_kvcache if use_vllm else None
-            attention.use_triton_kv_cache = use_vllm
-            layer.input_layernorm.use_triton_rmsnorm = use_vllm
-            layer.post_attention_layernorm.use_triton_rmsnorm = use_vllm
-        self.language_model.model.norm.use_triton_rmsnorm = use_vllm
-        self.rvq_depth_decoder.set_decode_engine(self.engine)
-        kernels = "FlashAttention2 + Triton" if use_vllm else "SDPA"
-        print(f"[MiniMax Music 3] semantic decode: CUDA graphs + {kernels}")
+            attention.flash_attn_varlen_func = attention.flash_attn_varlen_func if flash else None
+            attention.flash_attn_with_kvcache = attention.flash_attn_with_kvcache if flash else None
+            attention.use_triton_kv_cache = triton
+            layer.input_layernorm.use_triton_rmsnorm = triton
+            layer.post_attention_layernorm.use_triton_rmsnorm = triton
+        self.language_model.model.norm.use_triton_rmsnorm = triton
+        self.rvq_depth_decoder.set_cuda_graphs(self.features.graphs)
 
     def _allocate(self, capacity: int):
         if capacity <= self._capacity:
@@ -69,10 +64,20 @@ class MiniMaxMusic3SemanticAcceleration:
         for layer in self.language_model.model.layers:
             attention = layer.self_attn.attn
             shape = (total_blocks, self.block_size, attention.num_kv_heads, attention.head_dim)
-            attention.k_cache = torch.empty(shape, device=self.device, dtype=dtype)
-            attention.v_cache = torch.empty(shape, device=self.device, dtype=dtype)
+            # zeros: the attention reads the unwritten slots of the last page with a zero weight, and 0 * NaN is NaN
+            attention.k_cache = torch.zeros(shape, device=self.device, dtype=dtype)
+            attention.v_cache = torch.zeros(shape, device=self.device, dtype=dtype)
         first = torch.arange(self._blocks_per_sequence, device=self.device, dtype=torch.int32)
         self._block_tables = torch.stack((first, first + self._blocks_per_sequence))
+        # the step's inputs, filled in place: the layers read them through the engine context, so they are graph state
+        self._positions = torch.zeros(2, device=self.device, dtype=torch.long)
+        self._slots = torch.zeros(2, device=self.device, dtype=torch.long)
+        self._context_lens = torch.zeros(2, device=self.device, dtype=torch.int32)
+        self._sequence_offsets = torch.arange(2, device=self.device, dtype=torch.long) * self._blocks_per_sequence * self.block_size
+
+    def _register_state(self):
+        caches = [tensor for layer in self.language_model.model.layers for tensor in (layer.self_attn.attn.k_cache, layer.self_attn.attn.v_cache)]
+        self._runner.register_state(caches, self._block_tables, self._positions, self._slots, self._context_lens)
 
     def _slot_mapping(self, positions: torch.Tensor) -> torch.Tensor:
         sequence_offsets = torch.arange(2, device=self.device, dtype=torch.long) * self._blocks_per_sequence * self.block_size
@@ -84,6 +89,7 @@ class MiniMaxMusic3SemanticAcceleration:
             raise ValueError(f"MiniMax Music 3 accelerated CFG expects batch size 2, got {batch_size}")
         self._allocate(prompt_length + max_frames)
         self._runner.release()
+        self._register_state()
         prompt_positions = torch.arange(prompt_length, device=self.device, dtype=torch.long)
         positions = prompt_positions.repeat(2)
         slots = torch.cat((prompt_positions, prompt_positions + self._blocks_per_sequence * self.block_size))
@@ -118,11 +124,11 @@ class MiniMaxMusic3SemanticAcceleration:
         reset_context()
 
     def decode(self, inputs_embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.full((2,), self._next_position, device=self.device, dtype=torch.long)
-        slot_mapping = self._slot_mapping(positions)
-        context_lens = positions.to(torch.int32) + 1
+        self._positions.fill_(self._next_position)
+        torch.add(self._sequence_offsets, self._positions, out=self._slots)
+        self._context_lens.fill_(self._next_position + 1)
         try:
-            hidden, logits = self._runner.run(inputs_embeds.view(2, -1), positions, slot_mapping, context_lens)
+            hidden, logits = self._runner.run("decode", self._decode_step, inputs_embeds.view(2, -1), self._positions, self._slots, self._context_lens)
         finally:
             reset_context()
         self._next_position += 1
@@ -131,7 +137,7 @@ class MiniMaxMusic3SemanticAcceleration:
     def release(self):
         self._runner.release()
         self.rvq_depth_decoder.release_decode_graph()
-        if self.engine == "vllm":
+        if self.features.triton:
             from shared.kernels.quanto_int8_triton import configure_tiny_m_shape_overrides
 
             configure_tiny_m_shape_overrides()

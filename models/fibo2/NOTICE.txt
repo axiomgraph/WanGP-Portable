@@ -1,0 +1,17 @@
+Fibo 2.0 integration
+
+Transformer, caption processing and text-image rendering are adapted from
+Bria AI's contribution to Hugging Face Diffusers, revision
+ab96e2b58c89adb9df418af74d81cc8b1e1be074, under Apache License 2.0.
+See LICENSE-APACHE.txt and the source file notices.
+
+Model source: https://huggingface.co/briaai/Fibo-2.0-dev
+Weights revision: 530604492bf2bd1364ae43ca6b2bf2285ef0f2ba
+Edit Turbo source: https://huggingface.co/briaai/Fibo-2.0-edit-turbo
+Edit Turbo revision: 63316ff6d5c4c4ba37729a8a6510bced7e8f585b
+Model weights retain Bria's separate license:
+https://platform.bria.ai/licensing/pricing?model=fibo-2
+
+Qwen3-VL conditioning and the FLUX.2 autoencoder reuse WanGP's existing
+implementations and their respective upstream notices. The downloaded
+Aileron and DejaVu fonts retain their accompanying license files.

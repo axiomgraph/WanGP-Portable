@@ -474,7 +474,7 @@ class UnifiedVoice(nn.Module):
                  checkpointing=True, types=1,
                  condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False,
                  spk_cond_mode="conformer", num_language_tokens=107,
-                 gpt_linear_layers=False, gpt_build_fp16=True, gpt_build_dtype=None, gpt_build_meta=True, force_no_flash2=False, accel_allow_vllm_kernels=False):
+                 gpt_linear_layers=False, gpt_build_fp16=True, gpt_build_dtype=None, gpt_build_meta=True, force_no_flash2=False, accel_allow_triton_kernels=False):
         """
         Args:
             layers: Number of layers in transformer stack.
@@ -600,7 +600,7 @@ class UnifiedVoice(nn.Module):
 
         self.use_accel = use_accel
         self.force_no_flash2 = bool(force_no_flash2)
-        self.accel_allow_vllm_kernels = bool(accel_allow_vllm_kernels)
+        self.accel_allow_triton_kernels = bool(accel_allow_triton_kernels)
         self.accel_engine = None  # Will be initialized in post_init_gpt2_config
         self.accel_flash2_available = False
         self.accel_triton_available = False
@@ -645,14 +645,13 @@ class UnifiedVoice(nn.Module):
             from ..accel import GPT2AccelAttention, GPT2AccelModel, AccelInferenceEngine
             from ..accel.attention import configure_attention_kernels
 
-            allow_vllm_kernels = bool(self.accel_allow_vllm_kernels)
-            allow_flash2_kernel = bool(allow_vllm_kernels and (not self.force_no_flash2))
-            allow_triton_kernel = bool(allow_vllm_kernels)
+            allow_flash2_kernel = not self.force_no_flash2  # each kernel family where supported, whatever the other
+            allow_triton_kernel = bool(self.accel_allow_triton_kernels)
             configure_attention_kernels(
                 allow_flash2=allow_flash2_kernel,
                 allow_triton=allow_triton_kernel,
             )
-            # The LM engine resolution already ran vllm probe; don't re-probe here.
+            # WanGP resolved the LM features: no probe here.
             self.accel_flash2_available = allow_flash2_kernel
             self.accel_triton_available = allow_triton_kernel
             has_quantized_modules = any(hasattr(module, "qweight") for module in self.gpt.modules())
@@ -688,12 +687,7 @@ class UnifiedVoice(nn.Module):
                 use_cuda_graph=True,
                 dtype=runtime_dtype,
             )
-            if allow_vllm_kernels and self.accel_flash2_available and self.accel_triton_available:
-                self.accel_kernel_mode = "vllm"
-            elif self.accel_flash2_available:
-                self.accel_kernel_mode = "flash2"
-            else:
-                self.accel_kernel_mode = "sdpa"
+            self.accel_kernel_mode = "+".join(name for name, used in (("flash2", self.accel_flash2_available), ("triton", self.accel_triton_available)) if used) or "sdpa"
             backend = self.accel_kernel_mode
             cg_state = "on"
             print(f"[IndexTTS2][accel] acceleration engine initialized (backend={backend}, cuda_graph={cg_state})")

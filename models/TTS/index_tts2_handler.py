@@ -151,7 +151,7 @@ def _get_index_tts2_model_def(base_model_type):
             "default": "T",
         },
         "prompt_enhancer_button_label": "Write",
-        "lm_engines": ["legacy", "cg", "vllm"],
+        "lm_decoder": True,
         "compile": False,
     }
     if not is_v25:
@@ -312,7 +312,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         from .index_tts2.pipeline import IndexTTS2Pipeline
@@ -350,7 +350,7 @@ class family_handler:
             device=runtime_device,
             gpt_weights_path=gpt_weights_path,
             show_load_logs=INDEX_TTS2_SHOW_LOAD_LOGS,
-            lm_decoder_engine=lm_decoder_engine,
+            lm_features=lm_features,
             architecture=base_model_type,
         )
         if torch.cuda.is_available():
@@ -366,14 +366,13 @@ class family_handler:
         }
         if is_v25:
             pipe["semantic_codec"] = pipeline.model.semantic_codec
-        if str(lm_decoder_engine).strip().lower() in ("cg", "cudagraph", "vllm"):
-            pipe["transformer"]._budget = 0
-
         load_def = {
             "pipe": pipe,
             "coTenantsMap": {},
+            # the GPT's decoding steps are MMGP graphs: its layers may stream (memory profile, VRAM preload)
+            "cudaGraphs": ["transformer"] if lm_features.graphs else False,
         }
-        if int(profile) in (2, 4, 5):
+        if int(profile) in (0, 2, 4, 5):
             load_def["budgets"] = {"transformer2": 250}
 
         if save_quantized and gpt_weights_path:

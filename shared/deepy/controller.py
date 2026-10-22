@@ -474,7 +474,7 @@ class DeepyController:
                 engine._ensure_llm()
                 llm = getattr(engine, "_llm", None)
                 if llm is None:
-                    raise RuntimeError("Assistant NanoVLLM runtime is not available.")
+                    raise RuntimeError("Assistant LM engine runtime is not available.")
                 llm.model_runner.ensure_runtime_ready()
                 engine.release_runtime_allocations()
                 warmed_vllm = True
@@ -760,7 +760,7 @@ class DeepyController:
             active_session.prime_toolbox.close()
             active_session.prime_toolbox = None
         gen = self._deps.get_gen_info(state)
-        return DeepyZeroTools(
+        tools = DeepyZeroTools(
             gen,
             self._deps.get_processed_queue,
             send_cmd,
@@ -769,6 +769,8 @@ class DeepyController:
             record_file_metadata=self._deps.record_file_metadata,
             get_server_config=self._server_config,
         )
+        tools.zero_catalog = True
+        return tools
 
     def _build_session_system_prompt(self, session, tools) -> tuple[str, str]:
         host = getattr(self, 'workspace_host', None)

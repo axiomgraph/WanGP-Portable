@@ -10,6 +10,7 @@ from torch import Tensor
 
 from shared import attention_kit
 from shared.attention import pay_attention
+from shared.kernels import ops
 from shared.utils.lora_mapping import convert_lora_keys
 
 
@@ -23,15 +24,9 @@ def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
 
 
 def _apply_rope_inplace(x: Tensor, freqs: Tensor) -> Tensor:
-    freqs = freqs[:, None, :, :, :]
-    cos = freqs[..., 0, 0].to(x.dtype)
-    sin = freqs[..., 1, 0].to(x.dtype)
-    x_pair = x.reshape(*x.shape[:-1], -1, 2)
-    x0 = x_pair[..., 0].clone()
-    x1 = x_pair[..., 1]
-    x_pair[..., 0].mul_(cos).sub_(x1 * sin)
-    x_pair[..., 1].mul_(cos).add_(x0 * sin)
-    return x
+    """RoPE of x (batch, heads, tokens, head_dim) in place, channels paired (2i, 2i + 1), cos / sin of freqs in x's dtype."""
+    freqs = freqs[:, None]
+    return ops.paired_rope_(x, freqs[..., 0, 0].to(x.dtype), freqs[..., 1, 0].to(x.dtype), interleaved=True)
 
 
 def _norm_rope_(query, key, qknorm, freqs):
@@ -40,6 +35,13 @@ def _norm_rope_(query, key, qknorm, freqs):
     for tensor, norm in ((query, qknorm.qnorm), (key, qknorm.knorm)):
         if tensor is not None:
             attention_kit.rows_(tensor, lambda part, first, last: _norm_rope_rows(norm.forward(part), None if freqs is None else freqs[:, first:last]))
+
+
+def _norm_rope_quant(query, key, qknorm, freqs, core, settings):
+    """attention_kit fused_quant: the staged Sage 2 quantization of q and/or k with their zero-centered QKNorm (scale + 1 in the scale's
+    dtype, as RMSNorm.forward) and RoPE (freqs (batch, tokens, pairs, 2, 2) viewed with a head axis)."""
+    norms = [None if tensor is None else (norm.scale + 1, norm.eps) for tensor, norm in ((query, qknorm.qnorm), (key, qknorm.knorm))]
+    return ops.split_half_norm_rope_quant_(query, key, None if freqs is None else freqs.unsqueeze(2), *norms, core, settings, interleaved=True)
 
 
 def _norm_rope_rows(x: Tensor, freqs: Tensor | None) -> Tensor:
@@ -141,11 +143,6 @@ def key_padding_mask(mask: Tensor) -> Tensor:
     return mask.unsqueeze(1).unsqueeze(2)
 
 
-def modulate_inplace(x_list: list[Tensor], scale: Tensor, shift: Tensor):
-    x = x_list[0]
-    x.mul_(scale.add_(1)).add_(shift)
-
-
 def temb(t: Tensor, dim: int, period: float = 1e4, tfactor: float = 1e3, device: torch.device = None, dtype: torch.dtype = None) -> Tensor:
     half = dim // 2
     freqs = torch.exp(-math.log(period) * torch.arange(half, dtype=torch.float32, device=device) / half)
@@ -239,10 +236,8 @@ class RMSNorm(nn.Module):
         else:
             x = x_list
             del x_list
-        dtype = x.dtype
-        out = F.rms_norm(x, (self.features,), eps=self.eps, weight=(self.scale + 1.0))
-        del x
-        return out.to(dtype)
+        x_list, x = [x], None
+        return ops.zero_center_rms_norm(x_list, self.scale, self.eps, offset_in_weight_dtype=True)
 
 
 class QKNorm(nn.Module):
@@ -270,32 +265,11 @@ class SwiGLU(nn.Module):
         self.features = features
         self.mlpdim = mlpdim
 
-    def forward(self, x: Tensor | list[Tensor]) -> Tensor:
-        if isinstance(x, list):
-            x_ = x[0]
-            x.clear()
-            x = x_
-        seq_len = x.shape[-2]
-        chunk_size = 0 if seq_len <= 1024 else max(128, min(seq_len, seq_len * self.features // max(2 * self.mlpdim, 1)))
-        if chunk_size == 0:
-            gate = F.silu(self.gate(x))
-            up = self.up(x)
-            del x
-            gate.mul_(up)
-            del up
-            return self.down(gate)
-        out = x.new_empty(*x.shape[:-1], self.features)
-        for start in range(0, seq_len, chunk_size):
-            chunk = x.narrow(-2, start, min(chunk_size, seq_len - start))
-            gate = F.silu(self.gate(chunk))
-            up = self.up(chunk)
-            gate.mul_(up)
-            del up
-            chunk_out = self.down(gate)
-            out.narrow(-2, start, chunk_out.shape[-2]).copy_(chunk_out)
-            del chunk, gate, chunk_out
-        del x
-        return out
+    def forward(self, x_list: list[Tensor], residual: Tensor | None = None, gate: Tensor | None = None) -> Tensor:
+        """The shared chunked FFN of the activation handed off in x_list: in place, or added to residual scaled by gate (batch, 1,
+        features) when given."""
+        segments = None if gate is None else ops.gate_segments(gate, residual.shape[0], residual.shape[1])
+        return ops.mlp(x_list, self.gate, self.down, "swiglu", up=self.up, residual=residual, segments=segments)
 
 
 class Attention(nn.Module):
@@ -329,8 +303,9 @@ class Attention(nn.Module):
             qkv = None
             out = attention_kit.qkv_attention(x_list, self.wq, self.wk, self.wv, self.heads, self.headdim,
                                               lambda query, key, group: _norm_rope_(query, key, self.qknorm, freqs),
+                                              fused_quant=lambda query, key, group, core, settings: _norm_rope_quant(query, key, self.qknorm, freqs, core, settings),
                                               kv_heads=self.kvheads, attention_mask=None if mask is None else mask.transpose(1, 2)).flatten(2)
-            out.mul_(gate.sigmoid_())
+            ops.sigmoid_gate_(out, [gate])
             del gate
             return self.wo(out)
         if isinstance(qkv, list):
@@ -361,10 +336,9 @@ class Attention(nn.Module):
         q = k = v = None
         out = attention(qkv_list, mask=mask, gqa=self.gqa, txt_len=txt_len, NAG=NAG, neg_k=neg_k, neg_v=neg_v, neg_mask=neg_mask)
         neg_k = neg_v = neg_mask = None
-        gate = F.sigmoid(self.gate(qkv))
+        gate_list = [self.gate(qkv)]
         del qkv
-        out.mul_(gate)
-        del gate
+        ops.sigmoid_gate_(out, gate_list)
         return self.wo(out)
 
 
@@ -378,9 +352,7 @@ class LastLayer(nn.Module):
     def forward(self, x: Tensor | list[Tensor], tvec: Tensor) -> Tensor:
         scale, shift = self.modulation(tvec)
         x_list = x if isinstance(x, list) else [x]
-        x_list = [self.norm.forward(x_list)]
-        modulate_inplace(x_list, scale, shift)
-        return self.linear(x_list.pop())
+        return self.linear(ops.norm_scale_shift(x_list, self.norm, scale, shift))
 
 
 class TextFusionBlock(nn.Module):
@@ -396,10 +368,7 @@ class TextFusionBlock(nn.Module):
         attn_out = self.attn(x_list, mask=mask)
         x.add_(attn_out)
         del attn_out
-        x_list = [self.postnorm(x)]
-        mlp_out = self.mlp(x_list)
-        x.add_(mlp_out)
-        del mlp_out
+        self.mlp([self.postnorm(x)], residual=x)
         return x
 
 
@@ -447,22 +416,14 @@ class SingleStreamBlock(nn.Module):
         neg_mask: Tensor | None = None,
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x_list = [self.prenorm(x)]
-        modulate_inplace(x_list, prescale, preshift)
+        x_list = [ops.norm_scale_shift([x], self.prenorm, prescale, preshift)]
         if NAG is not None:
-            neg_context = self.prenorm(neg_context)
-            neg_context.mul_(prescale).add_(preshift)
+            neg_context = ops.norm_scale_shift([neg_context], self.prenorm, prescale, preshift)
         attn_out = self.attn(x_list, freqs, mask, txt_len=txt_len, NAG=NAG, neg_context=neg_context, neg_mask=neg_mask)
         neg_context = neg_mask = None
-        attn_out.mul_(pregate)
-        x.add_(attn_out)
+        ops.gated_residual_(x, [attn_out], pregate)
         del attn_out
-        x_list = [self.postnorm(x)]
-        modulate_inplace(x_list, postscale, postshift)
-        mlp_out = self.mlp(x_list)
-        mlp_out.mul_(postgate)
-        x.add_(mlp_out)
-        del mlp_out
+        self.mlp([ops.norm_scale_shift([x], self.postnorm, postscale, postshift)], residual=x, gate=postgate)
         return x
 
 

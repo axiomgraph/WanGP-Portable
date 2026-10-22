@@ -11,6 +11,7 @@ from .models.sq_codec import ScalarModel
 
 class HeartCodec(PreTrainedModel):
     config_class = HeartCodecConfig
+    _offload_base_modules = ("flow_matching.vq_embed",)  # mmgp keeps its codebooks in VRAM: they are read by index, outside a forward
 
     def __init__(self, config: HeartCodecConfig):
         super().__init__(config)

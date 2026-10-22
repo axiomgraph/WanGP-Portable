@@ -3,6 +3,7 @@ import os
 from collections.abc import Callable
 
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 from mmgp import cuda_graphs
 
@@ -475,7 +476,7 @@ class TransformerArgsPreprocessor:
             self, "_gguf_latent_logged"
         ):
             self._gguf_latent_logged = True
-            print(f"[GGUF][patchify_proj] latent={latent_dtype} weight={getattr(getattr(self.patchify_proj, 'weight', None), 'dtype', None)}")
+            tqdm.write(f"[GGUF][patchify_proj] latent={latent_dtype} weight={getattr(getattr(self.patchify_proj, 'weight', None), 'dtype', None)}")
         # with CUDA graphs, built in the graph pool's idle memory: the hidden state then moves into the blocks' static buffer
         x = cuda_graphs.pooled(self.patchify_proj, self._hidden_states, latent, modality.keyframes_mask)
         base_timestep, prompt_base_timestep = self._get_runtime_timestep_bases(modality)

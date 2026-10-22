@@ -26,6 +26,7 @@ DEPRECATED_SETTING_KEYS = frozenset({
     "prompts", "lset_name", "slg_switch", "slg_layers", "slg_start_perc", "slg_end_perc", "tea_cache_setting", "tea_cache_start_step_perc", "spatial_upsampler_face_count",
     "scheduler_type", "shift", "adaptive_switch", "MMAudio_setting", "MMAudio_prompt", "MMAudio_neg_prompt", "seedvc_voice_sample", "seedvc_voice_sample2",
     "fps", "sampling_steps", "sampler_solver", "sample_solvers", "enhanced_prompt", "enhanced_alt_prompt", "audio_postprocess", "audio_cfg_scale", "pace", "exaggeration",
+    "override_profile", "override_compile", "override_attention",
 })
 
 # Names commonly guessed for an existing setting, and what to use instead.

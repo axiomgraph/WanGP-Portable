@@ -38,15 +38,13 @@ def _load_draft_config(config_path):
     return Qwen3Config.from_dict(values)
 
 
-def install_block_draft(model, method, engine_name, *, bonsai=False):
+def install_block_draft(model, method, *, bonsai=False):
     import torch
     from mmgp import offload, quant_router
     from shared.utils import files_locator
     from shared.qtypes.prism import preserve_checkpoint_dtypes
-    from shared.llm_engines.nanovllm.models.block_draft import BlockDraft
+    from shared.llm_engines.lmgp.models.block_draft import BlockDraft
 
-    if engine_name != "vllm":
-        raise ValueError("DSpark and DFlash2 require the vLLM decoder engine; select Auto or vLLM.")
     spec = block_draft_spec(method, bonsai=bonsai)
     config_path = files_locator.locate_file(f"{spec['folder']}/{spec['config']}")
     config = _load_draft_config(config_path)

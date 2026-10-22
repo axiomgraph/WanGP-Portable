@@ -1,0 +1,19 @@
+{
+    "model": {
+        "name": "MiniMax H3 FastH3 Omni 8-Step 20B",
+        "architecture": "minimax_h3_ref2va_pruned",
+        "description": "Generates synchronized video and audio from text and your references in 8 steps, with the Ref2VA inputs: ordered images, videos and audio clips, start/end images, frame injection, reference or control videos, soundtracks and continuation. Faster than Ref2VA PDD at the same VRAM (FastVideo distillation, sparse video attention). Distilled with references: best with at least one image or video reference.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/FastH3-Omni-8-Step-V1-pruned_rank8_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/FastH3-Omni-8-Step-V1-pruned_rank8_int8_convrot.safetensors"
+        ],
+        "pdd": true,
+        "fasth3": true
+    },
+    "num_inference_steps": 8,
+    "guidance_phases": 1,
+    "sample_solver": "euler",
+    "flow_shift": 12.0,
+    "video_prompt_type": "I",
+    "prompt": "subject_definitions: <Subject 1> is the character from <Picture 1>.\nsummary: [reference generation] The referenced character explores a lush tropical forest.\nretention_analysis: <Subject 1> (appears in [Shot 1]): fully_preserved - retain identity and clothing while changing the setting.\ndetailed_description: [Shot 1] <Subject 1> walks between giant ferns, looks up at a colorful bird and smiles. The camera tracks alongside at eye level in soft morning light.\noverall_soundscape: Bird calls, rustling leaves and gentle footsteps.\nnon_diegetic_music: N/A"
+}

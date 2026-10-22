@@ -18,13 +18,21 @@ import torch
 import triton
 import triton.language as tl
 
+from shared.kernels.dispatch import triton_dtype_supported
+
+
+def _bf16_bits(tensor):
+    # GPUs without BF16 conversion instructions (Turing) read a BF16 tensor as its bits
+    return tensor.dtype == torch.bfloat16 and not triton_dtype_supported(tensor.device, tensor.dtype)
+
+
 @triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,
                                 stride_iz, stride_ih, stride_in,
                                 stride_oz, stride_oh, stride_on,
                                 stride_sz, stride_sh,
                                 sm_scale,
-                                C: tl.constexpr, BLK: tl.constexpr):
+                                C: tl.constexpr, BLK: tl.constexpr, BF16_BITS: tl.constexpr):
     off_blk = tl.program_id(0)
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
@@ -37,6 +45,8 @@ def quant_per_block_int8_kernel(Input, Output, Scale, L,
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    if BF16_BITS:  # the bits of BF16 values, shifted into FP32 bits: the exact conversion
+        x = (x.to(tl.int32) << 16).to(tl.float32, bitcast=True)
     x = x.to(tl.float32)
     x *= sm_scale
     scale = tl.max(tl.abs(x)) / 127.
@@ -79,23 +89,25 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         sm_scale = head_dim**-0.5
 
     grid = ((qo_len + BLKQ - 1) // BLKQ, h_qo, b)
+    bits = _bf16_bits(q)
     quant_per_block_int8_kernel[grid](
-        q, q_int8, q_scale, qo_len,
+        q.view(torch.int16) if bits else q, q_int8, q_scale, qo_len,
         stride_bz_q, stride_h_q, stride_seq_q,
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
         sm_scale=(sm_scale * 1.44269504),
-        C=head_dim, BLK=BLKQ
+        C=head_dim, BLK=BLKQ, BF16_BITS=bits
     )
 
     grid = ((kv_len + BLKK - 1) // BLKK, h_kv, b)
+    bits = _bf16_bits(k)
     quant_per_block_int8_kernel[grid](
-        k, k_int8, k_scale, kv_len,
+        k.view(torch.int16) if bits else k, k_int8, k_scale, kv_len,
         stride_bz_k, stride_h_k, stride_seq_k,
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
         sm_scale=1.0,
-        C=head_dim, BLK=BLKK
+        C=head_dim, BLK=BLKK, BF16_BITS=bits
     )
 
     return q_int8, q_scale, k_int8, k_scale

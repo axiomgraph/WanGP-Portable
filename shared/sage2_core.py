@@ -24,6 +24,15 @@ if sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backend
 import torch.nn.functional as F
 from mmgp import cuda_graphs
 
+from .sageattention_patch import patch_sageattention
+from .sage1_core import fp16_v, scale_output
+try:  # the fused norm + RoPE + quantization kernels (fused_qk_layouts)
+    from shared.kernels import qk_quant_triton as _qk_layouts
+except (ImportError, OSError, RuntimeError):
+    _qk_layouts = None
+
+patch_sageattention()
+
 from sageattention.triton.quant_per_block import per_block_int8 as per_block_int8_triton, quant_per_block_int8_kernel
 from sageattention.triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
 import sageattention.triton.attn_qk_int8_per_block as attn_qk_int8_per_block
@@ -221,7 +230,7 @@ def sageattn_attention_mask_support_reason(qkv_list=None, attn_mask: torch.Tenso
     q = qkv_list[0]
     if q.dtype not in (torch.float16, torch.bfloat16):
         return f"dtype {q.dtype} is unsupported"
-    if q.shape[-1] > 128:
+    if q.shape[-1] > 128 and q.shape[-1] != 256:
         return f"head_dim {q.shape[-1]} is unsupported"
     return None
 
@@ -236,6 +245,7 @@ def sageattn(
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
     recycle_q: bool = False,
+    scale_v: bool = False,
     **kwargs: Any,
 ):
     """
@@ -298,18 +308,34 @@ def sageattn(
         support_reason = sageattn_attention_mask_support_reason(qkv_list, attn_mask, tensor_layout=tensor_layout)
         if support_reason is not None:
             raise ValueError(f"Masked SageAttention is unsupported on CUDA architecture {arch}: {support_reason}")
+    if qkv_list[0].shape[-1] == 256:
+        if tensor_layout != "NHD" or is_causal or return_lse or sm_scale is not None:
+            raise ValueError("SageAttention with head_dim 256 takes NHD tensors, without causal mask, softmax scale or LSE")
+        return _sageattn_head256(qkv_list, attn_mask, scale_v, recycle_q)
     if attn_mask is not None or cuda_graphs.recording() and not cuda_kernels_capturable(qkv_list[0].device):
-        return sageattn_qk_int8_pv_fp16_triton(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, attn_mask=attn_mask)
+        return sageattn_qk_int8_pv_fp16_triton(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, attn_mask=attn_mask, scale_v=scale_v)
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
-        return sageattn_qk_int8_pv_fp16_triton(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+        return sageattn_qk_int8_pv_fp16_triton(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, scale_v=scale_v)
     elif arch in ("sm89", "sm120"):
         return sageattn_qk_int8_pv_fp8_cuda(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, recycle_q = recycle_q, **_fp8_pv_settings(arch))
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32", recycle_q = recycle_q)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
+
+
+def _sageattn_head256(qkv_list, attn_mask, scale_v, recycle_q):
+    """sageattn of NHD q, k and v with head_dim 256 through the staged functions (no CUDA kernel, and sageattn_qk_int8_pv_fp16_triton's
+    launches exceed the shared memory at 256). k is copied: staged_quantize_k subtracts its mean in place and callers may hold it."""
+    q, k, v = qkv_list
+    qkv_list.clear()
+    settings = staged_settings(q.device, attn_mask is not None, scale_v, 256)
+    quantized = [None, staged_quantize_k([k.clone()], settings), staged_quantize_v([v], settings)]
+    k = v = None
+    quantized[0] = staged_quantize_q(q, settings)
+    return staged_attention(q if recycle_q else torch.empty_like(q, memory_format=torch.contiguous_format), quantized, settings, attn_mask)
 
 
 _capturable = None
@@ -350,23 +376,45 @@ def _fp8_pv_settings(arch):
 
 # Staged quantization: a caller that computes q, k and v one after another quantizes each as soon as it is ready, so that at most one
 # of them exists in 16 bits. Same kernels and values as sageattn (NHD layout, head_dim 64 or 128): INT8 q/k and FP8 v on sm89 and
-# sm120; INT8 q/k per block and fp16 v with its Triton path (sm86, and masked attentions on every architecture: v keeps 16 bits).
-_PER_BLOCK_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 128, "launch": None}
-_LOW_SHARED_SETTINGS = {"qk_quant_gran": "per_block", "block_m": _LOW_SHARED_MASKED_BLOCK_M, "launch": (4, 3)}
+# sm120; INT8 q/k per block and fp16 v with its Triton path (sm86, and masked attentions on every architecture: v keeps 16 bits),
+# v scaled by powers of two with scale_v (shared.sage1_core.fp16_v).
+_PER_BLOCK_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 128, "launch": None, "scale_v": False}
+_LOW_SHARED_SETTINGS = {"qk_quant_gran": "per_block", "block_m": _LOW_SHARED_MASKED_BLOCK_M, "launch": (4, 3), "scale_v": False}
+# head_dim 256 (no CUDA kernel): the same Triton kernel on every architecture, launches that fit 99 KiB of shared memory
+_HEAD256_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 128, "launch": (8, 1), "scale_v": False}
+_MASKED_HEAD256_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 64, "launch": (8, 2), "scale_v": False}
 # The Triton attention of SageAttention 2.2 takes a mask and its strides, that of 2.1 does not (no masked path)
 _TRITON_MASK_ARGUMENT = "mask" in attn_qk_int8_per_block._attn_fwd.arg_names
 
 
-def staged_settings(device, masked=False):
+def staged_settings(device, masked=False, scale_v=False, head_dim=128):
     """sageattn's quantization settings for the staged_* functions on this device (with a mask: its masked Triton path, smaller
     blocks where shared memory is short), None where sageattn uses other kernels. A block recorded for a CUDA graph gets the Triton path
-    when the CUDA kernels cannot be captured (cuda_kernels_capturable)."""
-    if masked:
-        return _LOW_SHARED_SETTINGS if _use_low_shared_masked_triton(device) else _PER_BLOCK_SETTINGS
-    arch = _get_cuda_arch(device)
-    if arch == "sm86" or cuda_graphs.recording() and not cuda_kernels_capturable(device):
-        return _PER_BLOCK_SETTINGS
-    return _fp8_pv_settings(arch) if SM89_ENABLED and arch in ("sm89", "sm120") else None
+    when the CUDA kernels cannot be captured (cuda_kernels_capturable), as head_dim 256 always does. scale_v: v scaled by powers of two
+    on the Triton path."""
+    if head_dim == 256:
+        settings = _MASKED_HEAD256_SETTINGS if masked else _HEAD256_SETTINGS
+    elif masked:
+        settings = _LOW_SHARED_SETTINGS if _use_low_shared_masked_triton(device) else _PER_BLOCK_SETTINGS
+    elif (arch := _get_cuda_arch(device)) == "sm86" or cuda_graphs.recording() and not cuda_kernels_capturable(device):
+        settings = _PER_BLOCK_SETTINGS
+    else:
+        return _fp8_pv_settings(arch) if SM89_ENABLED and arch in ("sm89", "sm120") else None
+    return {**settings, "scale_v": True} if scale_v else settings
+
+
+def fused_qk_layouts(settings, head_dim):
+    """Row layouts of these settings' staged q / k quantization for shared.kernels.qk_quant_triton (the norm and RoPE of q and k fused
+    with their quantization): {"q": (layout, block, sm_scale, scale_eps), "k": (...)} as staged_quantize_q / staged_quantize_k
+    quantize; None where the fused kernels do not reproduce the core's quantizers (the per-warp CUDA kernels of sm120 round
+    differently by one LSB in places and are not validated there)."""
+    if _qk_layouts is None:
+        return None
+    if settings["qk_quant_gran"] == "per_thread":
+        return {"q": (_qk_layouts.LAYOUT_THREAD_Q, 32, 1.0, 1e-7), "k": (_qk_layouts.LAYOUT_THREAD_K, 64, 1.0, 1e-7)}
+    if settings["qk_quant_gran"] == "per_block":
+        return {"q": (_qk_layouts.LAYOUT_PER_BLOCK, settings["block_m"], 1.0 / head_dim ** 0.5 * 1.44269504, 0.0), "k": (_qk_layouts.LAYOUT_PER_BLOCK, 64, 1.0, 0.0)}
+    return None
 
 
 def _quant_per_block(x, x_int8, block, sm_scale):
@@ -382,11 +430,12 @@ def _quant_per_block(x, x_int8, block, sm_scale):
 
 @torch.compiler.disable
 def staged_quantize_v(v_list, settings):
-    """FP8 v (transposed, padded, scaled per channel) with its scale and mean, or on sm86 fp16 v with None, None; v is released."""
+    """FP8 v (transposed, padded, scaled per channel) with its scale and mean, or on the Triton path fp16 v with its scales (fp16_v) and
+    None; v is released."""
     if settings["qk_quant_gran"] == "per_block":
         v = v_list[0]
         v_list.clear()
-        return v.to(torch.float16), None, None
+        return *fp16_v(v, settings["scale_v"]), None
     _maybe_set_device(v_list[0].device)
     scale_max = 2.25 if settings["pv_accum_dtype"] == "fp32+fp16" else 448.0
     return per_channel_fp8(v_list, tensor_layout="NHD", scale_max=scale_max, smooth_v=settings["smooth_v"])
@@ -459,7 +508,7 @@ def staged_attention(out, quantized_list, settings, attn_mask=None):
             v.stride(0), v.stride(2), v.stride(1), out.stride(0), out.stride(2), out.stride(1), *mask[1],
             qo_len, kv_len, heads, heads // k_int8.shape[2], BLOCK_M=settings["block_m"], BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1,
             RETURN_LSE=False, num_warps=num_warps, num_stages=num_stages)
-        return out
+        return out if v_scale is None else scale_output(out, v_scale, 2)
     inputs = (q_int8, k_int8, v, out, q_scale, k_scale, v_scale)
     options = (0, 0, 3 if settings["qk_quant_gran"] == "per_thread" else 2, out.size(-1) ** -0.5, 0)
     if settings["pv_accum_dtype"] == "fp32+fp16":
@@ -485,10 +534,12 @@ def sageattn_qk_int8_pv_fp16_triton(
     smooth_k: bool = True,
     return_lse: bool = False,
     attn_mask: Optional[torch.Tensor] = None,
+    scale_v: bool = False,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
     SageAttention with per-block INT8 quantization for Q and K, FP16 PV with FP16 accumulation, implemented using Triton.
+    scale_v: v scaled by powers of two (shared.sage1_core.fp16_v), for v large enough to overflow the FP16 accumulation.
     The FP16 accumulator is added to a FP32 buffer immediately after each iteration.
 
     Parameters
@@ -598,8 +649,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     else:
         km = None
 
-    if dtype == torch.bfloat16 or dtype == torch.float32:
-        v = v.to(torch.float16)
+    v, v_scale = fp16_v(v, scale_v, (0, seq_dim))
 
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
@@ -632,6 +682,8 @@ def sageattn_qk_int8_pv_fp16_triton(
         o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, attn_mask=attn_mask)
     else:
         o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+    if v_scale is not None:
+        scale_output(o, v_scale, 3 - seq_dim)  # heads: dimension 2 in NHD, 1 in HND
 
     o = o[..., :head_dim_og]
 

@@ -149,7 +149,7 @@ def _load_joycaption_prompt_enhancer():
     return llm_model, llm_tokenizer, 10000
 
 
-def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_decoder_engine: str = "", qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, deepy_kv_cache_quantization: str = "") -> PromptEnhancerRuntime:
+def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, deepy_kv_cache_quantization: str = "") -> PromptEnhancerRuntime:
     enhancer_enabled = int(enhancer_enabled)
     runtime = PromptEnhancerRuntime()
     if enhancer_enabled <= 0:
@@ -200,7 +200,6 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
             default_dtype=default_dtype,
             backend=backend,
             attn_implementation="sdpa",
-            requested_lm_engine=lm_decoder_engine,
             variant=qwen35_variant,
             speculative_decoding=speculative_decoding,
             kv_cache_int8=deepy_kv_cache_quantization == "int8",
@@ -224,6 +223,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
         runtime.image_caption_model.eval()
         runtime.pipe_models["prompt_enhancer_image_caption_vision_tower_model"] = vision_tower_model
         runtime.pipe_models["prompt_enhancer_image_caption_embedding_model"] = caption_embedding_model
+        runtime.llm_model._mm_pinned_pool = True  # the prompt enhancer's and Deepy Prime's language model decodes token by token: its blocks enter MMGP's pinned pool
         runtime.pipe_models["prompt_enhancer_llm_model"] = runtime.llm_model
         runtime.budgets["prompt_enhancer_image_caption_vision_tower_model"] = spec.get("vision_budget", 3000)
         runtime.budgets["prompt_enhancer_image_caption_embedding_model"] = spec.get("embedding_budget", 2000)
@@ -240,6 +240,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
         runtime.llm_model, runtime.llm_tokenizer, budget = _load_llama32_prompt_enhancer()
     else:
         runtime.llm_model, runtime.llm_tokenizer, budget = _load_joycaption_prompt_enhancer()
+    runtime.llm_model._mm_pinned_pool = True  # decodes token by token: its blocks enter MMGP's pinned pool
     runtime.pipe_models["prompt_enhancer_llm_model"] = runtime.llm_model
     runtime.budgets["prompt_enhancer_llm_model"] = budget
     return runtime

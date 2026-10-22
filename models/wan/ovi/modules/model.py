@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from shared.attention import pay_attention
+from ...modules.model import frame_modulation, modulate_frames
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -23,11 +24,6 @@ def sinusoidal_embedding_1d(dim, position):
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
-def reshape_latent(latent, latent_frames):
-    return latent.reshape(latent.shape[0], latent_frames, -1, latent.shape[-1] )
-
-def restore_latent_shape(latent):
-    return latent.reshape(latent.shape[0], -1, latent.shape[-1] )
 
 
 @amp.autocast('cuda', enabled=False)
@@ -438,15 +434,8 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         # assert e.dtype == torch.float32
-        dtype = x.dtype
-
-        latent_frames = e.shape[0]
-        e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-        x = self.norm(x).to(dtype)
-        x = reshape_latent(x , latent_frames)
-        x *= (1 + e[1])
-        x += e[0]
-        x = restore_latent_shape(x)
+        e = frame_modulation(self.modulation, e.unsqueeze(1))
+        x = modulate_frames(x, self.norm, e[0], e[1])
         x= x.to(self.head.weight.dtype)
         x = self.head(x)
         return x

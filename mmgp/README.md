@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 4.0.0 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 4.2.0 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -141,7 +141,7 @@ For example:
 - budgets: either a number in mega bytes (for all models, 0 for an unlimited budget), a string that is a percentage of the total VRAM (for instance "80%"), or a dictionary that maps model ids to mega bytes or percentages: the approximate VRAM allocated to a model. To define the default value in the dictionary, add an entry named "*".\
 The smaller this number, the more VRAM is left for image data / longer videos, but the slower, since the parts of the model are transferred between the RAM and the VRAM at each step. A model too big for its budget is broken down into blocks loaded one after the other; the part of the budget that these transfers do not need keeps blocks permanently in VRAM. The speed of a low budget increases (up to 2 times) with reserved RAM and asyncTransfers.
 - workingVRAM: either a number in mega bytes, a string that is a percentage of the total VRAM, or a dictionary that maps model ids to mega bytes: a minimum amount of VRAM that should be left for the data processed by the model. This number prevails if it is in conflict with a too high budget defined for the same model.
-- vram_safety_coefficient: float between 0 and 1, 0.8 by default: the maximum share of the VRAM that the models may occupy.
+- vram_safety_coefficient: float between 0 and 1, 0.85 by default: the maximum share of the VRAM that the models may occupy.
 - asyncTransfers: True by default. The next blocks of a model are transferred to the GPU while the current block is computed. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - prefetchWindow: None by default: 2 for the models whose budget also preloads blocks in VRAM, 1 for the others. With asyncTransfers, number of blocks transferred ahead of the block being computed, for the models that are pinned or copied through the staging ring. The GPU itself orders these transfers after the computation of the blocks whose memory they reuse, so the next transfers are prepared during the computation; the blocks in transit (window + 1) are taken from the budget of the model, so a window of 2 costs no VRAM beyond it. Windows beyond 1 are only used if their extra blocks fit in 5% of the VRAM. 0 waits for the GPU after every block.
 - autoPreload: False by default. With the MMGP Optimized VRAM Allocator (`mmgp.allocator.install()`), the models processed block by block keep in VRAM as much of their blocks as each workload (a denoising stage, a resolution, a model of the pipe) leaves free, instead of the preload of their budget: the first step of a new workload measures what it needs, the next ones fill the VRAM left, and part of the model leaves the VRAM if it runs short, instead of an out of memory error. *True* keeps what was measured for the process; a dictionary keeps it in it, so that an application can tie it to a model definition. Not applied to compiled models or without asynchronous transfers.

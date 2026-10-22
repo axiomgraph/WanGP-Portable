@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 import torch
+from mmgp import runtime
 from transformers.cache_utils import StaticCache
 
 from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 class Qwen3TTSCudaGraphHooks:
     def __init__(self, talker: "Qwen3TTSTalkerForConditionalGeneration") -> None:
         self.talker = talker
+        self.graph_owner = talker  # the model MMGP manages (the whole TTS model): its graphs then run the decoding steps
         self._enabled = False
         self._kit: AutoRegressiveCudaGraphKit | None = None
         self._talker_cache: StaticCache | None = None
@@ -31,9 +33,10 @@ class Qwen3TTSCudaGraphHooks:
         self._talker_decode_position_ids: torch.Tensor | None = None
         self._subtalker_decode_position_ids: torch.Tensor | None = None
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        engine = str(lm_decoder_engine or "legacy").strip().lower()
-        self._enabled = engine in ("cg", "cudagraph")
+    def set_cuda_graphs(self, enabled: bool, graph_owner=None) -> None:
+        if graph_owner is not None:
+            self.graph_owner = graph_owner
+        self._enabled = bool(enabled)
         if not self._enabled:
             self.release()
 
@@ -67,8 +70,8 @@ class Qwen3TTSCudaGraphHooks:
         if max_batch_size <= 0 or max_talker_tokens <= 0 or max_subtalker_tokens <= 0:
             raise ValueError("Qwen3 CUDA graph capacities must be > 0.")
 
-        first_param = next(self.talker.parameters(), None)
-        if first_param is None or first_param.device.type != "cuda":
+        device, dtype = runtime.execution_device(self.talker), next(self.talker.parameters()).dtype  # its weights may be on the CPU (streamed)
+        if device.type != "cuda":
             return
 
         if (
@@ -82,11 +85,11 @@ class Qwen3TTSCudaGraphHooks:
             self._last_prepare_reused = True
             self.reset_talker_cache()
             self.reset_subtalker_cache()
-            self._ensure_runtime_tensors(first_param.device)
+            self._ensure_runtime_tensors(device)
             return
 
         self.release()
-        self._kit = AutoRegressiveCudaGraphKit("qwen3_tts", owner=self.talker)
+        self._kit = AutoRegressiveCudaGraphKit("qwen3_tts", owner=self.graph_owner, resident=self.talker)  # the steps run the talker only
         self._max_batch_size = int(max_batch_size)
         self._max_talker_tokens = int(max_talker_tokens)
         self._max_subtalker_tokens = int(max_subtalker_tokens)
@@ -94,17 +97,18 @@ class Qwen3TTSCudaGraphHooks:
             config=talker_config,
             max_batch_size=self._max_batch_size,
             max_cache_len=self._max_talker_tokens,
-            device=first_param.device,
-            dtype=first_param.dtype,
+            device=device,
+            dtype=dtype,
         )
         self._subtalker_cache = StaticCache(
             config=subtalker_config,
             max_batch_size=self._max_batch_size,
             max_cache_len=self._max_subtalker_tokens,
-            device=first_param.device,
-            dtype=first_param.dtype,
+            device=device,
+            dtype=dtype,
         )
-        self._ensure_runtime_tensors(first_param.device)
+        self._ensure_runtime_tensors(device)
+        self._kit.register_state(self._talker_cache, self._subtalker_cache)
 
     def release(self) -> None:
         if self._kit is not None:

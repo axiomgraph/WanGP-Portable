@@ -36,6 +36,8 @@ class MiniMaxH3PackedSequence:
     num_condition_audio_rows: int
     num_target_condition_audio_latents: int = 0
     num_target_condition_video_rows: int = 0
+    dense_spans: tuple = ()  # (start, stop) of every non-video-region row range in sequence order: text, keyframes, image references, audio
+    reference_video_spans: tuple = ()  # (start, stop, (t, h, w)) of every reference video's rows, in sequence order
 
 
 @dataclass
@@ -205,7 +207,8 @@ def build_packed_sequence(text_token_tags, num_latent_frames, latent_height, lat
     token_tags[video_indices] = MINIMAX_H3_VIDEO_TAG
     return MiniMaxH3PackedSequence(sequence_length, position_ids, token_tags, video_indices, audio_indices,
                                    text_indices, condition_video_rows, condition_audio_rows,
-                                   target_condition_audio_latents, target_condition_video_frames * rows_per_frame)
+                                   target_condition_audio_latents, target_condition_video_frames * rows_per_frame,
+                                   tuple(span for span in ((0, text_len), (condition_video_start, condition_audio_start), (condition_audio_start, audio_start), (audio_start, video_start)) if span[1] > span[0]))
 
 
 def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames, latent_height, latent_width,
@@ -235,10 +238,13 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
     video_indices = [torch.arange(keyframe_start, keyframe_audio_start)] if keyframe_rows else []
     audio_indices = [torch.arange(keyframe_audio_start, reference_start)] if keyframe_audio_rows else []
     cursor, time_cursor = reference_start, float(text_len)
+    dense_spans = [(0, text_len)] + ([(keyframe_start, keyframe_audio_start)] if keyframe_rows else []) + ([(keyframe_audio_start, reference_start)] if keyframe_audio_rows else [])
+    reference_video_spans = []
     for ref in references:
         if ref.kind == "image":
             rows = slice(cursor, cursor + ref.num_video_rows)
             cursor = rows.stop
+            dense_spans.append((rows.start, rows.stop))
             video_indices.append(torch.arange(rows.start, rows.stop))
             frame_grid, _ = _frame_grid(ref.latent_height, ref.latent_width, patch_h, patch_w)
             position_ids[rows, 0] = time_cursor
@@ -247,6 +253,7 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
         elif ref.kind == "audio":
             rows = slice(cursor, cursor + ref.num_audio_rows)
             cursor = rows.stop
+            dense_spans.append((rows.start, rows.stop))
             audio_indices.append(torch.arange(rows.start, rows.stop))
             _fill_audio_positions(position_ids, rows, ref.num_audio_latents, time_cursor, target_width_grid)
             time_cursor += float(ref.num_audio_latents)
@@ -254,9 +261,12 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
             audio_rows = slice(cursor, cursor + ref.num_audio_rows)
             video_rows = slice(audio_rows.stop, audio_rows.stop + ref.num_video_rows)
             cursor = video_rows.stop
+            if ref.num_audio_rows:
+                dense_spans.append((audio_rows.start, audio_rows.stop))
             audio_indices.append(torch.arange(audio_rows.start, audio_rows.stop))
             video_indices.append(torch.arange(video_rows.start, video_rows.stop))
             frame_grid, width_grid = _frame_grid(ref.latent_height, ref.latent_width, patch_h, patch_w)
+            reference_video_spans.append((video_rows.start, video_rows.stop, (ref.num_latent_frames, ref.latent_height // patch_h, ref.latent_width // patch_w)))
             _fill_audio_positions(position_ids, audio_rows, ref.num_audio_latents, time_cursor, width_grid)
             video_grid = position_ids[video_rows].view(ref.num_latent_frames, frame_grid.shape[0], 3)
             video_grid[:, :, 0] = _video_t_grid(ref.num_latent_frames, time_cursor, video_time_scale)[:, None]
@@ -308,14 +318,17 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
     return MiniMaxH3PackedSequence(sequence_length, position_ids, token_tags, video_indices, audio_indices,
                                    text_indices, condition_video_rows, condition_audio_rows,
                                    target_condition_audio_latents,
-                                   target_condition_video_frames * rows_per_target_frame)
+                                   target_condition_video_frames * rows_per_target_frame,
+                                   tuple(dense_spans + [(audio_start, video_start)]), tuple(reference_video_spans))
 
 
 def build_row_timesteps(layout, video_timestep, audio_timestep, condition_video_timestep,
-                        condition_audio_timestep, target_condition_timestep=1.0):
+                        condition_audio_timestep, target_condition_timestep=1.0, keyframe_timesteps=()):
     timesteps = torch.full((layout.sequence_length,), video_timestep, dtype=torch.float32,
                            device=layout.token_tags.device)
     timesteps[layout.video_indices[:layout.num_condition_video_rows]] = condition_video_timestep
+    for start, stop, timestep in keyframe_timesteps:  # softened keyframes keep their own noise level
+        timesteps[layout.video_indices[start:stop]] = timestep
     if layout.num_target_condition_video_rows:
         timesteps[layout.video_indices[-layout.num_target_condition_video_rows:]] = target_condition_timestep
     timesteps[layout.audio_indices[layout.num_condition_audio_rows:]] = audio_timestep

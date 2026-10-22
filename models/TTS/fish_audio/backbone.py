@@ -26,14 +26,14 @@ class DenseMLP(nn.Module):
 
 
 class SparseMoeBlock(nn.Module):
-    def __init__(self, config, engine):
+    def __init__(self, config, features):
         super().__init__()
         hidden = config.hidden_size
         self.top_k, self.norm_topk_prob = config.num_experts_per_tok, config.norm_topk_prob
         self.gate = nn.Linear(hidden, config.num_experts, bias=False, dtype=torch.bfloat16)
         self.shared_expert = DenseMLP(hidden, config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(hidden, 1, bias=False, dtype=torch.bfloat16)
-        self.experts = SwiGLUExperts(config.num_experts, hidden, config.moe_intermediate_size, device="meta", use_triton=engine == "vllm")
+        self.experts = SwiGLUExperts(config.num_experts, hidden, config.moe_intermediate_size, device="meta", use_triton=features.triton)
 
     def route(self, x):
         flat = x.reshape(-1, x.shape[-1])
@@ -48,16 +48,16 @@ class SparseMoeBlock(nn.Module):
 class DecoderLayer(nn.Module):
     _cuda_graph_segments = True
 
-    def __init__(self, config, index, engine):
+    def __init__(self, config, index, features):
         super().__init__()
         self.layer_type = config.layer_types[index]
         if self.layer_type == "full_attention":
             self.self_attn = FullAttention(config, dtype=torch.bfloat16)
-            self.self_attn.engine = engine
+            self.self_attn.features = features
         else:
             self.linear_attn = GatedDeltaNet(config, dtype=torch.bfloat16)
-            self.linear_attn.engine = engine
-        self.mlp = SparseMoeBlock(config, engine)
+            self.linear_attn.features = features
+        self.mlp = SparseMoeBlock(config, features)
         self.input_layernorm = ZeroCenteredRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = ZeroCenteredRMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -80,18 +80,18 @@ class DecoderLayer(nn.Module):
 
 
 class TextModel(nn.Module):
-    def __init__(self, config, engine):
+    def __init__(self, config, features):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([DecoderLayer(config, index, engine) for index in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([DecoderLayer(config, index, features) for index in range(config.num_hidden_layers)])
         self.norm = ZeroCenteredRMSNorm(config.hidden_size, config.rms_norm_eps)
 
 
 class FishOmniBackbone(nn.Module):
-    def __init__(self, config, engine, head_rows, vq_codebooks):
+    def __init__(self, config, features, head_rows, vq_codebooks):
         super().__init__()
-        self.config, self.engine = config, engine
-        self.model = TextModel(config, engine)
+        self.config, self.features = config, features
+        self.model = TextModel(config, features)
         # Decoding samples only eos and the semantic band: the head keeps vocabulary rows head_rows = [start, stop) (the loader
         # slices the checkpoint's full head), and its logits are indexed from start.
         self.head_rows = head_rows

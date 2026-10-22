@@ -4,8 +4,11 @@ from collections import deque
 from typing import Callable, List, Optional
 
 import torch
+from mmgp import runtime
 from torch import nn
 from tqdm import tqdm
+
+from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
 
 from .attention import (
     ForwardContext,
@@ -77,22 +80,14 @@ class AccelInferenceEngine:
         self.kv_manager.wire_kv_cache_to_model(model)
         self.sampler = Sampler()
         self.current_sequences = []
-        self.graphs = {}
+        # decoding steps through the CUDA graph kit: MMGP graph stages when MMGP manages the GPT (one graph while it is in VRAM, per-layer
+        # graphs while its layers stream), the kit's own graphs otherwise; graph_vars: their persistent inputs, filled before each step
+        self.graph_bs = [1, 2, 4, 8]
         self.graph_vars = None
-        self.graph_pool = None
-        self.graph_captured = False
-        self.graph_num_blocks = 0
-        self.graph_signature = None
+        self._kit = None
 
     def _runtime_kv_device(self) -> torch.device:
-        first_param = next(self.model.parameters(), None)
-        if first_param is not None and first_param.device.type == "cuda":
-            return first_param.device
-        if torch.cuda.is_available():
-            return torch.device(f"cuda:{torch.cuda.current_device()}")
-        if first_param is not None:
-            return first_param.device
-        return torch.device("cpu")
+        return runtime.execution_device(self.model)  # its weights may be on the CPU (streamed)
 
     def _new_kv_manager(self, num_blocks: int, device: torch.device) -> KVCacheManager:
         return KVCacheManager(
@@ -125,45 +120,6 @@ class AccelInferenceEngine:
             filtered = filtered.masked_fill(remove_mask, float("-inf"))
         return filtered
 
-    @staticmethod
-    def _tensor_sig(tensor: Optional[torch.Tensor]):
-        if tensor is None:
-            return None
-        return (
-            int(tensor.data_ptr()),
-            str(tensor.dtype),
-            tuple(int(x) for x in tensor.shape),
-            int(tensor.device.index if tensor.device.index is not None else -1),
-        )
-
-    def _module_first_param_sig(self, module: Optional[torch.nn.Module]):
-        if module is None:
-            return None
-        try:
-            first_param = next(module.parameters())
-        except StopIteration:
-            return None
-        return self._tensor_sig(first_param)
-
-    def _make_capture_signature(
-        self,
-        tts_mel_embedding: Optional[torch.nn.Module] = None,
-        tts_text_pos_embedding: Optional[torch.nn.Module] = None,
-    ):
-        mel_weight = getattr(tts_mel_embedding, "weight", None) if tts_mel_embedding is not None else None
-        pos_emb = None
-        if tts_text_pos_embedding is not None:
-            pos_emb = getattr(tts_text_pos_embedding, "emb", tts_text_pos_embedding)
-        pos_weight = getattr(pos_emb, "weight", None) if pos_emb is not None else None
-        return (
-            self._module_first_param_sig(self.model),
-            self._tensor_sig(self.kv_manager.kv_cache),
-            self._tensor_sig(mel_weight),
-            self._tensor_sig(pos_weight),
-            int(self.num_blocks),
-            int(self.block_size),
-        )
-
     def _compute_tts_embeds(
         self,
         input_ids: torch.Tensor,
@@ -186,12 +142,9 @@ class AccelInferenceEngine:
         return max(1, int(math.ceil(float(max(1, total_tokens)) / float(self.block_size))) + 1)
 
     def _reset_decode_graph(self):
-        self.graphs = {}
-        self.graph_vars = None
-        self.graph_pool = None
-        self.graph_captured = False
-        self.graph_num_blocks = 0
-        self.graph_signature = None
+        if self._kit is not None:
+            self._kit.release()
+        self._kit = self.graph_vars = None
 
     def _resize_kv_cache_if_needed(self, required_blocks: int):
         target_blocks = int(max(1, required_blocks))
@@ -231,35 +184,19 @@ class AccelInferenceEngine:
         tts_text_pos_embedding: Optional[torch.nn.Module] = None,
     ):
         required_blocks = self._required_blocks(int(max_total_tokens))
-        self._resize_kv_cache_if_needed(required_blocks)
-        if not self.use_cuda_graph:
+        self._resize_kv_cache_if_needed(required_blocks)  # a new cache resets the kit
+        if not self.use_cuda_graph or self._kit is not None:
             return
-        signature = self._make_capture_signature(
-            tts_mel_embedding=tts_mel_embedding,
-            tts_text_pos_embedding=tts_text_pos_embedding,
-        )
-        if (
-            self.graph_captured
-            and int(self.graph_num_blocks) == int(self.num_blocks)
-            and self.graph_num_blocks >= required_blocks
-            and self.graph_signature == signature
-        ):
-            return
-        print(
-            f"[CAPTURE] use_cuda_graph={self.use_cuda_graph}, graph_captured={self.graph_captured}, "
-            f"graph_num_blocks={self.graph_num_blocks}, required_blocks={required_blocks}, cache_blocks={self.num_blocks}",
-            flush=True,
-        )
-        self._reset_decode_graph()
-        self._capture_cuda_graphs(
-            tts_mel_embedding=tts_mel_embedding,
-            tts_text_pos_embedding=tts_text_pos_embedding,
-            max_num_blocks=self.num_blocks,
-        )
-        self.graph_captured = True
-        self.graph_num_blocks = int(self.num_blocks)
-        self.graph_signature = signature
-        print(f"[CAPTURE] Completed! graphs={list(self.graphs.keys())}, num_blocks={self.graph_num_blocks}", flush=True)
+        max_bs, device = self.graph_bs[-1], self.kv_manager.kv_cache.device
+        self.graph_vars = {
+            "input_ids": torch.zeros(max_bs, dtype=torch.int64, device=device),
+            "slot_mapping": torch.zeros(max_bs, dtype=torch.int32, device=device),
+            "context_lens": torch.zeros(max_bs, dtype=torch.int32, device=device),
+            "block_tables": torch.zeros(max_bs, self.num_blocks, dtype=torch.int32, device=device),
+            "inputs_embeds": torch.zeros(max_bs, self.hidden_size, dtype=next(self.model.parameters()).dtype, device=device),
+        }
+        self._kit = AutoRegressiveCudaGraphKit("index_tts2", owner=self.model)
+        self._kit.register_state(self.kv_manager.kv_cache, self.graph_vars)  # what the steps read besides the GPT and their input
 
     def _prepare_prefill(self, requests: List[Seq]):
         input_ids = []
@@ -410,102 +347,6 @@ class AccelInferenceEngine:
         ).cuda(non_blocking=True)
         return temperatures
 
-    def _capture_cuda_graphs(
-        self,
-        tts_mel_embedding=None,
-        tts_text_pos_embedding=None,
-        max_num_blocks: Optional[int] = None,
-    ):
-        print("Capturing CUDA graphs for decode optimization...")
-        max_bs = 8  # Support up to batch size 8
-        if max_num_blocks is None:
-            max_num_blocks = self.num_blocks
-        max_num_blocks = max(1, min(int(max_num_blocks), int(self.num_blocks)))
-        model_dtype = next(self.model.parameters()).dtype
-        input_ids = torch.ones(max_bs, dtype=torch.int64, device="cuda")
-        positions = torch.ones(max_bs, dtype=torch.int64, device="cuda")
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        context_lens = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device="cuda")
-        outputs = torch.zeros(max_bs, self.hidden_size, dtype=model_dtype, device="cuda")
-        inputs_embeds_buffer = torch.zeros(max_bs, self.hidden_size, dtype=model_dtype, device="cuda")
-
-        self.graph_bs = [1, 2, 4, 8]
-
-        use_tts = tts_mel_embedding is not None and tts_text_pos_embedding is not None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-
-            slot_mapping[:bs].copy_(torch.arange(bs, dtype=torch.int32, device="cuda"))
-            context_lens[:bs].fill_(bs + 1)
-            block_tables[:bs, :].zero_()
-
-            set_forward_context(
-                False,
-                slot_mapping=slot_mapping[:bs],
-                context_lens=context_lens[:bs],
-                block_tables=block_tables[:bs],
-            )
-
-            # warmup
-            if use_tts:
-                inputs_embeds_buffer[:bs].copy_(
-                    self._compute_tts_embeds(
-                        input_ids[:bs],
-                        positions[:bs],
-                        tts_mel_embedding=tts_mel_embedding,
-                        tts_text_pos_embedding=tts_text_pos_embedding,
-                    )
-                )
-                out = self.model(
-                    inputs_embeds=inputs_embeds_buffer[:bs].unsqueeze(1),
-                    return_dict=True,
-                ).last_hidden_state
-            else:
-                out = self.model(
-                    input_ids=input_ids[:bs].unsqueeze(1), return_dict=True
-                ).last_hidden_state
-            outputs[:bs].copy_(out.squeeze(1) if out.dim() == 3 else out)
-
-            with torch.cuda.graph(graph, self.graph_pool, capture_error_mode="thread_local"):
-                if use_tts:
-                    inputs_embeds_buffer[:bs].copy_(
-                        self._compute_tts_embeds(
-                            input_ids[:bs],
-                            positions[:bs],
-                            tts_mel_embedding=tts_mel_embedding,
-                            tts_text_pos_embedding=tts_text_pos_embedding,
-                        )
-                    )
-                    out = self.model(
-                        inputs_embeds=inputs_embeds_buffer[:bs].unsqueeze(1),
-                        return_dict=True,
-                    ).last_hidden_state
-                else:
-                    out = self.model(
-                        input_ids=input_ids[:bs].unsqueeze(1), return_dict=True
-                    ).last_hidden_state
-                outputs[:bs].copy_(out.squeeze(1) if out.dim() == 3 else out)
-
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_forward_context()
-
-        self.graph_vars = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "slot_mapping": slot_mapping,
-            "context_lens": context_lens,
-            "block_tables": block_tables,
-            "outputs": outputs,
-            "inputs_embeds": inputs_embeds_buffer,
-        }
-        print(f"CUDA graphs captured for batch sizes: {self.graph_bs}")
-
     def _run_decode_with_graph(
         self,
         input_ids: torch.Tensor,
@@ -517,24 +358,7 @@ class AccelInferenceEngine:
         bs = input_ids.size(0)
         use_tts_embedding = hasattr(self, "_tts_mode") and self._tts_mode
 
-        if not self.use_cuda_graph or not self.graphs:
-            if use_tts_embedding:
-                inputs_embeds = self._compute_tts_embeds(
-                    input_ids,
-                    positions,
-                    tts_mel_embedding=tts_mel_embedding,
-                    tts_text_pos_embedding=tts_text_pos_embedding,
-                )
-                out = self.model(
-                    inputs_embeds=inputs_embeds.unsqueeze(1), return_dict=True
-                ).last_hidden_state
-            else:
-                out = self.model(
-                    input_ids=input_ids.unsqueeze(1), return_dict=True
-                ).last_hidden_state
-            return out.squeeze(1) if out.dim() == 3 else out
-
-        graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+        graph_bs = None if self._kit is None else next((x for x in self.graph_bs if x >= bs), None)
         if graph_bs is None:
             if use_tts_embedding:
                 inputs_embeds = self._compute_tts_embeds(
@@ -552,23 +376,31 @@ class AccelInferenceEngine:
                 ).last_hidden_state
             return out.squeeze(1) if out.dim() == 3 else out
 
-        graph = self.graphs[graph_bs]
         graph_vars = self.graph_vars
-
-        if graph_vars is None:
-            raise RuntimeError("Graph variables not initialized")
-
-        graph_vars["input_ids"][:bs].copy_(input_ids)
-        graph_vars["positions"][:bs].copy_(positions)
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][:bs].copy_(context.slot_mapping)
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs].copy_(context.context_lens)
         graph_vars["block_tables"][:bs, :].fill_(-1)
         graph_vars["block_tables"][:bs, : context.block_tables.size(1)].copy_(context.block_tables)
-        graph.replay()
+        # the steps read their context from these buffers: their graphs replay on the same addresses
+        set_forward_context(False, slot_mapping=graph_vars["slot_mapping"][:graph_bs], context_lens=graph_vars["context_lens"][:graph_bs], block_tables=graph_vars["block_tables"][:graph_bs])
+        if use_tts_embedding:  # computed before the step: the embeddings are modules of the outer model, the step runs the GPT only
+            graph_vars["inputs_embeds"][:bs].copy_(self._compute_tts_embeds(input_ids, positions, tts_mel_embedding=tts_mel_embedding, tts_text_pos_embedding=tts_text_pos_embedding))
+            out = self._kit.run(f"decode_embeds_{graph_bs}", self._decode_embeds_step, graph_vars["inputs_embeds"][:graph_bs])
+        else:
+            graph_vars["input_ids"][:bs].copy_(input_ids)
+            out = self._kit.run(f"decode_ids_{graph_bs}", self._decode_ids_step, graph_vars["input_ids"][:graph_bs])
+        return out[:bs]
 
-        return graph_vars["outputs"][:bs]
+    def _decode_embeds_step(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        # no transformers cache: the accel attention keeps the KV cache (a cache object would be an argument of each layer)
+        out = self.model(inputs_embeds=inputs_embeds.unsqueeze(1), use_cache=False, return_dict=True).last_hidden_state
+        return out.squeeze(1) if out.dim() == 3 else out
+
+    def _decode_ids_step(self, input_ids: torch.Tensor) -> torch.Tensor:
+        out = self.model(input_ids=input_ids.unsqueeze(1), use_cache=False, return_dict=True).last_hidden_state
+        return out.squeeze(1) if out.dim() == 3 else out
 
     def generate(
         self,

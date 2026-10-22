@@ -12,10 +12,10 @@ import math
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from shared.attention_kit import qkv_attention, rows_
 
 
 class Gemma4UnifiedTextConfig(PretrainedConfig):
@@ -118,14 +118,6 @@ def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
     return x * cos + _rotate_half(x) * sin
 
 
-def _repeat_kv(hidden_states: torch.Tensor, repetitions: int) -> torch.Tensor:
-    if repetitions == 1:
-        return hidden_states
-    batch, heads, tokens, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None].expand(batch, heads, repetitions, tokens, head_dim)
-    return hidden_states.reshape(batch, heads * repetitions, tokens, head_dim)
-
-
 class Gemma4UnifiedTextRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma4UnifiedTextConfig):
         super().__init__()
@@ -164,7 +156,7 @@ class Gemma4UnifiedTextAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
         num_key_value_heads = config.num_global_key_value_heads if self.use_alternative_attention else config.num_key_value_heads
-        self.num_key_value_groups = config.num_attention_heads // num_key_value_heads
+        self.num_key_value_heads = num_key_value_heads
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
         self.q_norm = Gemma4UnifiedRMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -174,20 +166,22 @@ class Gemma4UnifiedTextAttention(nn.Module):
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], attention_mask: torch.Tensor) -> torch.Tensor:
-        batch, tokens, _ = hidden_states.shape
-        shape = (batch, tokens, -1, self.head_dim)
         cos, sin = position_embeddings
-        query = self.q_norm(self.q_proj(hidden_states).view(shape))
-        query = _apply_rotary(query, cos, sin).transpose(1, 2)
-        key = self.k_proj(hidden_states).view(shape)
-        value = key if self.v_proj is None else self.v_proj(hidden_states).view(shape)
-        key = _apply_rotary(self.k_norm(key), cos, sin).transpose(1, 2)
-        value = self.v_norm(value).transpose(1, 2)
-        key = _repeat_kv(key, self.num_key_value_groups)
-        value = _repeat_kv(value, self.num_key_value_groups)
-        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=1.0)
-        output = output.transpose(1, 2).reshape(batch, tokens, -1)
-        return self.o_proj(output)
+
+        def norm_rope(query, key, group):
+            if query is not None:
+                rows_(query, lambda part, first, last: _apply_rotary(self.q_norm(part), cos[:, first:last], sin[:, first:last]))
+            if key is not None:
+                rows_(key, lambda part, first, last: _apply_rotary(self.k_norm(part), cos[:, first:last], sin[:, first:last]))
+
+        def norm_v(value, group):
+            rows_(value, lambda part, first, last: self.v_norm(part))
+
+        x_list, hidden_states = [hidden_states], None
+        output = qkv_attention(x_list, self.q_proj, self.k_proj, self.k_proj if self.v_proj is None else self.v_proj,
+                               self.num_attention_heads, self.head_dim, norm_rope, kv_heads=self.num_key_value_heads,
+                               attention_mask=attention_mask.transpose(1, 2), norm_v=norm_v, softmax_scale=1.0, force_attention="sdpa")
+        return self.o_proj(output.flatten(2))
 
 
 class Gemma4UnifiedTextMLP(nn.Module):

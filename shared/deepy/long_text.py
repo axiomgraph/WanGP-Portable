@@ -125,8 +125,7 @@ def long_text_system_instructions(policy) -> str:
         "Use rg(arguments) for bounded, read-only text search. Its syntax is rg options plus one pattern, then `--` and authorized @alias paths; omit paths to search the temporary workspace. "
         "Use append_text(file_path, text) to create a missing UTF-8 file or append exact literal text; include every intended newline and do not prefix lines with patch markers. "
         "Use edit(file_path, old_string, new_string, replace_all=false) for exact replacement. Search for enough local context that old_string occurs once, preserve its whitespace and line endings exactly, then search or read back the changed area. "
-        f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries. "
-        "For long prose or generation prompts, read wangp://skills/long-story-writing or wangp://skills/long-generation-prompts."
+        f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries."
     )
 
 

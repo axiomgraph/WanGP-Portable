@@ -1,0 +1,22 @@
+{
+    "model_type": "moss_tts_v1_5",
+    "prompt": "",
+    "alt_prompt": "English",
+    "audio_prompt_type": "A",
+    "duration_seconds": 30,
+    "pause_seconds": 0.2,
+    "seed": -1,
+    "temperature": 1.7,
+    "top_k": 25,
+    "top_p": 0.8,
+    "prompt_enhancer": "",
+    "override_profile": -1,
+    "image_mode": 0,
+    "video_length": 0,
+    "num_inference_steps": 1,
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "repeat_generation": 1,
+    "settings_version": 2.55,
+    "model_mode": 0
+}

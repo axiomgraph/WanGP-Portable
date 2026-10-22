@@ -64,7 +64,28 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
-## 15th of October 2026: WanGP v18.10 - More Drama per Gigabyte
+## 21st of October 2026: WanGP v18.21 - No GPU Left Behind
+
+- **Profile 0 — More Speed with Less RAM (Experimental)**: a new, fully automated mode. WanGP gives fast Reserved RAM and spare VRAM to the model currently running, then makes those resources available to the next task. This makes switching between large models much friendlier to low-RAM PCs. Higher-end PCs may still get better results by choosing a profile manually.
+
+- **RTX 20XX Gets a Second Wind**: older RTX cards now benefit from the new **WGPKernels 1.3.0** (please check *docs/INSTALLATION.md*) and faster local language-model processing. LTX-2.5 image and video VAE encoding, decoding, and upscaling are measured **4.8–6.8× faster**, turning jobs that were painfully slow into practical workflows.
+
+- **Optimizations Across the Board**: many image, video, 3D, speech, and music models are now up to **10% faster** and use slightly less VRAM.
+
+- **Faster Deepy, Prompt Enhancer, Speech and Music**: WanGP automatically selects the best acceleration supported by your GPU. When a language model is too large for VRAM, the CPU can work on the part left in RAM while the GPU handles the rest—often making responses about twice as fast. For instance, you can now run **Deepy Prime** with **Qwen 3.8 Bonsai** on an RTX 2080 Ti at **60 tokens/s**.
+
+- **MiniMax H3 FastH3 Omni**: on RTX 30XX or newer, this new H3 variant combines the quality of the **PDD** process with **VSA sparse attention**. Best of all, it is an **omni** model that should work well for both **FL2VA** and **Ref2VA** workflows, which is why you will find it in the Ref2VA section. There is also an **NVFP4** variant that should bring the RTX 5090 close to real-time generation.
+
+- **More Flexible H3 Two-Pass Generation**: the second pass has its own **Phase 2 Steps** setting and can use your selected LoRA accelerators instead of the automatic Turbo LoRA. Put accelerator multipliers before `|` in **LoRAs Multipliers**: for example, `1;0.6 |` uses the selected accelerator at strength 1 in phase 1 and 0.6 in phase 2. Use `1;0 |` to keep it out of phase 2 and retain the automatic Turbo LoRA there.
+
+- **Fibo 2.0**: ranked as the **best open-source image generator**, it can also edit with up to **four references** or replace a masked area. **Edit Turbo** makes edits in only four steps. Prompts can be simple descriptions or structured captions, with extra help for rendering the intended text.
+
+- **FlashVSR+ Turbo**: a new FlashVSR model that restores richer detail and runs faster at high resolutions. It supports images and videos, from **1× refinement to 4× upscaling**. Select it under **Configuration → Extensions → FlashVSR Spatial Upsampling → Model**.
+
+- **Useful Extras and Fixes**: `--offline` prevents all downloads and clearly reports missing files. Linux DLSS Frame Generation x2 is easier to install, and several audio-model compatibility issues are fixed.
+
+
+## 18h of October 2026: WanGP v18.19 - More Drama per Gigabyte
 
 - **Flux 3 Klein 5.6B**: text-to-image generation and editing with up to **10 reference images**. Choose the distilled model for **16-step generation**, or Base for **50 steps with guidance**. Both come in BF16, INT8 ConvRot and NVFP4. The new **Prompt Helper** lets you draw layout boxes, place elements from reference images, and mark objects for removal. Boxes guide the composition; they do not act as exact pixel masks.
 
@@ -78,6 +99,14 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **Deepy Prime Got More Efficient, and a Bit Artsy**: give it a one-minute brief (an ad, a short film, a music video, a podcast clip) and it plans the shots, keeps the cast consistent from shot to shot, paces the cuts to the genre and puts music or narration under the whole film. Before handing the result over, it measures and fixes what used to slip through: black frames, unwanted cuts inside a generated shot, silent stretches and typos in on-screen text. Titles, lower thirds, labels and app screens can now be drawn over the footage with exact lettering, while subtitles stay a separate track you can switch off. 
 
+- **MOSS Image 5B**: a new text-to-image family from **OpenMOSS**, with **Base** and **SFT** variants. Describe a scene in plain language, use tags, or arrange text and objects with the **Prompt Helper** layout editor. SFT adds training on curated data; both start at **50 steps**. The optional layout enhancer follows your selected canvas size. Boxes guide the composition; text and placement can still vary.
+
+- **MOSS-TTS v1.5**: **8B** and **Local 4B** multilingual speech models with cloning of up to **three voices**, dialogue, adjustable pauses and optional script writing. Both support **BF16 / INT8 ConvRot** and **PyTorch / CUDA Graphs / vLLM**; Local 4B outputs **48 kHz stereo**.
+
+- **Krea 2 Edit v2**: **General Edit** for changes to colors, lighting, objects and style; **Identity Edit** for changing poses, outfits and scenes while preserving likeness. Both use **Krea 2 Turbo**, support **two reference images** and start at **8 steps**.
+
+*Update v18.17*: added MOSS Image\
+*Update v18.19*: lots of bugs fixes, MOSS TTS, Krea Edit v2
 
 ## 11th of October 2026: WanGP v18.00 - Distortion of Space and Time
 
@@ -129,8 +158,6 @@ These VRAM savings should benefit everyone, especially at higher resolutions and
 To get the most out of this update, first make sure you use *Sage2/2+ Attention* as quite a few optimizations depends on it. Then open the new *Config → RAM/VRAM Management* tab, choose an *MMGP Optimized VRAM Allocator* option under *VRAM Allocator*, and turn on *Smart Memory Pinning*. Restart WanGP if you change the allocator.
 
 For an extra **20% VRAM saving**, with a speed penalty of up to 10%, go to *Config → Performance* and set *Attention Head Split* to *Medium (good balance)*. A pretty good trade-off when every gigabyte counts.
-
-For faster model checkpoint loading on Windows, enable *Read Ahead (Windows)* in *RAM/VRAM Management*.
 
 **Dynamic VRAM Preload** fills spare VRAM with model weights and frees space as needed. Set *VRAM Preload* to *Dynamic* for less waiting between layers, especially when generating images.
 

@@ -229,7 +229,7 @@ def mount_voice_routes(app, *, get_service, dependencies=None, language=None):
                 raise HTTPException(409, "This recording has already been submitted.")
             job.submitted = True
         try:
-            path = await save_upload(file, Path(tempfile.gettempdir()) / "wangp" / "deepy_voice", limit=VOICE_LIMIT, extensions={".webm", ".mp4", ".m4a", ".wav", ".ogg", ".mp3"})
+            path = await save_upload(file, Path(tempfile.gettempdir()) / "wangp" / "deepy_voice", limit=VOICE_LIMIT, extensions={".webm", ".mp4", ".m4a", ".wav", ".ogg", ".mp3", ".flac"})
             with _preparations_lock:
                 if job.done.is_set():
                     path.unlink(missing_ok=True)
@@ -254,7 +254,7 @@ def mount_voice_routes(app, *, get_service, dependencies=None, language=None):
             await file.close()
             raise HTTPException(403, "Microphone transcription is disabled in Configuration.")
         directory = Path(tempfile.gettempdir()) / "wangp" / "deepy_voice"
-        path = await save_upload(file, directory, limit=VOICE_LIMIT, extensions={".webm", ".mp4", ".m4a", ".wav", ".ogg", ".mp3"})
+        path = await save_upload(file, directory, limit=VOICE_LIMIT, extensions={".webm", ".mp4", ".m4a", ".wav", ".ogg", ".mp3", ".flac"})
         try:
             text = await run_in_threadpool(transcribe_recording, path, service=get_service(), language=recording_language())
             return {"text": text}

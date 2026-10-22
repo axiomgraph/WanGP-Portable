@@ -78,7 +78,7 @@ def _get_kugelaudio_model_def():
         "image_prompt_types_allowed": "",
         "supports_early_stop": True,
         "profiles_dir": ["kugelaudio_0_open"],
-        "lm_engines": ["cg"],
+        "lm_decoder": True,
         "duration_slider": dict(KUGELAUDIO_DURATION_SLIDER),
         "custom_settings": [one.copy() for one in KUGELAUDIO_CUSTOM_SETTINGS],
         "preserve_empty_prompt_lines": True,
@@ -168,7 +168,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         from .kugelaudio.pipeline import KugelAudioPipeline
@@ -178,13 +178,8 @@ class family_handler:
             model_weights_path=weights_path,
             ckpt_root=fl.get_download_location(),
             device=mps_device_or(torch.device("cpu")),
-            lm_decoder_engine=lm_decoder_engine,
+            cuda_graphs=lm_features.graphs,
         )
-        if lm_decoder_engine == "cg":
-            pipeline.model._budget = 0
-            language_model = getattr(getattr(pipeline.model, "model", None), "language_model", None)
-            if language_model is not None:
-                language_model._budget = 0
         _configure_diffusion_compile_targets(pipeline.model)
 
         pipe = {
@@ -214,7 +209,8 @@ class family_handler:
                 config_path,
             )
 
-        return pipeline, pipe
+        # its decoding steps are MMGP graphs: the language model may stream its layers (memory profile, VRAM preload)
+        return pipeline, {"pipe": pipe, "cudaGraphs": ["transformer"] if lm_features.graphs else False}
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):

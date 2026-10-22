@@ -19,6 +19,7 @@ _sources = weakref.WeakKeyDictionary()  # module -> the names of the checkpoint 
 owner_files = {}  # model id -> the checkpoint files of the model whose weights it pinned
 _lock = threading.RLock()
 _owner = None  # the model whose weights are being pinned (their blocks are registered by copy threads)
+_pool_thread = threading.local()  # .owner: the model whose block enters the pinned pool on this thread (the pool's)
 _users, _patched, _sampler, _stop = 0, [], None, None
 _unpins = {}  # owner -> [blocks, bytes] unregistered and not reported yet: an event per owner and sampling interval
 _explained = 0  # bytes given back by the explicit releases of the RAM allocator's cache since the counters were read
@@ -65,6 +66,16 @@ def pinned_by_owner(owners=None):
                 total = result.setdefault(info["owner"], [0, 0])
                 total[0] += 1
                 total[1] += info["size"]
+    return result
+
+
+def pooled_by_owner():
+    """{owner: blocks} of the RAM registered now by the pinned pool's entries."""
+    result = {}
+    with _lock:
+        for info in registrations.values():
+            if info["pool"]:
+                result[info["owner"]] = result.get(info["owner"], 0) + 1
     return result
 
 
@@ -150,14 +161,25 @@ def _install():
                 record("pin", f"{model_id}{' (' + ', '.join(files) + ')' if files else ''}: {(after[1] - before[1]) / GB:.2f} GiB pinned in {after[0] - before[0]} blocks")
         return wrapped
 
+    def pool_prepare(original):
+        def wrapped(self, manager, model_id, *args, **kwargs):
+            _pool_thread.owner = model_id
+            owner_files[model_id] = sources(manager.models[model_id])  # a model id can be reused by the next model (two "transformer")
+            try:
+                return original(self, manager, model_id, *args, **kwargs)
+            finally:
+                _pool_thread.owner = None
+        return wrapped
+
     def register(original):
         def wrapped(self):
             error = original(self)
             if int(error) == 0:
                 ring = isinstance(self.buffer, torch.Tensor)  # the staging ring; the pinned weights are NumPy arrays
+                pooled = None if ring else getattr(_pool_thread, "owner", None)
                 with _lock:
-                    registrations[self.pointer] = {"size": self.size, "cls": "pinned_ring" if ring else "pinned_mmgp",
-                                                   "owner": "staging ring" if ring else _owner or "?", "t": time.perf_counter()}
+                    registrations[self.pointer] = {"size": self.size, "cls": "pinned_ring" if ring else "pinned_mmgp", "pool": pooled is not None,
+                                                   "owner": "staging ring" if ring else pooled or _owner or "?", "t": time.perf_counter()}
                 if ring:
                     record("ring", f"staging ring of {self.size / MB:.0f} MiB pinned")
             return error
@@ -198,6 +220,7 @@ def _install():
     patch(offload, "_pin_to_memory", pin_to_memory)
     patch(offload._HostRegistration, "register", register)
     patch(offload._HostRegistration, "close", close)
+    patch(offload._PinnedPool, "_prepare", pool_prepare)
     patch(ram, "release", ram_release)
 
 

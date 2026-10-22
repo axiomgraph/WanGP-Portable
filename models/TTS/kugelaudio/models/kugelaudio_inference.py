@@ -96,6 +96,11 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
     """KugelAudio model for inference with speech generation capabilities."""
 
     _tied_weights_keys = ["lm_head.weight"]
+    # mmgp: the diffusion head runs at every sampling step of every frame. Its 4 layers join the dynamic VRAM preload as a tower (kept
+    # when the VRAM allows), its small per-step modules stay with the model base: otherwise they would be streamed at each of these calls
+    _cuda_graph_towers = ("model.prediction_head.layers",)
+    _offload_base_modules = ("model.prediction_head.t_embedder", "model.prediction_head.final_layer", "model.acoustic_connector", "model.semantic_connector")
+
     def __init__(self, config):
         super().__init__(config)
         self.model = KugelAudioModel(config)
@@ -157,8 +162,8 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
             num_steps or self.config.diffusion_head_config.ddpm_num_inference_steps
         )
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self._cuda_graph_hooks.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self._cuda_graph_hooks.set_cuda_graphs(enabled)
 
     def prepare_decode_cuda_graph(self, *, max_batch_size: int, max_cache_tokens: int) -> None:
         self._cuda_graph_hooks.prepare(max_batch_size=max_batch_size, max_cache_tokens=max_cache_tokens)

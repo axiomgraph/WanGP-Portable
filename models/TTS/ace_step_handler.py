@@ -355,7 +355,8 @@ class family_handler:
                 "audio_scale_name": "Source Audio Strength",
                 "audio_prompt_choices": True,
                 "enabled_audio_lora": True,
-                "lm_engines": ["vllm"],
+                "lm_decoder": True,
+                "cuda_graphs": ["transformer"],
                 "prompt_class": "Lyrics",
                 "prompt_infos": "Write the actual lyrics in `prompt`, not an instruction to write a song. Describe the desired sound in `alt_prompt`, for example: warm acoustic folk, fingerpicked guitar, soft female vocals, restrained percussion. For instrumental music, use `[Instrumental]` in `prompt` and describe the instruments in the caption.\n\n" + ACE_STEP_LYRICS_PROMPT_INFOS,
                 "alt_guidance": "LM Guidance (CFG)",
@@ -516,7 +517,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         transformer_weights = None
@@ -551,7 +552,7 @@ class family_handler:
             silence_latent = _get_model_path(model_def, "ace_step15_silence_latent", _ace_step15_ckpt_file(ACE_STEP15_SILENCE_LATENT_NAME))
             if enable_lm:
                 lm_weight_name = os.path.basename(str(lm_weights)) if lm_weights else ""
-                print(f"[ace_step15] LM engine='{lm_decoder_engine}' | LM weights='{lm_weight_name}'")
+                print(f"[ace_step15] LM weights='{lm_weight_name}'")
 
             pipeline = ACEStep15Pipeline(
                 transformer_weights_path=transformer_weights,
@@ -566,7 +567,7 @@ class family_handler:
                 silence_latent_path=silence_latent,
                 enable_lm=enable_lm,
                 ignore_lm_cache_seed=ignore_lm_cache_seed,
-                lm_decoder_engine=lm_decoder_engine,
+                lm_features=lm_features,
                 device=mps_device(),
                 dtype=dtype or torch.bfloat16,
             )
@@ -579,7 +580,7 @@ class family_handler:
             if text_encoder_filename and pipeline.lm_model is not None:
                 pipe["text_encoder"] = pipeline.lm_model
 
-            pipe = { "pipe": pipe, "coTenantsMap": {}, }
+            pipe = { "pipe": pipe, "coTenantsMap": {}, "cudaGraphs": ["text_encoder"] if "text_encoder" in pipe and lm_features.graphs else False}
 
             if save_quantized and transformer_weights:
                 from wgp import save_quantized_model

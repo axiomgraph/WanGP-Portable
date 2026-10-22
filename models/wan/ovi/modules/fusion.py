@@ -5,13 +5,14 @@
 import torch
 import torch.nn as nn
 from .model import WanLayerNorm, WanModel, WanRMSNorm, rope_apply
+from ...modules.model import gated_frames_, modulate_frames
 from shared.attention import pay_attention
+from shared.kernels import ops as kernels
 
-def reshape_latent(latent, latent_frames):
-    return latent.reshape(latent.shape[0], latent_frames, -1, latent.shape[-1] )
 
-def restore_latent_shape(latent):
-    return latent.reshape(latent.shape[0], -1, latent.shape[-1] )
+def _frame_modulation(block, e):
+    """The block's six modulation rows (ModulationAdd, called as a module) as contiguous (1, frames, dim) rows per latent frame."""
+    return block.modulation(e).transpose(0, 1).contiguous().chunk(6)
 
 class FusionModel(nn.Module):
     def __init__(self, video_config=None, audio_config=None):
@@ -155,40 +156,9 @@ class FusionModel(nn.Module):
                                                                        context_lens=context_lens
                                                                        )
 
-        latent_frames = src_e[0].shape[0]
-
-        y = attn_block.norm2(src_seq).to(torch.bfloat16)
-        y = reshape_latent(y , latent_frames)        
-        y *= (1 + src_e[4].squeeze(2)) 
-        y += src_e[3].squeeze(2)
-        y = restore_latent_shape(y)        
-        # y = attn_block.ffn(y)
-
-
-        ffn = attn_block.ffn[0]
-        gelu = attn_block.ffn[1]
-        ffn2= attn_block.ffn[2]
-
-        y_shape = y.shape
-        y = y.view(-1, y_shape[-1])
-        chunk_size = int(y.shape[0]/2.7)
-        chunks =torch.split(y, chunk_size)
-        for y_chunk  in chunks:
-            mlp_chunk = ffn(y_chunk)
-            mlp_chunk = gelu(mlp_chunk)
-            y_chunk[...] = ffn2(mlp_chunk)
-            del mlp_chunk 
-        y = y.view(y_shape)
-
-        src_seq, y = reshape_latent(src_seq , latent_frames), reshape_latent(y , latent_frames)        
-        src_seq.addcmul_(y, src_e[5].squeeze(2))
-        src_seq = restore_latent_shape(src_seq)        
-        del y
-
-        # # y = attn_block.ffn(attn_block.norm2(src_seq).bfloat16() * (1 + src_e[4].squeeze(2)) + src_e[3].squeeze(2))
-        # with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        #     src_seq = src_seq + y * src_e[5].squeeze(2)
-        return src_seq
+        y_list = [modulate_frames(src_seq, attn_block.norm2, src_e[3], src_e[4], torch.bfloat16)]
+        # the FFN by chunks, its output gated per latent frame into src_seq
+        return kernels.mlp(y_list, attn_block.ffn[0], attn_block.ffn[2], "gelu", residual=src_seq, segments=kernels.gate_segments(src_e[5], src_seq.shape[0], src_seq.shape[1]))
         
     def single_fusion_block_forward(self,
                                     vid_block,
@@ -209,36 +179,22 @@ class FusionModel(nn.Module):
                                     audio_context_lens,
                                     ):
         ## audio modulation
-        audio_e = audio_block.modulation(audio_e).chunk(6, dim=1)
+        audio_e = _frame_modulation(audio_block, audio_e)
 
         # audio self-attention
-        audio_y = audio_block.norm1(audio).to(torch.bfloat16)
-        audio_y *= (1 + audio_e[1].squeeze(2)) 
-        audio_y += audio_e[0].squeeze(2)
-        audio_y = audio_block.self_attn(audio_y, audio_seq_lens, audio_grid_sizes, audio_freqs)
-
-        audio.addcmul_(audio_y, audio_e[2].squeeze(2))
+        audio_y = modulate_frames(audio, audio_block.norm1, audio_e[0], audio_e[1], torch.bfloat16)
+        audio_y_list = [audio_block.self_attn(audio_y, audio_seq_lens, audio_grid_sizes, audio_freqs)]
         del audio_y
-
-        latent_frames = vid_e.shape[0]
+        audio = gated_frames_(audio, audio_y_list, audio_e[2])
 
         ## video modulation
-        vid_e = vid_block.modulation(vid_e).chunk(6, dim=1)
-
+        vid_e = _frame_modulation(vid_block, vid_e)
 
         # video self-attention
-        vid_y = vid_block.norm1(vid).to(torch.bfloat16)
-        vid_y = reshape_latent(vid_y , latent_frames)        
-        vid_y *= (1 + vid_e[1].squeeze(2)) 
-        vid_y += vid_e[0].squeeze(2)
-        vid_y = restore_latent_shape(vid_y)        
-        vid_y = vid_block.self_attn(vid_y, vid_seq_lens, vid_grid_sizes, vid_freqs)
-    
-
-        vid, vid_y = reshape_latent(vid , latent_frames), reshape_latent(vid_y , latent_frames)        
-        vid.addcmul_(vid_y, vid_e[2].squeeze(2))
-        vid = restore_latent_shape(vid)        
+        vid_y = modulate_frames(vid, vid_block.norm1, vid_e[0], vid_e[1], torch.bfloat16)
+        vid_y_list = [vid_block.self_attn(vid_y, vid_seq_lens, vid_grid_sizes, vid_freqs)]
         del vid_y
+        vid = gated_frames_(vid, vid_y_list, vid_e[2])
 
         # og_audio = audio
 

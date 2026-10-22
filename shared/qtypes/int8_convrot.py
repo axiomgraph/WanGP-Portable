@@ -287,6 +287,13 @@ def _collect_specs(state_dict, metadata=None):
     return specs
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this INT8 weight (INT8 ConvRot or Quanto qint8) compute on the CPU in its storage when MMGP leaves their block
+    there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, WeightQBytesTensor) and tensor._data.dtype == torch.int8 and cpu_linear.supported(tensor)
+
+
 def detect(state_dict, verboseLevel=1, metadata=None):
     specs = _collect_specs(state_dict, metadata)
     if not specs:
@@ -308,6 +315,8 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None,
         weight = state_dict.pop(base + ".weight")
         scale = state_dict.pop(base + ".weight_scale")
         state_dict.pop(base + ".comfy_quant", None)
+        if scale.numel() == 1:
+            scale = scale.reshape(1, 1).expand(weight.shape[0], 1).contiguous()
         if scale.numel() == weight.shape[0]:
             scale = scale.reshape(weight.shape[0], 1)
         if scale.numel() != weight.shape[0]:
@@ -452,6 +461,11 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            if self.weight_qtype == _QINT8_CONVROT_QTYPE:
+                input = _rotate_activation(input, self._convrot_group_size)
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
         prepared = getattr(self, '_wangp_prequantized_input', None)
         if prepared is not None:
             return int8_backend.linear_prequantized(qweight, self.bias, *prepared)
@@ -466,6 +480,9 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
                 return int8_backend.wgp_linear(input, qweight, self.bias, group=self._convrot_group_size)
             if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256
                     and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16, torch.float32)):
+                # This direct kernel bypasses F.linear's autocast (LayerNorm can supply FP32 even in a BF16 encoder).
+                if torch.is_autocast_enabled("cuda"):
+                    input = input.to(torch.get_autocast_dtype("cuda"))
                 return int8_backend.kitchen_linear(input, qweight, self.bias, convrot=True)
             if (quanto_int8_inject.FUSED_CONVROT_ENABLED and quanto_int8_inject._PATCH_STATE.enabled
                     and self._convrot_group_size == 256

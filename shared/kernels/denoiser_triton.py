@@ -19,8 +19,10 @@ def _modulate(X, SCALE, SHIFT, N, D: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(X + i, scaled + shift, valid)
 
 
-def norm_modulate(x, norm, shift, scale, segments):
+def norm_modulate(x, norm, shift, scale, segments, dtype=None):
     output = norm(x)
+    if dtype is not None:
+        output = output.to(dtype)
     width = x.shape[-1]
     for start, stop, row in segments:
         if stop > start:
@@ -44,11 +46,12 @@ _TUNE_ROWS = 1 << 17  # cap tuning scratch
 
 @triton.jit(do_not_specialize=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'], do_not_specialize_on_alignment=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'])
 def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
-              PAIRS: tl.constexpr, BLOCK: tl.constexpr):
+              PAIRS: tl.constexpr, BLOCK: tl.constexpr, INTERLEAVED: tl.constexpr):
     """Rows (batch, token, head) of Q or K, loaded whole: weighted RMSNorm in FP32 rounded to the activation dtype (the norm output),
-    then the split-half rotation of the first 2 * PAIRS channels in FP32 with one final rounding (cos / sin pairs of ROPE); the other
-    channels keep the norm output. 128-channel heads sum the squares as Comfy Kitchen does (lane sums of c, c + 32, c + 64, c + 96, then
-    the lanes): its results bit for bit."""
+    then the rotation of the first 2 * PAIRS channels in FP32 with one final rounding (cos / sin pairs of ROPE): channel p with
+    p + PAIRS (split halves) or, INTERLEAVED, 2p with 2p + 1 (a complex table viewed as real); the other channels keep the norm
+    output. 128-channel heads sum the squares as Comfy Kitchen does (lane sums of c, c + 32, c + 64, c + 96, then the lanes): its
+    results bit for bit."""
     rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     ok = rows < ROWS
     head = rows % HEADS
@@ -60,10 +63,17 @@ def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.cons
     ptr = X + base[:, None] + c[None, :]
     x = tl.load(ptr, ok[:, None], 0).to(tl.float32)
     rotated = c < 2 * PAIRS
-    partner = tl.where(c < PAIRS, c + PAIRS, tl.where(rotated, c - PAIRS, c))
+    if INTERLEAVED:
+        leading = c % 2 == 0
+        partner = tl.where(rotated, c ^ 1, c)
+        pair = c // 2
+    else:
+        leading = c < PAIRS
+        partner = tl.where(leading, c + PAIRS, tl.where(rotated, c - PAIRS, c))
+        pair = tl.where(leading, c, c - PAIRS)
     other = tl.load(X + base[:, None] + partner[None, :], ok[:, None], 0).to(tl.float32)
     if D == 128:
-        lanes = tl.reshape(tl.permute(tl.reshape(x, (BLOCK, 4, 32)), (0, 2, 1)), (BLOCK, 32, 2, 2))
+        lanes = tl.reshape(tl.permute(tl.reshape(x, (BLOCK, 4, 32)), 0, 2, 1), (BLOCK, 32, 2, 2))  # variadic dims: Triton 3.2 rejects the tuple form
         even, odd = tl.split(lanes)
         x0, x2 = tl.split(even)
         x1, x3 = tl.split(odd)
@@ -73,18 +83,19 @@ def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.cons
     inv = libdevice.rsqrt(total / D + EPS)[:, None]
     y = (x * inv * tl.load(W + c).to(tl.float32)[None, :]).to(X.dtype.element_ty).to(tl.float32)
     other = (other * inv * tl.load(W + partner).to(tl.float32)[None, :]).to(X.dtype.element_ty).to(tl.float32)
-    angle = batch[:, None] * RB + seq[:, None] * RS + tl.where(c < PAIRS, c, c - PAIRS)[None, :] * RP
+    angle = batch[:, None] * RB + seq[:, None] * RS + pair[None, :] * RP
     mask = ok[:, None] & rotated[None, :]
     cos = tl.load(ROPE + angle, mask, 1.0).to(tl.float32)
     sin = tl.load(ROPE + angle + RC, mask, 0.0).to(tl.float32)
-    first = c[None, :] < PAIRS
+    first = leading[None, :]
     out = tl.fma(tl.where(first, cos, sin), tl.where(first, y, other), tl.where(first, -sin, cos) * tl.where(first, other, y))
     tl.store(ptr, tl.where(rotated[None, :], out, y), ok[:, None])
 
 
-def rms_rope_(x, weight, rope, eps):
+def rms_rope_(x, weight, rope, eps, *, interleaved=False):
     """In place on Q or K (batch, tokens, heads, head_dim), any strides with contiguous channels (views of a fused projection); weight:
-    the RMSNorm weight; rope: (1 | batch, tokens, 1, pairs, 2) cos / sin of the split-half rotation of the first 2 * pairs channels."""
+    the RMSNorm weight; rope: (1 | batch, tokens, 1, pairs, 2) cos / sin of the rotation of the first 2 * pairs channels, split halves
+    or interleaved pairs (2p, 2p + 1: a complex table viewed as real)."""
     batch, seq, heads, dim = x.shape
     rope_batch = 0 if rope.shape[0] == 1 else rope.stride(0)
 
@@ -92,7 +103,7 @@ def rms_rope_(x, weight, rope, eps):
         block, warps = config
         rows = xx.shape[0] * xx.shape[1] * heads
         _rms_rope[(triton.cdiv(rows, block),)](xx, weight, rope, rows, heads, xx.shape[1], *xx.stride()[:3], rope_batch, rope.stride(1), eps,
-                                               rope.stride(3), rope.stride(4), dim, rope.shape[-2], block, num_warps=warps, enable_fp_fusion=False)
+                                               rope.stride(3), rope.stride(4), dim, rope.shape[-2], block, interleaved, num_warps=warps, enable_fp_fusion=False)
 
     def prepare_scratch():  # a copy of the first rows, in the head layout of x
         tokens = max(1, min(seq, _TUNE_ROWS // heads))
@@ -100,7 +111,7 @@ def rms_rope_(x, weight, rope, eps):
         scratch.copy_(x[:1, :tokens])
         return lambda config: launch(scratch, config)
 
-    config = _TUNER.config("rms_rope", f"{x.dtype}|{heads}x{dim}|p{rope.shape[-2]}|s{x.stride(2)}", x.device, _ROPE_CONFIGS, prepare_scratch,
+    config = _TUNER.config("rms_rope", f"{x.dtype}|{heads}x{dim}|p{rope.shape[-2]}|s{x.stride(2)}|I{int(interleaved)}", x.device, _ROPE_CONFIGS, prepare_scratch,
                            batch * seq * heads >= _TUNE_ROWS)
     launch(x, config)
     torch.autograd.graph.increment_version(x)
@@ -111,8 +122,8 @@ from shared.kernels.triton_compilation_log import install_triton_compilation_log
 install_triton_compilation_logger()
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _scale_shift(X, SCALE, SHIFT, Y, N, D: tl.constexpr, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=['N', 'MOD_STRIDE'], do_not_specialize_on_alignment=['N', 'MOD_STRIDE'])
+def _scale_shift(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D: tl.constexpr, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     # A grid row owns one conditioning row and all tokens that borrow it.
     # No runtime integer divisions are needed to recover batch/frame indices.
@@ -121,9 +132,9 @@ def _scale_shift(X, SCALE, SHIFT, Y, N, D: tl.constexpr, PER_TOKEN: tl.constexpr
     if PER_TOKEN:
         s = i
     elif D % BLOCK == 0:
-        s = group * D + (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
+        s = group * MOD_STRIDE + (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
     else:
-        s = group * D + i % D
+        s = group * MOD_STRIDE + i % D
     x = tl.load(X + offset, i < N, 0).to(tl.float32)
     scale = tl.load(SCALE + s, i < N, 0).to(tl.float32)
     shift = tl.load(SHIFT + s, i < N, 0).to(tl.float32)
@@ -134,21 +145,43 @@ def _scale_shift(X, SCALE, SHIFT, Y, N, D: tl.constexpr, PER_TOKEN: tl.constexpr
 
 def scale_shift(x, scale, shift, in_place):
     out = x if in_place else torch.empty_like(x)
-    per_token = scale.shape[1] == x.shape[1]
+    per_token = scale.shape[1] == x.shape[1] and scale.is_contiguous()  # strided per-token rows go through the row groups
     groups = 1 if per_token else scale.shape[0] * scale.shape[1]
     size = x.numel() // groups
     _scale_shift[(triton.cdiv(size, 1024), groups)](
-        x, scale, shift, out, size, x.shape[2], per_token, 1024,
+        x, scale, shift, out, size, modulation_stride(scale), x.shape[2], per_token, 1024,
         enable_fp_fusion=False)
     if in_place:
         torch.autograd.graph.increment_version(out)
     return out
 
 
+@triton.jit
+def _axis_row(token, AXIS: tl.constexpr, G0, G1, G2):
+    # The token's position along grid axis AXIS (0: first, 1: second, else: third) whose frequency table the kernel reads.
+    if AXIS == 0:
+        row = token // (G1 * G2) % G0
+    elif AXIS == 1:
+        row = token // G2 % G1
+    else:
+        row = token % G2
+    return row
+
+
+def _axis_ids(rope_axes):
+    """The grid axis of each frequency table as three constexpr ints (a constexpr tuple is not subscriptable on Triton 3.2)."""
+    return tuple(rope_axes) + (0,) * (3 - len(rope_axes))
+
+
+def modulation_stride(scale):
+    """Elements between consecutive modulation rows: LTX hands unbind views of a (B, T, K, D) projection, stride K * D."""
+    return scale.stride(1) if scale.shape[1] > 1 else scale.stride(0)
+
+
 @triton.jit(do_not_specialize=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'], do_not_specialize_on_alignment=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'])
 def _split_rope(X, C0, S0, C1, S1, C2, S2, N, TOKENS,
                 WIDTH, HALF: tl.constexpr, PAD: tl.constexpr,
-                AXES: tl.constexpr, G0, G1, G2, AXIS_IDS: tl.constexpr,
+                AXES: tl.constexpr, G0, G1, G2, A0: tl.constexpr, A1: tl.constexpr, A2: tl.constexpr,
                 FREQ_WIDTH: tl.constexpr, BATCH_STRIDE, HEAD_START,
                 FP32: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -163,20 +196,17 @@ def _split_rope(X, C0, S0, C1, S1, C2, S2, N, TOKENS,
     c = tl.full((BLOCK,), 1.0, tl.float32)
     s = tl.full((BLOCK,), 0.0, tl.float32)
     for a in tl.static_range(AXES):
-        if AXIS_IDS[a] == 0:
-            row = token // (G1 * G2) % G0
-        elif AXIS_IDS[a] == 1:
-            row = token // G2 % G1
-        else:
-            row = token % G2
         valid = (i < N) & (f >= PAD) & (axis == a)
         if a == 0:
+            row = _axis_row(token, A0, G0, G1, G2)
             cv = tl.load(C0 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
             sv = tl.load(S0 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
         elif a == 1:
+            row = _axis_row(token, A1, G0, G1, G2)
             cv = tl.load(C1 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
             sv = tl.load(S1 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
         else:
+            row = _axis_row(token, A2, G0, G1, G2)
             cv = tl.load(C2 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
             sv = tl.load(S2 + row * FREQ_WIDTH + col, valid, 0).to(tl.float32)
         c = tl.where(valid, cv, c)
@@ -202,5 +232,5 @@ def split_rope(x, cache, layout, head_start=0, dim_head=None):
     size = x.numel() // 2
     return _split_rope[(triton.cdiv(size, 256),)](
         x, *pointers, size, x.shape[1], x.shape[2], (dim_head or x.shape[2] // cache.num_attention_heads) // 2,
-        cache.pad_size, len(cos), *(layout.grid_sizes + (1,) * (3 - len(layout.grid_sizes))), cache.rope_axes, cos[0].shape[1],
+        cache.pad_size, len(cos), *(layout.grid_sizes + (1,) * (3 - len(layout.grid_sizes))), *_axis_ids(cache.rope_axes), cos[0].shape[1],
         x.stride(0), head_start, cache.use_fp32_freqs, 256, enable_fp_fusion=False)

@@ -82,10 +82,16 @@ You can ask Deepy to:
 - inspect images, video frames, and 3D assets, or compare several visuals
 - report useful media details such as dimensions, duration, FPS, frame count, and audio tracks, and for 3D assets their size and animation frames
 - extract images, clips, or audio; transcribe audio or video; mute or replace a video soundtrack; resize or crop media; compose assets side by side; and merge videos
+- find available LoRAs, explain the active tool defaults, and answer WanGP usage questions
+
+Prime can also:
+
 - render views of a 3D asset at one consistent scale (front, sides, back, any angle, any animation frame, close-ups, and depth or normal images to guide other models)
 - draw images from a precise layout, with shapes, text, and gallery images placed where needed
 - build a character sheet: the same character from several angles with a title and labels, which then helps keep the character consistent in later images and videos
-- find available LoRAs, explain the active tool defaults, and answer WanGP usage questions
+- measure audio levels and silences, separate vocals, convert or combine image channels, and mask named objects
+
+Zero keeps a shorter tool list so that it stays fast and leaves most of its context for the conversation.
 
 Prime is especially useful for requests with dependencies. It can create an intermediate asset, inspect it, revise it if necessary, and use the accepted result in the next stage.
 Prime can use `remux_media` to mix stems into one audio stream, package separate selectable audio tracks, or add selectable subtitle tracks to a video. Subtitle files may be SRT, VTT, ASS, or SSA in an authorized workspace path; use `subtitle_tracks` with optional language, title, and default status. Existing video subtitle tracks are retained unless `include_video_subtitles=false`. With a video and subtitles but no audio inputs, compatible existing audio is copied; incompatible audio is converted only when the chosen container requires it. MP4/MOV subtitles use `mov_text`; MKV retains compatible subtitles or converts incompatible ones. Audio-only mixes follow the configured standalone WAV/MP3 format unless you request a supported output extension; separate audio-only tracks use M4A.
@@ -352,19 +358,29 @@ For Qwen3.8 27B:
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
 - **GGUF Q2** has the lowest memory use and the largest quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
 
-If Deepy frequently unloads other models, runs out of memory, or leaves too little VRAM for media generation, select a smaller model or lower quantization before reducing the context window drastically.
+Deepy keeps as much of its local model in VRAM as fits beside its context cache. When the whole model does not fit, it streams the remaining layers from RAM at each step: it keeps working, but it answers more slowly the more layers are streamed, and it frees VRAM by itself when an image is inspected or another component needs memory. Deepy always uses the fastest kernels that are installed; there is no decoder setting to choose.
+
+**Configuration > Performance > Language Models CPU Compute** speeds up this case: while Deepy writes, the CPU processes the layers that stay in RAM instead of sending them to the GPU at each word.
+- **Auto** (default) chooses for your PC: it measures whether your CPU or the GPU transfers are faster for the model's format, and the CPU processes part of the layers left in RAM while the GPU receives the others. Deepy then answers about twice as fast.
+- **On** makes the CPU help even when it measured slower, to compare both ways on your PC.
+- Deepy's language model always uses Memory Profile 0, whatever the profile of your other models: while it writes, the layers it streams are kept in your Reserved RAM, which goes back to the other models when you switch. This setting only decides whether the CPU helps.
+- Models that are expensive to process on a CPU (2-bit and ternary weights such as IQ2 and Bonsai) keep streaming their layers to the GPU.
+- The setting has no effect when the model fits in VRAM. Reading prompts and images still uses the GPU.
+- While Deepy writes, the CPU is fully busy. Choose **Off** if other work needs the CPU.
+
+If Deepy frequently unloads other models, runs out of memory, answers slowly, or leaves too little VRAM for media generation, select a smaller model or lower quantization before reducing the context window drastically.
 
 ### Speculative Decoding
 
 Speculative decoding can generate Deepy's text faster by predicting several tokens ahead. More draft tokens can improve speed for some requests but use more VRAM, and the fastest setting varies by model and workload.
 
-Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model, quantization, or decoder resets the method to **Auto**.
+Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model or quantization resets the method to **Auto**.
 
 - **Auto** enables MTP on supported models when WanGP detects enough VRAM: normally at least 12 GB for Qwen3.5 9B and 24 GB for Qwen3.8 27B. The token count is automatic.
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
 - **MTP** supports 1–8 draft tokens on Qwen3.5 9B and Qwen3.8/Bonsai 27B. Start with 2.
-- **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B with the vLLM decoder (including Auto decoder selection).
-- **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, with the vLLM decoder (including Auto decoder selection). WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
+- **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed.
+- **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, when Triton and FlashAttention 2 are installed. WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
 
 Each method label includes its estimated additional VRAM: approximately 0.5–1 GiB for MTP and 4–5 GiB for DSpark or DFlash2 at roughly 32K context. Auto adds between zero and the MTP cost. Longer context, draft count, and model choice affect actual usage. Compare representative prompts before choosing a prediction method: Disabled can be fastest, especially with Bonsai.
 
@@ -403,12 +419,12 @@ If generations fail to fit after changing this setting, move one level toward ea
 
 The context window is how much recent conversation, tool output, and project state the local model can consider at once. A larger value helps Deepy follow long projects and retain more detail before summarization, but its KV cache consumes more VRAM and long context can take longer to prepare.
 
-- **8K-16K** is suitable for short Zero conversations and uses the least memory.
+- **20K** is the minimum, suitable for short Zero conversations, and uses the least memory.
 - **32K** is the practical minimum for Prime with **Summarize**.
 - **48K or more** supports **Summarize with Thinking** and longer projects, with increasing memory cost.
 - **Very large windows** are useful only when the extra history materially improves the workflow and the displayed KV-cache estimate fits comfortably alongside your generation models.
 
-**Recommendation:** start around 16K for Zero, 32K for Prime, or 48K for Prime when using compaction thinking. Increase it only when Deepy summarizes too often or loses relevant recent detail.
+**Recommendation:** start around 20K for Zero, 32K for Prime, or 48K for Prime when using compaction thinking. Increase it only when Deepy summarizes too often or loses relevant recent detail.
 
 ### KV Cache Quantization
 

@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from shared.kernels import scaled_fp16
 
 from shared.utils.conv_bands import conv_bands
 import torch.utils.checkpoint
@@ -103,7 +104,8 @@ class QwenImageCausalConv3d(nn.Conv3d):
     def forward(self, x, cache_x=None):
         if cache_x is None and x.shape[2] == 1 and self._padding[4] == self.kernel_size[0] - 1:
             # one frame without history: the causal padding frames are zeros, only the kernel's last time slice reads data; by bands of rows
-            conv = functools.partial(F.conv2d, weight=self.weight[:, :, -1], bias=self.bias, stride=self.stride[1:], padding=(self._padding[2], self._padding[0]))
+            conv = functools.partial(scaled_fp16.conv2d, weight=self.weight[:, :, -1], bias=self.bias, stride=self.stride[1:], padding=(self._padding[2], self._padding[0]),
+                                     owner=self, key="_scaled_fp16_stats_2d")  # F.conv2d, or on Turing the BF16 weights on FP16 tensor cores
             return conv_bands(x[:, :, 0], conv).unsqueeze(2)
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:

@@ -20,7 +20,7 @@ import torch
 from shared.utils.phase_progress import GenerationAborted, PhaseProgress
 import torch.nn.functional as F
 from einops import rearrange
-from shared.kernels import vae_ops
+from shared.kernels import ops as kernels, vae_ops
 from torch import nn
 from tqdm import tqdm
 
@@ -33,7 +33,6 @@ from .tiling import TilingConfig, compute_trapezoidal_mask_1d
 
 _NA_SCORE_BUDGET = 2**25
 _NA_KV_STACK_BUDGET = 2**28
-_MLP_TOKEN_CHUNK = 4096
 _TRITON_NA_AVAILABLE, _TRITON_VERSION = vae_ops.neighborhood_status()
 
 
@@ -329,23 +328,8 @@ class SwiGLU(nn.Module):
         self.w_down = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x_list: list[torch.Tensor]) -> torch.Tensor:
-        x = _take_tensor(x_list)
-        shape = x.shape
-        flat = x.reshape(-1, shape[-1])
-        x = None
-        out = torch.empty_like(flat)
-        token_chunk = min(_MLP_TOKEN_CHUNK, max(1, flat.numel() // self.w_up.out_features))
-        for start in range(0, flat.shape[0], token_chunk):
-            values = flat[start:start + token_chunk]
-            hidden = F.silu(self.w_gate(values), inplace=True)
-            hidden.mul_(self.w_up(values))
-            rows = hidden.shape[0]
-            hidden_list = [hidden]
-            hidden = None
-            down = _linear_disposable(self.w_down, hidden_list)
-            out[start:start + rows] = down
-            down = None
-        return out.view(shape)
+        """w_down(silu(w_gate(x)) * w_up(x)) by chunks of tokens (shared chunked FFN), written over x (handed off, contiguous)."""
+        return kernels.mlp(x_list, self.w_gate, self.w_down, "swiglu", up=self.w_up)
 
 
 class NABlock(nn.Module):
@@ -381,6 +365,13 @@ class NABlock(nn.Module):
         return x, keyframe_x
 
 
+def _norm_modulate(norm: nn.RMSNorm, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    """norm(x) * (1 + scale) + shift in place of the norm output, x (batch, t, h, w, channels) borrowed, one modulation per batch row:
+    the shared scale/shift on a (batch, tokens, channels) view."""
+    batch = x.shape[0]
+    return kernels.norm_scale_shift([x.view(batch, -1, x.shape[-1])], norm, scale.view(batch, 1, -1), shift.view(batch, 1, -1)).view(x.shape)
+
+
 class DiffusionNABlock(nn.Module):
     def __init__(self, dim: int, kernel_size: tuple[int, int, int], context_channels: int, head_dim: int = 64, rope_dim_split: tuple[int, int, int] | None = None):
         super().__init__()
@@ -397,24 +388,24 @@ class DiffusionNABlock(nn.Module):
         scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [modulation[index] + self.scale_shift_table[index].view(1, 1, 1, 1, -1) for index in range(7)]
         x.add_(self.context_proj(context))
         keyframe_x.add_(self.context_proj(keyframe_context))
-        attention_out, keyframe_attention = self.attn.forward_with_keyframes([self.norm1(x).mul_(1 + scale_msa).add_(shift_msa)], [self.norm1(keyframe_x).mul_(1 + scale_msa).add_(shift_msa)], keyframe_times)
+        attention_out, keyframe_attention = self.attn.forward_with_keyframes([_norm_modulate(self.norm1, x, scale_msa, shift_msa)], [_norm_modulate(self.norm1, keyframe_x, scale_msa, shift_msa)], keyframe_times)
         x.add_(attention_out)
         keyframe_x.add_(keyframe_attention)
         attention_out = keyframe_attention = None
-        x.add_(self.mlp([self.norm2(x).mul_(1 + scale_mlp).add_(shift_mlp)]))
-        keyframe_x.add_(self.mlp([self.norm2(keyframe_x).mul_(1 + scale_mlp).add_(shift_mlp)]))
+        x.add_(self.mlp([_norm_modulate(self.norm2, x, scale_mlp, shift_mlp)]))
+        keyframe_x.add_(self.mlp([_norm_modulate(self.norm2, keyframe_x, scale_mlp, shift_mlp)]))
         return x, keyframe_x
 
     def forward(self, context: torch.Tensor, x: torch.Tensor, modulation: tuple[torch.Tensor, ...]) -> torch.Tensor:
         scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [modulation[index] + self.scale_shift_table[index].view(1, 1, 1, 1, -1) for index in range(7)]
         x.add_(self.context_proj(context))
-        attention_input = self.norm1(x).mul_(1 + scale_msa).add_(shift_msa)
+        attention_input = _norm_modulate(self.norm1, x, scale_msa, shift_msa)
         attention_list = [attention_input]
         attention_input = None
         attention_out = self.attn(attention_list)
         x.add_(attention_out)
         attention_out = None
-        mlp_input = self.norm2(x).mul_(1 + scale_mlp).add_(shift_mlp)
+        mlp_input = _norm_modulate(self.norm2, x, scale_mlp, shift_mlp)
         mlp_list = [mlp_input]
         mlp_input = None
         mlp_out = self.mlp(mlp_list)

@@ -35,9 +35,21 @@ def generation_downloads(get_gen_info, get_offloadobj=lambda: None):
     return decorate
 
 
+def _offline():
+    # --offline sets HF_HUB_OFFLINE before Hugging Face libraries load, which then never download either
+    from huggingface_hub import constants
+    return constants.HF_HUB_OFFLINE
+
+
+def _ensure_online(name):
+    if _offline():
+        raise DownloadError(f"{name} is missing and WanGP runs offline (--offline): copy it into a checkpoints folder, or run once without --offline to download it")
+
+
 def _hf_download(*, gen=None, show_filename=True, file_index=1, file_count=1, **kwargs):
     from huggingface_hub import hf_hub_download
 
+    _ensure_online(kwargs["filename"])
     gen = resolve_download_gen(gen)
     install_hf_download_patch()
     try:
@@ -172,8 +184,9 @@ def process_files_def(repoId=None, sourceFolderList=None, fileList=None, targetF
         targetRoot = fl.get_smart_download_root(explicit_target)
         local_dir = os.path.join(targetRoot, targetFolder) if targetFolder is not None else targetRoot
         if len(files) == 0:
-            if gen is None:
+            if gen is None or _offline():  # offline: the remote listing is unreachable, a folder present locally is taken as complete
                 if fl.locate_folder(sourceFolder if targetFolder is None else os.path.join(targetFolder, sourceFolder), error_if_none=False) is None:
+                    _ensure_online(sourceFolder)
                     snapshot_download(repo_id=repoId, allow_patterns=sourceFolder + "/*", local_dir=local_dir)
                 continue
             # Explicit iteration keeps the opt-in context in this thread, including folder downloads.
@@ -298,6 +311,7 @@ def download_file(url, filename, gen=None, show_filename=True):
 
     gen = resolve_download_gen(gen)
     check_download_cancelled(gen)
+    _ensure_online(os.path.basename(filename))
     url = url.split("|")[0]
     if url.startswith("https://huggingface.co/") and "/resolve/main/" in url:
         base_dir = os.path.dirname(filename)

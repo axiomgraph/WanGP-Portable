@@ -270,11 +270,14 @@ def name_models(models):
 
 
 def reset():
-    """New peaks and totals (between two generations); the allocations alive stay recorded."""
+    """New peaks and totals (between two generations); the allocations alive stay recorded. The allocator's peaks restart too: the header of
+    the next report covers the same period as its phases."""
     rec = _rec
     if rec is None:
         return
-    _library().vmm_debug_reset()
+    lib = _library()
+    lib.vmm_debug_reset()
+    lib.vmm_reset_peaks(_device())
     rec.phase = None
     mark("start")
 
@@ -331,10 +334,9 @@ _WEIGHT_LOADERS = {"to_gpu", "_take_slot", "_move_block", "copy_block", "cpu_to_
 def _where(rec, stack_id):  # the innermost frame of the application's own code, or mmgp's when it loads model weights
     if stack_id < 0:
         return ""
-    code, line = rec.stack_frames[stack_id][0]
-    if code.co_name in _WEIGHT_LOADERS and code.co_filename.endswith(os.path.join("mmgp", "offload.py")):
-        return _frame_text(code, line) + " (model weights loaded by mmgp)"
-    for code, line in rec.stack_frames[stack_id]:
+    for code, line in rec.stack_frames[stack_id]:  # library frames may come first (e.g. PyTorch's default device mode)
+        if code.co_name in _WEIGHT_LOADERS and code.co_filename.endswith(os.path.join("mmgp", "offload.py")):
+            return _frame_text(code, line) + " (model weights loaded by mmgp)"
         if not any(part in code.co_filename for part in _INTERNAL):
             return _frame_text(code, line)
     return _frame_text(*rec.stack_frames[stack_id][0])
@@ -475,6 +477,22 @@ def _phase_summary(phase, title):
             f"spilled {phase['spilled_gb']:.2f} GiB.{heaps}\n\n{_table(phase['groups'], 25)}\n\n")
 
 
+def _coverage_warnings(result):
+    """What the phases below do not show: a peak of the period above all of theirs (reached without a phase snapshot), and memory in
+    allocations below the recording threshold (counted, not itemized)."""
+    warnings, allocator = [], result.get("allocator") or {}
+    top = max((phase["allocated_gb"] for phase in result["phases"]), default=0.0)
+    if allocator and allocator["peak_allocated"] > top + 0.02:
+        warnings.append(f"**The peak in use of this period ({allocator['peak_allocated']:.2f} GiB) is above every phase peak below ({top:.2f} GiB)**: "
+                        "it was reached outside them (before the recording or between two reports), its tensors are not listed.\n\n")
+    smaller = [phase for phase in result["phases"] if phase["smaller_gb"] >= max(0.25, 0.2 * phase["allocated_gb"])]
+    if smaller:
+        warnings.append("**Allocations below the recording threshold weigh "
+                        + ", ".join(f"{phase['smaller_gb']:.2f} GiB at the peak of {phase['name']}" for phase in smaller)
+                        + f"**: not itemized at {result['threshold_mb']} MB, a lower threshold (e.g. 1 MB) lists them.\n\n")
+    return warnings
+
+
 def summary(result):
     """Markdown summary of a report."""
     text = [f"# VRAM debug report, {result['created']}: allocations of {result['threshold_mb']} MB and more\n\n"]
@@ -490,6 +508,7 @@ def summary(result):
                     + (f"**models still alive: {', '.join(release['alive'])}**; " if release["alive"] else "")
                     + (f"**{release['vram_still_held_gb']:.2f} GiB of recorded VRAM still held by their modules**:\n\n{_table(release['groups'], 15)}\n\n" if release["groups"]
                        else "no recorded VRAM left by their modules.\n\n"))
+    text.extend(_coverage_warnings(result))
     for phase in result["phases"]:
         text.append(_phase_summary(phase, f"Peak of phase {phase['name']} ({phase['time_s']:.1f} s)"))
     for phase in result.get("reserved_peaks", []):
@@ -519,7 +538,18 @@ def diff(before, after):
             lines.append(f"## {phase['name']}: only in the second report, {phase['allocated_gb']:.2f} GiB\n")
             continue
         lines.append(f"## {phase['name']}: peak in use {old['allocated_gb']:.2f} -> {phase['allocated_gb']:.2f} GiB "
-                     f"({phase['allocated_gb'] - old['allocated_gb']:+.2f}), reserved {old['reserved_gb']:.2f} -> {phase['reserved_gb']:.2f}\n")
+                     f"({phase['allocated_gb'] - old['allocated_gb']:+.2f}), reserved {old['reserved_gb']:.2f} -> {phase['reserved_gb']:.2f}; "
+                     f"below the threshold {old['smaller_gb']:.2f} -> {phase['smaller_gb']:.2f} GiB\n")
+        # net by model first: the same weights allocated at another site or under another module path (whole model / blocks) cancel out
+        by_model = {}
+        for index, report_phase in enumerate((old, phase)):
+            for group in report_phase["groups"]:
+                by_model.setdefault((group["module"] or "-").split(".")[0], [0.0, 0.0])[index] += group["mb"]
+        net = sorted(((model, mb) for model, mb in by_model.items() if abs(mb[1] - mb[0]) >= 1), key=lambda item: -abs(item[1][1] - item[1][0]))
+        if net:
+            lines.append("| net change MB | model (- : no module recorded) |\n|---:|---|")
+            lines.extend(f"| {new_mb - old_mb:+.0f} | {module} |" for module, (old_mb, new_mb) in net[:12])
+            lines.append("")
         key = lambda group: (group["module"], re.sub(r":\d+ in ", " in ", group["where"]), group["tag"], group["tensor_tag"])  # line numbers move with edits
         sizes = {}
         for index, report_phase in enumerate((old, phase)):

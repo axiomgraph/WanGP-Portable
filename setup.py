@@ -312,9 +312,13 @@ def run_cmd(cmd, env_vars=None):
 
     subprocess.run(cmd, shell=True, check=True, env=custom_env)
 
-def run_pip_component(pip, cmd):
+def run_pip_component(pip, cmd, env_path=None):
     if not cmd: return
-    run_cmd(cmd.format(pip=pip) if "{pip}" in cmd else f"{pip} {cmd}")
+    env_vars = None
+    if not IS_WIN and env_path:
+        # Build-time generators may invoke bare python instead of sys.executable.
+        env_vars = {"PATH": os.path.join(os.path.abspath(env_path), "bin") + os.pathsep + os.environ.get("PATH", "")}
+    run_cmd(cmd.format(pip=pip) if "{pip}" in cmd else f"{pip} {cmd}", env_vars=env_vars)
 
 def install_plugin_requirements(pip_cmd):
     plugins_dir = "plugins"
@@ -431,17 +435,23 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
 
     if sparge_k:
         cmd = resolve_cmd(config['components']['sparge'][sparge_k]['cmd'])
-        if cmd: run_pip_component(pip, cmd)
+        if cmd: run_pip_component(pip, cmd, env_path=env_path if env_type != "none" else None)
 
     if flash_k:
         cmd = resolve_cmd(config['components']['flash'][flash_k]['cmd'])
         if cmd: run_cmd(f"{pip} {cmd}")
 
     for k in kernel_list:
-        if k in ("gguf", "gguf_cu128"):
-            gguf_builds = {("cu130", "3.11"): "gguf", ("cu128", "3.10"): "gguf_cu128"}
-            k = gguf_builds.get((torch_k, py_k))
+        if k in ("wgpkernels", "wgpkernels_cu128", "wgpkernels_rocm10"):
+            k = {"cu130": "wgpkernels", "cu128": "wgpkernels_cu128", "rocm10": "wgpkernels_rocm10"}.get(torch_k)
             if k is None:
+                continue
+            if k == "wgpkernels_rocm10" and not any(f"device-{arch}" in torch_cmd for arch in ("gfx1200", "gfx1201")):
+                continue
+        if k in ("gguf", "gguf_cu128", "gguf_rocm10"):
+            gguf_builds = {("cu130", "3.11"): "gguf", ("cu128", "3.10"): "gguf_cu128", ("rocm10", "3.12"): "gguf_rocm10"}
+            k = gguf_builds.get((torch_k, py_k))
+            if k is None or k == "gguf_rocm10" and not any(f"device-{arch}" in torch_cmd for arch in ("gfx1200", "gfx1201")):
                 continue
         if k in config['components']['kernels']:
             cmd = resolve_cmd(config['components']['kernels'][k]['cmd'])

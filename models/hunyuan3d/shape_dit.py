@@ -13,6 +13,7 @@ from torch import nn
 
 from shared import attention_kit
 from shared.attention import pay_attention
+from shared.kernels import ops
 from shared.utils.phase_progress import check_abort
 
 
@@ -60,7 +61,8 @@ class Attention(nn.Module):
                 _rms_norm_(tensor, norm)
 
     def forward(self, x_list):
-        out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.num_heads, self.head_dim, self._norm_)
+        out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.num_heads, self.head_dim, self._norm_,
+                                          fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, None, self.q_norm, self.k_norm, core, settings))
         return self.out_proj(out.flatten(2))
 
 

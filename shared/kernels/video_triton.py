@@ -60,6 +60,9 @@ def _residual(X, SCALE, RESIDUAL, N, D: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(X + i, scaled + residual, i < N)
 
 
+CAST_ROPE_SUPPORTED = hasattr(tl, "gather")  # _cast_rope gathers the rotation partners: Triton 3.3+ (3.2 of the PyTorch 2.7 stack has no tl.gather)
+
+
 def cast_rope(q, rotary):
     b, t, heads, dim = q.shape
     cos, sin = (q, q) if rotary is None else rotary
@@ -127,7 +130,7 @@ def _norm_rope_rows(X, base, ok, cos, sin, partner, keep, EPS, D: tl.constexpr, 
     if D == 64:
         # Match Kitchen's lane sums (c, c + 32), then its warp reduction. Reuse
         # the loaded row: a differently ordered sum can change FP16 rounding.
-        first, second = tl.split(tl.trans(tl.reshape(x, (BLOCK, 2, 32)), (0, 2, 1)))
+        first, second = tl.split(tl.trans(tl.reshape(x, (BLOCK, 2, 32)), 0, 2, 1))  # variadic dims: Triton 3.2 rejects the tuple form
         squares = tl.fma(second, second, first * first)
         total = tl.sum(squares, 1)
     else:

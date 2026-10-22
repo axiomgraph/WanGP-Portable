@@ -1,0 +1,7 @@
+MOSS-TTS inference is adapted from OpenMOSS/MOSS-TTS revision 934d6826b084c46a0d033402174d5f8ac4ed2519.
+MOSS-Audio-Tokenizer code/configuration is from OpenMOSS-Team/MOSS-Audio-Tokenizer revision 3cd226ba2947efa357ef453bcad111b6eafba782.
+TTS weights: OpenMOSS-Team/MOSS-TTS-v1.5 revision cdd3b911b1585e3f2dbc7775ef10f9926f58850a.
+Copyright OpenMOSS and HuggingFace contributors. Apache License 2.0; see LICENSE.
+
+MOSS-TTS-Local-Transformer-v1.5: OpenMOSS-Team revision be7766a6735b98bd793f7c79fb720b4d0f5d13b8.
+MOSS-Audio-Tokenizer-v2: OpenMOSS-Team revision f6e20e543b33d2c252a7ef71bdf8aa71e5ff9169.

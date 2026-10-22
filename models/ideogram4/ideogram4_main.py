@@ -223,7 +223,8 @@ class Ideogram4WanPipeline:
             "token_ids": token_ids.to(device),
             "text_position_ids": text_position_ids.to(device),
             "position_ids": position_ids.to(device),
-            "segment_ids": segment_ids.to(device),
+            # a key mask only with padding (prompts of different lengths): all True otherwise, and attention without a mask is faster
+            "segment_ids": segment_ids.to(device) if (segment_ids == SEQUENCE_PADDING_INDICATOR).any() else None,
             "indicator": indicator.to(device),
             "num_image_tokens": num_image_tokens,
             "grid_h": grid_h,
@@ -392,7 +393,7 @@ class Ideogram4WanPipeline:
 
         if self.unconditional_transformer is not None:
             neg_position_ids = inputs["position_ids"][:, max_text_tokens:]
-            neg_segment_ids = inputs["segment_ids"][:, max_text_tokens:]
+            neg_segment_ids = None  # image tokens are never padded
             neg_indicator = inputs["indicator"][:, max_text_tokens:]
             neg_llm_features = llm_features.new_empty(batch_size, 0, llm_features.shape[-1])
 

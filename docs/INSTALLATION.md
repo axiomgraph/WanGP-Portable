@@ -56,31 +56,38 @@ Comfy Kitchen is installed with `requirements.txt`; its prebuilt CUDA kernels re
 
 ### WGPKernels Installation
 
-WGPKernels are WanGP's own INT8 kernels, with higher precision than the other fast INT8 backends. Install the wheel matching the CUDA version of your PyTorch (NVIDIA RTX 30XX or newer):
+The Windows and Linux install scripts include WGPKernels for RTX 20XX, 30XX, 40XX and 50XX, choosing the wheel for the selected CUDA stack. AMD RDNA4 targets (`gfx1200`, `gfx1201`) receive the experimental ROCm 10 wheel. For an existing installation, choose **Upgrade** in the update script; **Update** only refreshes code and requirements.
+
+WGPKernels are WanGP's own INT8 kernels, with higher precision than the other fast INT8 backends. Install the wheel matching the CUDA version of your PyTorch (NVIDIA RTX 20XX or newer; WanGP checks the kernels on your GPU before using them):
 
 For **PyTorch 2.10 / CUDA 13** (NVIDIA R580+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-linux_x86_64.whl
 ```
 
 For **PyTorch 2.7.1 / CUDA 12.8** (NVIDIA R570+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-linux_x86_64.whl
 ```
 
-For **AMD RX 9070 with PyTorch 2.10.0+rocm7.14.0** (Windows, experimental):
+For **AMD RDNA4 (`gfx1200`, `gfx1201`) with PyTorch 2.13.0 / ROCm 10.0** (experimental):
 
-```powershell
-python -m pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Brocm714-py3-none-win_amd64.whl
+```bash
+# Windows
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-win_amd64.whl
+# Linux
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-linux_x86_64.whl
 ```
+
+The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and Conv3D remain CUDA-only; AMD retains the independent supported backends for those operations. AMD packages pass installation and library-loading checks, but kernel execution on AMD hardware remains unvalidated.
 
 ### CUDA Kernels Optimized Ops Precision (When Available)
 
@@ -109,11 +116,15 @@ The Triton library is required for Pytorch compilation and Sage Attention and by
 
 ### Windows RTX 30XX - RTX 50XX
 
-Use the Triton version matching your PyTorch installation. For the recommended **PyTorch 2.10** environment:
+For the recommended **Python 3.11 / PyTorch 2.10** environment, new installations use Triton 3.7:
 
 ```bash
-python -m pip install -U "triton-windows>=3.6,<3.7"
+python -m pip install -U "triton-windows>=3.7.0.post26,<=3.7.1.post27"
 ```
+
+**Existing installations do not need to upgrade.** Triton 3.6 continues to work as before and remains available in the installer's manual selection. Run the command above in your WanGP environment only if you want to upgrade, for example when antivirus software blocks Triton's generated CUDA helper.
+
+WanGP includes a small prebuilt CUDA helper for **3.7.0.post26 and 3.7.1.post27**, enabled automatically on 64-bit Windows with Python 3.11. No separate helper installation, Visual Studio or antivirus exclusion is needed. Triton acceleration remains enabled, including GPU kernel compilation on first use. Other Python/Triton versions keep their existing behavior.
 
 For an existing **PyTorch 2.7 / 2.7.1** environment:
 
@@ -130,6 +141,18 @@ RTX 20XX must use Triton 3.2:
 ```bash
 python -m pip install -U "triton-windows>=3.2,<3.3"
 ```
+
+### Windows AMD / ROCm 10
+
+For **Python 3.12 / PyTorch 2.13.0 / ROCm 10.0.0**, WanGP includes a separate prebuilt HIP helper, automatically enabled with **3.7.0.post26 or 3.7.1.post27**. It uses the installed ROCm runtime and avoids compiling Triton's host helper locally; GPU kernels still compile normally. There is no extra helper installation or Visual Studio requirement.
+
+Upgrading an existing environment is optional. To use one of these releases, run this command in your AMD WanGP environment:
+
+```bash
+python -m pip install -U "triton-windows>=3.7.0.post26,<=3.7.1.post27"
+```
+
+Older Triton versions retain their existing behavior. The prebuilt HIP helper is experimental pending AMD GPU generation and antivirus validation; it does not extend ROCm's supported GPU list. Linux is unchanged.
 
 ### Linux
 
@@ -191,6 +214,7 @@ pip install https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-win
 ```
 
 #### Linux Install Sparge Attention
+Activate your WanGP Python environment before running these commands; SpargeAttn's build also invokes `python` from `PATH` to generate its kernels.
 ```
 python -m pip install ninja wheel packaging
 python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
@@ -200,7 +224,7 @@ python -m pip install --no-build-isolation git+https://github.com/woct0rdho/Spar
 ## Flash Attention
 Flash attention is not as fast as Sage for Generating Videos or Images but it preserves quality. However when used with a Language Model (prompt enhancer, Text to Speech, Deepy) it can offer a significant speedup.
 
-The FlashAttention 2 packages below require RTX 30XX or newer. RTX 20XX users should use SDPA or SageAttention 1 where supported, and the PyTorch/legacy LM decoder for autoregressive models.
+The FlashAttention 2 packages below require RTX 30XX or newer. RTX 20XX users should use SDPA or SageAttention 1 where supported; the language models of autoregressive models (speech, music, prompt enhancer) then use WanGP's PyTorch kernels with CUDA Graphs automatically.
 
  
 ### Flash Attention Windows
@@ -215,14 +239,22 @@ pip install https://github.com/Redtash1/Flash_Attention_2_Windows/releases/downl
 ```
 
 #### Linux
+Run this in your WanGP environment after installing PyTorch. If a matching wheel is unavailable, building from source requires a C++ compiler and the CUDA toolkit matching your PyTorch stack (CUDA 12.8 or 13.0, including `nvcc`).
+
 ```
-pip install flash-attn==2.7.2.post1
+pip install flash-attn==2.8.3.post1 --no-build-isolation
 ```
 
 
 ## GGUF llama.cpp CUDA Kernels
 
-These kernels accelerate GGUF models with packed MMVQ/MMQ, direct FP16/BF16 activation quantization, CUDA-graph-safe workspaces and quantized KV-cache attention. 
+Version 1.0.28 accelerates GGUF models with packed MMVQ/MMQ, direct FP16/BF16 activation quantization, CUDA-graph-safe workspaces and quantized KV-cache attention.
+
+Large linears, such as those of long video token sequences or long prompts, now run in a single kernel that quantizes the activations while other parts of the GPU multiply earlier rows, and adds the bias as it writes the result. On Q4_K/Q6_K layers this was 2-10% faster without bias and 5-19% faster with bias, used slightly less memory, and turned each linear into a single CUDA graph node instead of dozens, which lowers the memory kept by CUDA graphs. The first time each layer shape runs on a GPU, WanGP times the new kernel against the previous row slices and keeps the faster one; the choice is cached. With an older GGUF wheel, WanGP keeps using the previous row slices.
+
+On RTX 20, Bonsai and other PTQ1_0 language models decode their tokens and speculative drafts faster: each block of weights is decoded once for all the tokens of a step.
+
+Packed rows crossing quantization blocks are supported on RTX 20/30/40/50 for Q2_K through Q6_K, Q4_0/Q4_1, Q5_0/Q5_1 and Q8_0. This fixes MiniMax H3 image-reference projections without dense weight materialization or matrix padding. RTX 20 uses NVRTC; RTX 30/40/50 use the installed Triton compiler. First use compiles and tunes the kernels.
 
 Install the wheel matching your Python, PyTorch and CUDA stack. `--no-deps` preserves the installed PyTorch environment.
 
@@ -230,44 +262,43 @@ Install the wheel matching your Python, PyTorch and CUDA stack. `--no-deps` pres
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.25/llamacpp_gguf_cuda-1.0.25%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.25/llamacpp_gguf_cuda-1.0.25%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
 ```
 
 ### Python 3.10 / PyTorch 2.7.1 / CUDA 12.8
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.25/llamacpp_gguf_cuda-1.0.25%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.25/llamacpp_gguf_cuda-1.0.25%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
 ```
 
-The CUDA 13 builds contain native GPU code for SM75 through the architectures supported by CUDA 13.1. CUDA 12.8 builds additionally contain pre-SM75 code, subject to PyTorch's own support. The release includes the exact architecture lists, source and build instructions. Hardware validation was performed on RTX5090; Linux wheels were built and tested under Ubuntu 22.04 in WSL.
+The CUDA 13 builds contain native GPU code for SM75 through the architectures supported by CUDA 13.1. CUDA 12.8 builds additionally contain pre-SM75 code, subject to PyTorch's own support. Linux wheels need glibc 2.28 or newer. The release includes the exact architecture lists, source and build instructions.
 
-### Experimental AMD HIP wheel: Windows / Python 3.11 / PyTorch 2.10
+### Experimental AMD HIP wheel: Python 3.12 / PyTorch 2.13 / ROCm 10
 
-For RX 9070-series GPUs (`gfx1201`), the separate HIP wheel targets exactly
-**PyTorch 2.10.0+rocm7.14.0**. It does not use the NVIDIA PyTorch build and does not
-load in the installer's AMD environment (PyTorch 2.13.0+rocm10.0.0). Install into a
-separate AMD environment:
+For RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer adds this wheel to its AMD environment (Python 3.12, PyTorch 2.13.0+rocm10.0.0). To install it manually in that environment:
 
-```powershell
-python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1201]==2.10.0+rocm7.14.0" "rocm[libraries,device-gfx1201]==7.14.0"
-python -m pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.25/llamacpp_gguf_cuda-1.0.25%2Btorch210rocm714py311-cp311-cp311-win_amd64.whl
+Windows:
+```bash
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl
 ```
 
-The HIP and CUDA wheels use the same package name; select the matching backend.
-The HIP wheel rejects a different PyTorch build at import. It replaces the earlier
-`+hip` asset compiled against PyTorch 2.12. Compilation and DLL import checks do
-not establish AMD inference correctness: hardware validation remains pending.
+Linux:
+```bash
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl
+```
+
+The HIP and CUDA wheels use the same package name; select the matching backend. The HIP wheel requires exactly PyTorch 2.13.0+rocm10.0.0 and rejects a different PyTorch build at import. It keeps the previous GGUF kernels: the new single-kernel row loop is CUDA only. Compilation and import checks do not establish AMD inference correctness: hardware validation remains pending.
 
 
 ## INT4 / FP4 quantized support

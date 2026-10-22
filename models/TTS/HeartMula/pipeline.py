@@ -103,7 +103,8 @@ class HeartMuLaPipeline:
         codec_guidance_scale: float = 1.25,
         codec_version: str = "",
         VAE_dtype = torch.float32,
-        lm_decoder_engine=None,
+        cuda_graphs=False,
+        flash_attention=False,
     ):
         self.device = device or torch.device("cpu")
         self.mula_device = self.device
@@ -119,7 +120,8 @@ class HeartMuLaPipeline:
         self.codec_version = codec_version
         self.heartmula_weights_path = heartmula_weights_path
         self.VAE_dtype = VAE_dtype
-        self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
+        self.cuda_graphs = bool(cuda_graphs)
+        self.flash_attention = bool(flash_attention)
 
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(
             fl.get_download_location()
@@ -132,8 +134,7 @@ class HeartMuLaPipeline:
         self._muq_dim = 512
 
         self._load_models()
-        engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
-        print(f"[HeartMuLa] LM Engine='{engine}', flash2={'on' if getattr(self.mula.backbone.layers[0].attn, '_flash_attn', None) is not None else 'off'}")
+        print(f"[HeartMuLa] CUDA graphs: {'on' if self.cuda_graphs else 'off'}")
 
     def _load_models(self):
         (
@@ -169,7 +170,8 @@ class HeartMuLaPipeline:
         self.mula.decoder = [decoder]
 
         self.mula._interrupt_check = self._abort_requested
-        self.mula.set_lm_decoder_engine(self.lm_decoder_engine)
+        self.mula.set_cuda_graphs(self.cuda_graphs)
+        self.mula.set_flash_attention(self.flash_attention)
         self.model = self.mula
         self.mula.eval()
         first_param = next(self.mula.parameters(), None)

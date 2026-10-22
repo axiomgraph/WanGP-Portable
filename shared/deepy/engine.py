@@ -59,6 +59,7 @@ from shared import extra_settings
 from shared.deepy import filesystem as deepy_filesystem, image_channels as deepy_image_channels, long_text as deepy_long_text, media_registry, session_store, tool_settings as deepy_tool_settings, transcription as deepy_transcription, ui_settings as deepy_ui_settings, video_tools as deepy_video_tools, vision as deepy_vision
 from shared.deepy.paged_files import list_directory_page
 from shared.deepy.tool_aliases import canonical_arguments
+from shared.deepy.zero_catalog import ZERO_TOOL_PARAMETERS, check_zero_catalog
 from shared.mcp.paging import PAGE_SIZE, ResultPages
 from shared.utils.gallery_media import gallery_media_ids
 
@@ -220,13 +221,13 @@ def _json_type_from_annotation(annotation) -> str:
     return _TOOL_TYPE_MAP.get(annotation_name, "string")
 
 
-def _build_tool_parameter_schema(annotations: dict[str, Any], param_name: str, param_meta: dict[str, Any]) -> dict[str, Any]:
+def _build_tool_parameter_schema(annotations: dict[str, Any], param_name: str, param_meta: dict[str, Any], zero_catalog: bool) -> dict[str, Any]:
     schema = {
         "type": param_meta.get("type") or _json_type_from_annotation(annotations.get(param_name, str)),
-        "description": str(param_meta.get("description", "")).strip(),
+        "description": str(param_meta.get("description", "") if zero_catalog else param_meta.get("agent_description") or param_meta.get("description", "")).strip(),
     }
     for meta_key, meta_value in param_meta.items():
-        if meta_key in {"description", "required", "type"}:
+        if meta_key in {"description", "agent_description", "required", "type"}:
             continue
         schema[meta_key] = copy.deepcopy(meta_value)
     return schema
@@ -261,12 +262,16 @@ def assistant_tool(
     requires_file_system: bool = False,
     requires_file_system_write: bool = False,
     requires_long_text_tools: bool = False,
+    agent_description: str = "",
 ):
+    # Deepy Zero sees only the tools and parameters listed in zero_catalog.ZERO_TOOL_PARAMETERS, with description; the MCP
+    # toolbox of Deepy Prime and external agents sees every tool, with agent_description (also per parameter) when given.
     def decorator(func):
         func._assistant_tool = {
             "name": str(name or func.__name__).strip(),
             "display_name": str(display_name or name or func.__name__).strip(),
             "description": str(description or "").strip(),
+            "agent_description": str(agent_description or "").strip(),
             "parameters": dict(parameters or {}),
             "pause_runtime": bool(pause_runtime),
             "pause_reason": str(pause_reason or "tool").strip() or "tool",
@@ -1479,6 +1484,7 @@ def _trim_incomplete_answer_tail(answer_text: str) -> str:
 
 class DeepyZeroTools:
     client_id_prefix = "ai"  # task client IDs; external MCP toolboxes use "ai_mcp" so their outputs are not credited to Deepy
+    zero_catalog = False  # True for Deepy Zero's own engine: only the tools and parameters of ZERO_TOOL_PARAMETERS, without agent descriptions
 
     def __init__(self, gen, get_processed_queue, send_cmd, session: AssistantSessionState | None = None, get_output_filepath: Callable[[str, bool, bool], str] | None = None, record_file_metadata: Callable[..., None] | None = None, get_server_config: Callable[[], dict[str, Any]] | None = None):
         self.gen = gen
@@ -2482,7 +2488,7 @@ class DeepyZeroTools:
                 continue
             method = getattr(self, attr_name)
             metadata = getattr(method, "_assistant_tool", None)
-            if metadata is not None and self._tool_enabled(metadata):
+            if metadata is not None and (not self.zero_catalog or metadata["name"] in ZERO_TOOL_PARAMETERS) and self._tool_enabled(metadata):
                 yield method, metadata
         for method, metadata, _plugin_id in self._plugin_tools:
             if self._tool_enabled(metadata):
@@ -4909,7 +4915,8 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Transcribe Media",
-        description="Transcribe the spoken content of a previously resolved audio or video media item with Whisper, returning segment timestamps by default and optionally using word timestamps instead. Timestamps are tightened to the detected speech, so a pause before a word is not counted in it, and speech_intervals lists where speech is heard. For speech over music, transcribe the clean voice file, or isolate the voice first (remove_background audio treatment).",
+        description="Transcribe the spoken content of a previously resolved audio or video media item with Whisper, returning segment timestamps by default and optionally using word timestamps instead.",
+        agent_description="Transcribe the spoken content of a previously resolved audio or video media item with Whisper, returning segment timestamps by default and optionally using word timestamps instead. Timestamps are tightened to the detected speech, so a pause before a word is not counted in it, and speech_intervals lists where speech is heard. For speech over music, transcribe the clean voice file, or isolate the voice first (remove_background audio treatment).",
         parameters={
             "media_id": {
                 "type": "string",
@@ -5365,7 +5372,8 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Merge Videos",
-        description="Join videos end to end in the given order, with a cut, a crossfade or a fade through black or white at each join; the soundtracks follow the picture. Clips are fitted to the first video's size and frame rate (a clip of another aspect ratio gets black bars: make title and end cards at each format's size), and a clip without sound gets silence. Soundtracks keep their levels (no limiter): master a final cut with remux_media (mode mix, normalize_lufs).",
+        description="Join videos end to end in the given order, with a cut, a crossfade or a fade through black or white at each join; the soundtracks follow the picture. Clips are fitted to the first video's size and frame rate, and a clip without sound gets silence.",
+        agent_description="Join videos end to end in the given order, with a cut, a crossfade or a fade through black or white at each join; the soundtracks follow the picture. Clips are fitted to the first video's size and frame rate (a clip of another aspect ratio gets black bars: make title and end cards at each format's size), and a clip without sound gets silence. Soundtracks keep their levels (no limiter): master a final cut with remux_media (mode mix, normalize_lufs).",
         parameters={
             "media_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 32, "description": "Media ids of the videos, in playing order."},
             "transitions": {"type": ["string", "array"], "anyOf": [{"type": "string", "enum": list(deepy_video_tools.MERGE_TRANSITIONS)}, {"type": "array", "items": {"type": "string", "enum": list(deepy_video_tools.MERGE_TRANSITIONS)}, "minItems": 1, "maxItems": 31}], "description": "Optional transition for all joins (such as \"crossfade\"), or a list with one per join; each is cut (default), crossfade, fade_black or fade_white.", "required": False},
@@ -5872,11 +5880,12 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Inspect Media",
-        description="Directly inspect or compare multiple images, explicitly selected video frames and 3D assets in one call; video frames do not need to be extracted first. A 3D asset is seen in its three-quarter preview unless an input sets view or an animation frame.",
+        description="Ask Deepy to inspect a previously resolved image or a frame from a previously resolved video and answer a visual question about it.",  # Deepy Zero's; get_tool_schemas writes the agent one from the vision limits
         parameters={
             "media_id": {
                 "type": "string",
-                "description": "One media id returned by Resolve Media. Use exactly one of media_id, media_ids, or media_inputs.",
+                "description": "The media id returned by Resolve Media.",
+                "agent_description": "One media id returned by Resolve Media. Use exactly one of media_id, media_ids, or media_inputs.",
                 "required": False,
             },
             "media_ids": {
@@ -5911,7 +5920,8 @@ class DeepyZeroTools:
             },
             "frame_no": {
                 "type": "integer",
-                "description": "Optional frame number to inspect for every video or animated 3D asset supplied through media_id or media_ids. If omitted, video frame 0 and the 3D rest pose are used. Do not use it with media_inputs.",
+                "description": "Optional frame number to inspect when media_id refers to a video. If omitted, the first frame is used.",
+                "agent_description": "Optional frame number to inspect for every video or animated 3D asset supplied through media_id or media_ids. If omitted, video frame 0 and the 3D rest pose are used. Do not use it with media_inputs.",
                 "required": False,
             },
             "time_s": {"type": "number", "minimum": 0, "description": "Optional time in seconds of the frame to inspect for every video supplied through media_id or media_ids, instead of frame_no. Do not use it with media_inputs.", "required": False},
@@ -6185,16 +6195,19 @@ class DeepyZeroTools:
             properties = {}
             required = []
             annotations = getattr(method, "__annotations__", {})
+            zero_parameters = ZERO_TOOL_PARAMETERS.get(metadata["name"]) if self.zero_catalog else None  # None for a Zero plugin tool: all of its own
             for param_name, param_meta in metadata["parameters"].items():
-                properties[param_name] = _build_tool_parameter_schema(annotations, param_name, param_meta)
+                if zero_parameters is not None and param_name not in zero_parameters:
+                    continue
+                properties[param_name] = _build_tool_parameter_schema(annotations, param_name, param_meta, self.zero_catalog)
                 if self._file_system_read_enabled() and properties[param_name].get("type") == "string" and "media id" in properties[param_name].get("description", "").casefold():
                     properties[param_name]["description"] += " An existing media file path with an extension is also accepted."
                 if self._file_system_read_enabled() and param_name == "media_inputs":
                     properties[param_name]["items"]["properties"]["media_id"]["description"] += " An existing media file path with an extension is also accepted."
                 if bool(param_meta.get("required", True)):
                     required.append(param_name)
-            description = metadata["description"]
-            if metadata["name"] == "inspect_media":
+            description = metadata["description"] if self.zero_catalog else metadata.get("agent_description") or metadata["description"]
+            if metadata["name"] == "inspect_media" and not self.zero_catalog:
                 properties["media_ids"]["maxItems"] = self._vision_max_images
                 properties["media_inputs"]["maxItems"] = self._vision_max_images
                 properties["media_ids"]["description"] = f"One to {self._vision_max_images} ordered media ids to inspect together. Videos use frame_no, or frame 0 when it is omitted. Use exactly one of media_id, media_ids, or media_inputs."
@@ -6324,6 +6337,9 @@ class DeepyZeroTools:
         raise KeyError(f"Unknown assistant tool: {tool_name}")
 
 
+check_zero_catalog({metadata["name"]: metadata for metadata in (getattr(value, "_assistant_tool", None) for value in vars(DeepyZeroTools).values()) if metadata is not None})
+
+
 class AssistantEngine:
     def __init__(self, session: AssistantSessionState, runtime_hooks: AssistantRuntimeHooks, tool_box: Any, send_cmd, debug_enabled: bool | None = None, thinking_enabled: bool = True, vram_mode: str = DEEPY_VRAM_MODE_UNLOAD, system_prompt: str = ASSISTANT_SYSTEM_PROMPT, custom_system_prompt_key: str = DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY):
         self.session = session
@@ -6387,7 +6403,7 @@ class AssistantEngine:
                 engine_state = ""
         info = {
             "model_class": model.__class__.__name__,
-            "engine": str(getattr(model, "_prompt_enhancer_engine_name", "") or ""),
+            "llm_features": dict(getattr(model, "_prompt_enhancer_llm_features", None) or {}),
             "use_vllm": bool(getattr(model, "_prompt_enhancer_use_vllm", False)),
             "use_legacy_cuda_runner": bool(getattr(model, "_prompt_enhancer_use_legacy_cuda_runner", False)),
             "enable_cudagraph": bool(getattr(model, "_prompt_enhancer_enable_cudagraph", False)),

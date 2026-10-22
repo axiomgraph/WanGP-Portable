@@ -88,9 +88,9 @@ class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_bf16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, show_load_logs=False,
-            lm_decoder_engine="legacy",
+            cuda_graphs=False,
             force_no_flash2=False,
-            accel_allow_vllm_kernels=False,
+            accel_allow_triton_kernels=False,
     ):
         """
         Args:
@@ -145,14 +145,14 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         self.use_accel = use_accel
         self.force_no_flash2 = bool(force_no_flash2)
-        self.accel_allow_vllm_kernels = bool(accel_allow_vllm_kernels)
+        self.accel_allow_triton_kernels = bool(accel_allow_triton_kernels)
         self.use_torch_compile = use_torch_compile
 
         qwen_emo_dir = self.cfg.qwen_emo_path
         if not os.path.isabs(qwen_emo_dir) and not os.path.isdir(qwen_emo_dir):
             qwen_emo_dir = os.path.join(self.model_dir, qwen_emo_dir)
         with _quiet_load_output(self.show_load_logs):
-            self.qwen_emo = QwenEmotion(qwen_emo_dir, model_filename=self.cfg.get("qwen_emo_filename", "model.safetensors"), lm_decoder_engine=lm_decoder_engine)
+            self.qwen_emo = QwenEmotion(qwen_emo_dir, model_filename=self.cfg.get("qwen_emo_filename", "model.safetensors"), cuda_graphs=cuda_graphs)
         self._load_log(">> qwen_emo weights restored from:", qwen_emo_dir)
 
         w2v_bert_dir = getattr(self.cfg, "w2v_bert_path", _W2V_BERT_FOLDER)
@@ -184,7 +184,7 @@ class IndexTTS2:
                     "gpt_build_dtype": self.dtype,
                     "gpt_build_meta": True,
                     "force_no_flash2": self.force_no_flash2,
-                    "accel_allow_vllm_kernels": self.accel_allow_vllm_kernels,
+                    "accel_allow_triton_kernels": self.accel_allow_triton_kernels,
                 },
             )
         self.gpt = self.gpt.to("cpu")
@@ -1476,7 +1476,7 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir, model_filename="model.safetensors", lm_decoder_engine="legacy"):
+    def __init__(self, model_dir, model_filename="model.safetensors", cuda_graphs=False):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         def _pretie_qwen_lm_head(state_dict, quantization_map=None, tied_weights_map=None):
@@ -1549,11 +1549,10 @@ class QwenEmotion:
         self._cg_max_cache_tokens = 0
         self._cg_decode_cache_position = None
         self._cg_last_prepare_reused = False
-        self.set_lm_decoder_engine(lm_decoder_engine)
+        self.set_cuda_graphs(cuda_graphs)
 
-    def set_lm_decoder_engine(self, lm_decoder_engine):
-        engine = str(lm_decoder_engine or "legacy").strip().lower()
-        self._cg_enabled = engine in ("cg", "cudagraph", "vllm")
+    def set_cuda_graphs(self, enabled):
+        self._cg_enabled = bool(enabled)
         if not self._cg_enabled:
             self.release_cuda_graph()
 

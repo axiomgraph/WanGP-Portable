@@ -124,7 +124,7 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def forward(self, x_list, cache, cos, sin, engine):
+    def forward(self, x_list, cache, cos, sin, flash):
         x = x_list.pop()
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
@@ -150,7 +150,7 @@ class Attention(nn.Module):
             grouped[:, prefix.shape[0]:].copy_(source.unsqueeze(-2))
             qkv_list[index] = combined
             del source, combined, grouped
-        h = pay_attention(qkv_list, force_attention="flash" if engine == "vllm" else "sdpa", recycle_q=True)
+        h = pay_attention(qkv_list, force_attention="flash" if flash else "sdpa", recycle_q=True)
         return self.o_proj(h.flatten(2))
 
 

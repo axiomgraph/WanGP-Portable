@@ -6,6 +6,7 @@ import dataclasses
 import threading
 
 import torch
+from tqdm import tqdm
 
 from . import allocator, cuda_graphs, memory_pressure
 
@@ -13,7 +14,11 @@ ONE_MB = 1 << 20
 MARGIN = 512 * ONE_MB  # left free beyond the measured peak: the allocator's headroom (256 MB) and its fragmentation
 MARGIN_SHARE = 0.05  # and this share of the peak, for variations between the cycles of a workload
 GROW_MIN = 512 * ONE_MB  # a plan grows by at least this much (or 2 blocks), not to change for small variations of the free VRAM
-_process_measures = {}  # with autoPreload=True: (model class, model id, structure, workload) -> peak of the activations measured
+PENALTY_PATIENCE = 8  # cycles without VRAM shortage or allocator recovery after which the VRAM a workload leaves free for them halves
+PENALTY_PATIENCE_MAX = 1024  # a shortage after such a decrease doubles the cycles waited before the next one, up to this
+PENALTY_MIN = 64 * ONE_MB  # a smaller penalty is dropped when it halves
+_process_measures = {}  # with autoPreload=True: (model class, model id, structure, workload) -> peak of the activations measured, and
+# (..., workload, "penalty") -> its penalty (_penalty)
 
 
 def _van_der_corput(n):
@@ -82,33 +87,47 @@ def workload(args, kwargs):
 
 class _Plan:
     """The blocks of a model and what it keeps in VRAM."""
-    def __init__(self, model_id, model_class, towers, base):
-        self.model_id, self.towers, self.base = model_id, towers, base
+    def __init__(self, model_id, model_class, towers, base, others=()):
+        self.model_id, self.towers, self.base, self.others = model_id, towers, base, list(others)
         self.sizes = {name: size for _, floors in towers for name, size in floors}
-        self.ranking = ranked_blocks([floors for _, floors in towers])
-        self.largest = max(self.sizes.values())
+        self.largest = max(self.sizes.values())  # the slots of the streamed blocks are sized for the towers (larger blocks get buffers of their own)
+        self.sizes.update(self.others)
+        self.ranking = self.ranked()
         self.structure = (model_class, model_id, len(self.sizes), sum(self.sizes.values()))  # another quantization or model is measured again
         self.first = towers[0][1][0][0]  # entering the first block of the first tower starts a cycle
         self.floor = 0  # number of ranked blocks preloaded for an unknown workload (the model's budget)
         self.pending = set()  # blocks of the plan that become preloaded when they have been transferred
+        self.reported = None  # the plan last printed: blocks that never run (e.g. an encoder unused by this workload) stay pending
+        self.previous = set()  # the blocks kept in VRAM when the model was last unloaded: they come back with it as far as they fit
+        self.last_work = None  # the workload of its last cycle
         self.last = None  # block that ran last
         self.workload = None  # of the cycle running, None between cycles
         self.min_weights = 0  # least VRAM held by the model's weights during the cycle
         self.grew = False  # blocks were kept during the cycle: its peak is not a measure of the activations
+        self.short = False  # the VRAM ran short during the cycle: the pressure callback released blocks of the plan
         self.relink = False  # blocks were released by the pressure callback: to chain again with the streamed blocks
         self.slow = set()  # blocks not pinned: staged through RAM at each transfer, the first to keep in VRAM
         self.recoveries = None  # the allocator's recoveries when a cycle with blocks kept in VRAM started (None: no block kept)
         self.measuring = False  # the cycle running measures a new workload with the budget's preload: the next one may keep other blocks
+        self.workload_of = workload  # or the model's _auto_preload_workload(args, kwargs): its own grouping of the inputs into workloads
+        self.cap = None  # or the model's _auto_preload_max: the most VRAM its weights may hold (base, blocks kept, slots of the streamed ones)
+
+    def ranked(self, slow=()):
+        """The order the blocks are kept in VRAM: those outside the towers first (embeddings, heads, short stacks: each runs at every pass as a
+        block of the towers does, and keeping it frees no slot), then those of the towers (ranked_blocks)."""
+        return [name for name, _ in self.others] + ranked_blocks([floors for _, floors in self.towers], slow)
 
 
 class AutoPreload:
-    def __init__(self, manager, model_ids, verbose_level=1, measures=None):
+    def __init__(self, manager, model_ids, verbose_level=1, measures=None, fixed_ids=()):
         """manager: the offload object, once its models are hooked and their budgets planned (tune_preloading). The preload of each model
         becomes the same number of ranked blocks, kept for the workloads not measured yet. measures: the dictionary that keeps the measures
-        (None: kept for the process)."""
+        (None: kept for the process). fixed_ids: models whose budget's preload stays as planned, except under VRAM pressure: their preloaded
+        blocks then leave the VRAM rather than the allocation spilling into RAM, until the model is unloaded."""
         self.manager, self.verbose = manager, verbose_level
         self.measures = _process_measures if measures is None else measures
         self.plans = {}
+        self.fixed = {}  # the plans of the fixed preloads (manual budgets): plan.manual is their preload, restored at each load
         self.thread = None  # the thread running the blocks, the only one that may change the plans
         self.dropping = False
         self.window = manager.prefetch_window if manager.prefetch_window is not None else 2  # fixed: the slots do not change with the plans
@@ -118,20 +137,26 @@ class AutoPreload:
                 self.plans[model_id] = plan
                 plan.floor = len(manager.preloaded_blocks_per_model.get(model_id, {}))
                 self._set(plan, plan.ranking[:plan.floor])
-        if self.plans:
+        for model_id in fixed_ids:
+            plan = self._new_plan(model_id)
+            if plan is not None and manager.preloaded_blocks_per_model.get(model_id):
+                plan.manual = dict(manager.preloaded_blocks_per_model[model_id])
+                self.fixed[model_id] = plan
+        if self.plans or self.fixed:
             memory_pressure.register(self)
-            if self.verbose >= 1:
+            if self.plans and self.verbose >= 1:
                 print(f"Automatic VRAM preload of {', '.join(repr(model_id) for model_id in self.plans)}: the blocks kept in VRAM follow the VRAM left by each workload")
 
     def close(self):
         memory_pressure.unregister(self)
 
     def after_pinning(self):
-        """The RAM is pinned: the blocks that are not pinned are the first to keep in VRAM. Nothing is in VRAM yet."""
+        """The RAM is pinned: the blocks that are not pinned are the first to keep in VRAM (those of the models of the pinned pool are pinned
+        as they stream). Nothing is in VRAM yet."""
         m = self.manager
         for plan in self.plans.values():
-            plan.slow = {name for name in plan.sizes if m._block_items(plan.model_id + "/" + name)[2] is None}
-            plan.ranking = ranked_blocks([floors for _, floors in plan.towers], plan.slow)
+            plan.slow = set() if plan.model_id in m.pool_models else {name for name in plan.sizes if m._block_items(plan.model_id + "/" + name)[2] is None}
+            plan.ranking = plan.ranked(plan.slow)
             self._set(plan, plan.ranking[:plan.floor])
 
     def _new_plan(self, model_id):
@@ -144,7 +169,24 @@ class AutoPreload:
                 towers.append((tower_name, [(name, size) for _, name, size in floors]))
         if not towers:
             return None
-        return _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0))
+        # the other blocks (a Sequential, a list of fewer layers than a tower), but those the model loads only while they run
+        excluded = {name for _, floors in towers for name, _ in floors} | set(getattr(m.models[model_id], "_offload_separate_blocks", ()))
+        others = [(name[len(model_id) + 1:], size) for name, size in m.blocks_of_modules_sizes.items() if name.startswith(model_id + "/") and size and name[len(model_id) + 1:] not in excluded]
+        plan = _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0), others)
+        plan.workload_of = getattr(m.models[model_id], "_auto_preload_workload", None) or workload
+        plan.cap = getattr(m.models[model_id], "_auto_preload_max", None)
+        return plan
+
+    def _penalty(self, key):
+        """[bytes, clean cycles, patience, probing] of a workload, kept with its measures: the VRAM its plans leave free beyond the measured
+        peak after VRAM shortages (the blocks they released) and allocator recoveries (a block each), which halves after `patience` cycles without
+        either; a shortage after such a decrease (probing) doubles the patience. The measured peak itself only grows, from real peaks."""
+        return self.measures.setdefault((*key, "penalty"), [0, 0, PENALTY_PATIENCE, False])
+
+    def _planned(self, key):
+        # the VRAM a workload needs beside the weights (None until measured): its measured peak and its penalty
+        peak = self.measures.get(key)
+        return None if peak is None else peak + self.measures.get((*key, "penalty"), (0,))[0]
 
     def _weights(self, plan, preloaded):
         """VRAM of the model's weights with these blocks preloaded: its base, the blocks and the slots of the blocks streamed."""
@@ -156,6 +198,8 @@ class AutoPreload:
         """The longest prefix of the ranking that fits beside a peak of activations, with the base and the slots of the streamed blocks."""
         stats = allocator.stats()
         target = stats["reserved"] + allocator.room() - peak - MARGIN - int(MARGIN_SHARE * peak)
+        if plan.cap is not None:
+            target = min(target, plan.cap)
         if plan.base + sum(plan.sizes.values()) <= target:
             return list(plan.ranking)
         shuttle, used, count = (self.window + 1) * plan.largest, plan.base, 0
@@ -174,23 +218,28 @@ class AutoPreload:
 
     def own_buffer(self, model_id, block_name):
         """A block transferred into a buffer of its own rather than a shared slot: a block to keep in VRAM once transferred, or any block while
-        no block of the towers is streamed (the slots, sized for the blocks of the towers, would only hold the small ones outside them)."""
+        the plan keeps all of its own (the slots, sized for the blocks of the towers, would only hold the blocks loaded while they run)."""
         plan = self.plans.get(model_id)
         return plan is not None and (block_name in plan.pending or len(self.manager.preloaded_blocks_per_model[model_id]) + len(plan.pending) == len(plan.sizes))
 
+    def keeps_all(self, model_id, block_name):
+        """block_name is transferred to stay in VRAM, as every block of the model: an idle slot of the streamed blocks may become its buffer
+        (the slots serve no streamed block any more)."""
+        plan = self.plans.get(model_id)
+        return plan is not None and block_name in plan.pending and len(self.manager.preloaded_blocks_per_model[model_id]) + len(plan.pending) == len(plan.sizes)
+
     def keep(self, model_id, block_name):
         """Called when the block that ran last is about to be unloaded: True keeps it in VRAM, preloaded from now on (it was transferred
-        into a buffer of its own; one that got a shared slot before it was planned is kept when it is transferred again)."""
+        into a buffer of its own; one that got a shared slot before it was planned keeps that slot when every block stays in VRAM, otherwise
+        it is kept when it is transferred again)."""
         plan = self.plans.get(model_id)
         if plan is None or block_name not in plan.pending:
             return False
         m, entry = self.manager, model_id + "/" + block_name
-        if any(slot[1] == entry for slot in m.block_slots.get(model_id, ())):
+        if any(slot[1] == entry for slot in m.block_slots.get(model_id, ())) and (not self.keeps_all(model_id, block_name) or m.adopt_slot(model_id, plan.sizes[block_name], entry) is None):
             return False
         plan.pending.discard(block_name)
         m.preloaded_blocks_per_model[model_id][block_name] = plan.sizes[block_name]
-        if m.read_ahead is not None:
-            m._cancel_read_ahead(entry)
         self._link(plan)
         self._complete_loras(model_id, entry)
         plan.grew = True
@@ -200,7 +249,14 @@ class AutoPreload:
         """Called before each module of a block of the model runs: entering the first block starts a cycle. Not while a graph stage
         is prepared or captured: the weights stay where the stage found them (a stage may span several blocks)."""
         plan = self.plans.get(model_id)
-        if plan is None or cuda_graphs.recording():
+        if plan is None:
+            fixed = self.fixed.get(model_id)
+            if fixed is not None and not cuda_graphs.recording():
+                self.thread, fixed.last = threading.get_ident(), block_name
+                if fixed.relink:  # blocks released under pressure: chained again with the streamed ones, outside the allocation that released them
+                    self._drop(fixed, [])
+            return
+        if cuda_graphs.recording():
             return
         last, plan.last = plan.last, block_name
         if block_name != plan.first or last == block_name:
@@ -210,8 +266,8 @@ class AutoPreload:
         loaded = self.manager.loaded_blocks[model_id]
         if loaded is not None and self.keep(model_id, loaded):  # the last block streamed to grow a plan: no streamed block retires it any more
             self.manager.loaded_blocks[model_id] = None
-        work = workload(args, kwargs)
-        peak = self.measures.get((*plan.structure, work))
+        work = plan.workload_of(args, kwargs)
+        peak = self._planned((*plan.structure, work))
         wanted = plan.ranking[:plan.floor] if peak is None else self._fit(plan, peak)
         current = self.manager.preloaded_blocks_per_model[model_id]
         experts = self.manager.expert_residency.get(model_id)
@@ -226,17 +282,34 @@ class AutoPreload:
         # growth): each one streamed costs a copy through RAM at every step
         if plan.pending or len(wanted) == len(plan.sizes) or sum(plan.sizes[name] for name in missing) >= max(GROW_MIN, 2 * plan.largest) or not plan.slow.isdisjoint(missing):
             plan.pending = set(missing)
-        if self.verbose >= 1 and (dropped or plan.pending):
-            measured = "the budget's preload until measured" if peak is None else f"{peak / ONE_MB:0.0f} MB of activations measured"
-            print(f"Automatic VRAM preload of '{model_id}': {len(current) + len(plan.pending)} of its {len(plan.sizes)} blocks to keep in VRAM ({measured})")
+        report = (len(current) + len(plan.pending), None if peak is None else round(peak / ONE_MB))
+        if self.verbose >= 1 and (dropped or plan.pending) and (dropped or report != plan.reported):
+            plan.reported = report
+            penalty = self.measures.get((*plan.structure, work, "penalty"), (0,))[0]
+            measured = "the budget's preload until measured" if peak is None else f"{(peak - penalty) / ONE_MB:0.0f} MB of activations measured" + \
+                       (f", {penalty / ONE_MB:0.0f} MB more left free after VRAM shortages" if penalty else "")
+            tqdm.write(f"Automatic VRAM preload of '{model_id}': {len(current) + len(plan.pending)} of its {len(plan.sizes)} blocks to keep in VRAM ({measured})")
         if len(current) + len(plan.pending) == len(plan.sizes):
             self._free_slots(plan)
         if experts is not None:
             experts.prepare()
-        plan.workload, plan.grew, plan.measuring = work, False, peak is None and plan.floor < len(plan.sizes)
+        plan.workload, plan.last_work, plan.grew, plan.measuring = work, work, False, peak is None and plan.floor < len(plan.sizes)
         plan.min_weights = self._weights(plan, current)
         plan.recoveries = allocator.stats()["recoveries"] if current or plan.pending else None
         allocator.mark_reset()
+
+    def on_load(self, model_id):
+        """The model comes back to VRAM: the blocks it kept when it left come back with it, at once as its base does, as far as they fit
+        beside the activations measured for its last workload (its next cycle adjusts them to its workload). Otherwise they would stream at
+        its first step and be kept one by one as they run, which also leaves its CUDA graph stages waiting for them."""
+        plan = self.plans.get(model_id)
+        if plan is None or not plan.previous:
+            return
+        peak = None if plan.last_work is None else self._planned((*plan.structure, plan.last_work))
+        if peak is not None:
+            fit, floor = set(self._fit(plan, peak)), set(plan.ranking[:plan.floor])
+            self._set(plan, [name for name in plan.ranking if name in floor or name in plan.previous and name in fit])
+        plan.previous = set()
 
     def on_unload(self, model_ids):
         """The models left the VRAM: their measures are kept, their preload is back to their budget's for the next load."""
@@ -244,8 +317,13 @@ class AutoPreload:
             plan = self.plans.get(model_id)
             if plan is not None:
                 self._end_cycle(plan)
-                plan.last, plan.pending = None, set()
+                plan.last, plan.pending, plan.previous = None, set(), set(self.manager.preloaded_blocks_per_model[model_id])
                 self._set(plan, plan.ranking[:plan.floor])
+            fixed = self.fixed.get(model_id)
+            if fixed is not None and len(self.manager.preloaded_blocks_per_model[model_id]) != len(fixed.manual):  # released under pressure
+                fixed.last, fixed.relink = None, False
+                self.manager.preloaded_blocks_per_model[model_id] = dict(fixed.manual)  # the whole manual preload at the next load
+                self._link(fixed)
 
     def on_expert_change(self):
         # The allocator peak is shared by co-tenants. A cycle spanning a change
@@ -258,14 +336,17 @@ class AutoPreload:
     def on_pressure(self, need):
         """The allocator found the VRAM short (without its lock): the plans stop growing, and the preloaded blocks of the models loaded leave
         the VRAM, the lowest ranked first, except the block running. They are streamed again when they run (chained again at the next
-        cycle), and the measured peak of the workload grows by what was released: its next plans leave that memory free instead of growing
-        back into the same shortage at every step."""
+        cycle), and the penalty of the workload grows by what was released (_penalty): its next plans leave that memory free instead of growing
+        back into the same shortage at every step. A fixed preload keeps that much less until the model is unloaded."""
         m, freed = self.manager, 0
-        if self.dropping or need <= 0 or threading.get_ident() != self.thread or cuda_graphs.recording():
+        if self.thread is None and any(model_id in self.plans or model_id in self.fixed for model_id in m.active_models_ids):
+            self.thread = threading.get_ident()  # no cycle ran yet: the thread loading the models is the one that runs their blocks
+        # nor while any CUDA graph is captured on this thread's stream (a model's own graphs): unloading blocks would invalidate the capture
+        if self.dropping or need <= 0 or threading.get_ident() != self.thread or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
             return 0
         need += MARGIN
         for model_id in reversed(m.active_models_ids):
-            plan = self.plans.get(model_id)
+            plan = self.plans.get(model_id) or self.fixed.get(model_id)
             if plan is None:
                 continue
             plan.pending = set()
@@ -275,40 +356,52 @@ class AutoPreload:
                 continue
             m.transfer_stream.wait_stream(torch.cuda.current_stream())  # their memory may still be read by the work queued
             released = 0
-            for name in victims:
-                if freed + released >= need:
-                    break
+            for name in victims:  # the blocks of a model being loaded that are not transferred yet free nothing: they all stay out
+                in_vram = m.block_in_vram(model_id, name)
+                if in_vram and freed + released >= need:
+                    continue
                 m.gpu_unload_blocks(model_id, name)
                 del preloaded[name]
-                if m.read_ahead is not None:
-                    m._cancel_read_ahead(model_id + "/" + name)
-                released += plan.sizes[name]
+                released += plan.sizes[name] if in_vram else 0
             freed += released
             plan.min_weights = min(plan.min_weights, self._weights(plan, preloaded))
             plan.relink = True  # back in the chain of the streamed blocks at the next cycle, not inside an allocation
             if plan.workload is not None:  # the plan was too large for this workload: its next plans leave the memory released free
                 key = (*plan.structure, plan.workload)
-                self.measures[key] = self.measures.get(key, 0) + released
+                self.measures.setdefault(key, 0)  # measured from now on: not the budget's preload again (its cycles keep blocks, unmeasured)
+                self._penalty(key)[0] += released
+                plan.short = True
             if freed >= need:
                 break
         if freed:
-            print(f"Automatic VRAM preload: VRAM short, {freed / ONE_MB:0.0f} MB of preloaded blocks released")
+            tqdm.write(f"VRAM preload: VRAM short, {freed / ONE_MB:0.0f} MB of preloaded blocks released")
         return freed
 
     def _end_cycle(self, plan):
         if plan.workload is not None:
             key = (*plan.structure, plan.workload)
-            if not plan.grew:
+            if not plan.grew and not plan.short:  # a cycle that ran short peaked with the blocks it released still counted (the penalty has it)
                 self.measures[key] = max(self.measures.get(key, 0), allocator.mark_peak() - plan.min_weights)
-            if plan.recoveries is not None and allocator.stats()["recoveries"] > plan.recoveries:
+            penalty = self._penalty(key)
+            recovered = plan.recoveries is not None and allocator.stats()["recoveries"] > plan.recoveries
+            if recovered:
                 # the allocator found the VRAM short and waited for other streams or synchronized the device to reuse memory, which stalls the
                 # transfers (H3 at 720p under 11 GB: 14 instead of 12.6 s per step): the next plans leave a block more free
-                self.measures[key] = self.measures.get(key, 0) + plan.largest
-        plan.workload = None
+                penalty[0] += plan.largest
+            if recovered or plan.short:
+                if penalty[3]:  # the last decrease was too much: wait twice as long before the next one
+                    penalty[2] = min(2 * penalty[2], PENALTY_PATIENCE_MAX)
+                penalty[1], penalty[3] = 0, False
+            elif penalty[0]:
+                penalty[1] += 1
+                if penalty[1] >= penalty[2]:  # enough cycles without shortage: the plans may grow back into half of that memory
+                    penalty[0] = 0 if penalty[0] < 2 * PENALTY_MIN else penalty[0] // 2
+                    penalty[1], penalty[3] = 0, True
+        plan.workload, plan.short = None, False
 
     def _free_slots(self, plan):
-        """No block of the towers is streamed any more: the VRAM slots of the model are freed, with the block loaded in one of them (a block
-        outside the towers, loaded again into a buffer of its own: the slots are sized again for the blocks streamed when there are). They
+        """No block of the plan is streamed any more: the VRAM slots of the model are freed, with the block loaded in one of them (a block
+        loaded while it runs, loaded again into a buffer of its own: the slots are sized again for the blocks streamed when there are). They
         would otherwise hold VRAM, measured as activations. A slot still used by a block in flight is freed at the next cycle."""
         m, model_id = self.manager, plan.model_id
         slots = m.block_slots.get(model_id)
@@ -344,6 +437,11 @@ class AutoPreload:
             # once it is preloaded: its parameters would then point to a buffer still being copied while it runs without waiting for it
             if target is not None and target.startswith(model_id + "/") and target[len(model_id) + 1:] in preloaded:
                 m.next_blocks_names[entry] = None
+        for name, _ in plan.others:  # out of the chain while preloaded; streamed again, their links are learned as they run
+            if name in preloaded:
+                entry = model_id + "/" + name
+                m.learned_links.discard(entry)
+                m.next_blocks_names[entry] = m.prev_blocks_names[entry] = None
         for _, floors in plan.towers:
             first = prev = None
             for name, _ in floors:
@@ -382,11 +480,6 @@ class AutoPreload:
         preloaded = m.preloaded_blocks_per_model[model_id]
         self.dropping = True
         try:
-            if m.read_ahead is not None:
-                # Eviction inserts blocks into the copy order. Discard old predictions before rebuilding it.
-                for entry in m.read_plans:
-                    if entry.startswith(model_id + "/"):
-                        m._cancel_read_ahead(entry)
             if model_id in m.active_models_ids:
                 if m.ring is not None:  # the staging ring follows the chain of the streamed blocks: emptied before the chain changes
                     m.wait_prefetch()

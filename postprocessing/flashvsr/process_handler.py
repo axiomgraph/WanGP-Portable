@@ -23,11 +23,16 @@ class FlashVSRProcessHandler:
     default_chunk_size_seconds = 3.0
     frame_step = 1
     minimum_requested_frames = 1
-    # FlashVSR's streaming output has an 11-frame tail that must be regenerated with the next source chunk before writing.
-    overlap_frames = 11
     hide_sliding_window_overlap = True
     hide_output_resolution = True
     hide_prompt = True
+
+    @property
+    def overlap_frames(self) -> int:
+        """FlashVSR's streaming output has a tail conditioned on repeated source frames (11 frames for v1.1, 19 for FlashVSR+) that
+        must be regenerated with the next source chunk before writing; it follows the model selected in the configuration."""
+        bridge = upsampler_api.find_postprocessing_upsampler(FlashVSRBridge.upsampling_value(2.0))
+        return bridge.overlap_frames() if bridge is not None else 11
 
     def get_overlap_frames(self, chunk_frames: int) -> int:
         return max(0, min(int(self.overlap_frames), int(chunk_frames) - 1))

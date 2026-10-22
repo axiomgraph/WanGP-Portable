@@ -601,7 +601,11 @@ class QLinearScaledFP8(QModuleMixin, torch.nn.Linear):
         return super().qweight
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return scaled_fp8_linear(self.qweight, input, self.bias)
+        qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
+        return scaled_fp8_linear(qweight, input, self.bias)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -694,6 +698,12 @@ def _collect_fp8_specs(state_dict):
             }
         )
     return specs
+
+
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, ScaledFP8WeightTensor) and cpu_linear.supported(tensor)
 
 
 def detect(state_dict, verboseLevel=1):

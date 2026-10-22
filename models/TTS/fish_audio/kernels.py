@@ -1,5 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - WanGP Community License 2.0 (see LICENSE.txt)
-"""Optional fused RMSNorms of the vLLM engine: one kernel per norm instead of about ten elementwise/reduction launches, which
+"""Optional fused RMSNorms (the Triton LM feature): one kernel per norm instead of about ten elementwise/reduction launches, which
 dominate a decoding step's GPU work at one token. The PyTorch path stays the reference; the row sums use another order, so these
 kernels follow kernel_policy.allow_approximate()."""
 import functools

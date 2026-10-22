@@ -9,7 +9,8 @@ from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .attention import AttentionCallable, AttentionFunction
 from .modality import Modality
 from .rope import LTXRopeType
-from .transformer import BasicAVTransformerBlock, TransformerConfig, _apply_scale_shift
+from .transformer import BasicAVTransformerBlock, TransformerConfig
+from shared.kernels import ops as kernels
 from .transformer_args import (
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -458,8 +459,8 @@ class LTXModel(torch.nn.Module):
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
-        x = norm_out(x)
-        x = _apply_scale_shift(x, scale, shift)
+        x_list, x = [x], None
+        x = kernels.layer_norm_modulate(x_list, shift, scale, norm_out.eps, frames=True)
         x = proj_out(x)
         return x
 

@@ -78,7 +78,9 @@ class family_handler:
                 build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_INT8),
             ],
             "text_encoder_folder": TEXT_ENCODER_FOLDER,
-            "lm_engines": ["cg", "vllm"],
+            "lm_decoder": True,
+            "device_explicit": True,
+            "cuda_graphs": ["transformer"],
             "compile": False,
             "prompt_class": "Lyrics",
             "prompt_enhancer_button_label": "Enhance",
@@ -145,7 +147,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         from .pipeline import MiniMaxMusic3Pipeline
@@ -159,7 +161,7 @@ class family_handler:
             "text_encoder_config": _source_config("text_encoder_config.json"),
             "transformer_config": _source_config("transformer_config.json"),
             "rvq_config": _asset_path("rvq_depth_decoder_config.json"),
-            "rvq_weights": rvq_weights["int8" if lm_decoder_engine in ("cg", "vllm") else "bf16"],
+            "rvq_weights": rvq_weights["int8" if lm_features.graphs else "bf16"],
             "condition_config": _asset_path("condition_encoder_config.json"),
             "condition_weights": _asset_path("condition_encoder_fp32.safetensors"),
             "vocoder_config": _asset_path("vocoder_config.json"),
@@ -171,10 +173,7 @@ class family_handler:
         fl.locate_file(os.path.join(TEXT_ENCODER_FOLDER, "chat_template.jinja"))
 
         dtype = torch.bfloat16
-        pipeline = MiniMaxMusic3Pipeline(flow_weights, text_encoder_filename, asset_paths, dtype, lm_decoder_engine=lm_decoder_engine)
-        if lm_decoder_engine in ("cg", "vllm"):
-            pipeline.text_encoder._budget = 0
-            pipeline.rvq_depth_decoder._budget = 0
+        pipeline = MiniMaxMusic3Pipeline(flow_weights, text_encoder_filename, asset_paths, dtype, lm_features=lm_features)
         if save_quantized:
             from wgp import save_quantized_model
 
@@ -195,9 +194,13 @@ class family_handler:
                 "rvq_depth_decoder": ["text_encoder"],
                 "condition_encoder": ["transformer"],
             },
+            # the decoding steps are MMGP graphs: the LM may stream its layers (memory profile, VRAM preload)
+            "cudaGraphs": ["text_encoder", "rvq_depth_decoder"] if lm_features.graphs else False,
         }
-        if int(profile) in (2, 4, 5):
-            offload_def["budgets"] = {"transformer": 400, "text_encoder": 800}
+        if int(profile) in (0, 2, 4, 5):
+            # the flow transformer runs hundreds of times per song (30 steps per 8 s chunk) on 2 x 690 tokens: kept whole (2.3 GB in
+            # INT8) rather than streamed at every call (2.7x slower); MMGP still streams it when it exceeds its share of the VRAM
+            offload_def["budgets"] = {"transformer": 0, "text_encoder": 800}
         return pipeline, offload_def
 
     @staticmethod

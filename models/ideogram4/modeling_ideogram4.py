@@ -116,7 +116,7 @@ class Ideogram4Attention(nn.Module):
         self.norm_k = Ideogram4RMSNorm(self.head_dim, eps=eps)
         self.o = nn.Linear(hidden_size, hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor | list[torch.Tensor], segment_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | list[torch.Tensor], segment_ids: torch.Tensor | None, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x = _take_tensor(x)
         batch_size, seq_len, _ = x.shape
         shape = (batch_size, seq_len, self.num_heads, self.head_dim)
@@ -127,7 +127,7 @@ class Ideogram4Attention(nn.Module):
         q = self.norm_q([q])
         k = self.norm_k([k])
         _apply_rotary_pos_emb_(q, k, cos, sin)
-        attn_mask = (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(2)
+        attn_mask = None if segment_ids is None else (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(2)
         qkv_list = [q, k, v]
         q = k = v = None
         out = pay_attention(qkv_list, attention_mask=attn_mask, recycle_q=True)
@@ -184,7 +184,7 @@ class Ideogram4TransformerBlock(nn.Module):
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.adaln_modulation = nn.Linear(adanln_dim, 4 * hidden_size, bias=True)
 
-    def forward(self, x: torch.Tensor, segment_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, adaln_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, segment_ids: torch.Tensor | None, cos: torch.Tensor, sin: torch.Tensor, adaln_input: torch.Tensor) -> torch.Tensor:
         mod = self.adaln_modulation(adaln_input)
         scale_msa, gate_msa, scale_mlp, gate_mlp = mod.chunk(4, dim=-1)
         mod = None
@@ -293,7 +293,7 @@ class Ideogram4Transformer(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         position_ids: torch.Tensor,
-        segment_ids: torch.Tensor,
+        segment_ids: torch.Tensor | None,
         indicator: torch.Tensor,
     ) -> torch.Tensor | None:
         batch_size, seq_len, in_channels = x.shape

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <deque>
 #include <functional>
@@ -23,6 +24,8 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dxgi1_4.h>
+#undef small  // a macro of rpcndr.h, which the DXGI headers include
 #include <thread>
 #define EXPORT extern "C" __declspec(dllexport)
 #else
@@ -151,6 +154,7 @@ struct Driver {
     CUresult (*MemGetInfo)(size_t*, size_t*);
     CUresult (*MemGetAllocationGranularity)(size_t*, const CUmemAllocationProp*, int);
     CUresult (*DeviceGetPCIBusId)(char*, int, CUdevice);
+    CUresult (*DeviceGetLuid)(char*, unsigned*, CUdevice);  // Windows: the adapter of the device for DXGI (optional)
 } cu;
 
 struct NvmlMemory {
@@ -216,6 +220,7 @@ int load_driver() {
     bind(cu.MemGetAllocationGranularity, "cuMemGetAllocationGranularity");
     bind(cu.DeviceGetPCIBusId, "cuDeviceGetPCIBusId");
     if (!complete) return driver_status = 2;
+    cu.DeviceGetLuid = reinterpret_cast<CUresult (*)(char*, unsigned*, CUdevice)>(symbol("cuDeviceGetLuid"));
     return driver_status = cu.Init(0) == CUDA_SUCCESS ? 0 : 3;
 }
 
@@ -297,6 +302,7 @@ struct Pool {  // graph-private heaps share physical chunks; all virtual mapping
     std::map<CUdeviceptr, PoolBlock> blocks;  // by address
     PoolFree free_small, free_large;  // small and mid-size arena blocks; large allocations use free_ranges/available_chunks
     std::vector<std::pair<CUdeviceptr, Event>> pending;  // escaped warmup outputs still read on another stream
+    std::unordered_set<CUmemGenericAllocationHandle> host_chunks;  // spill mode: chunks of pinned system RAM taken when VRAM was short
 };
 struct Capture {  // between PyTorch's begin and end of allocation to a pool
     MempoolId id;
@@ -352,6 +358,7 @@ struct Device {
     size_t host_granularity = 0;                               // 0 when the driver cannot map system RAM this way
     int64_t spilled_bytes = 0;                                 // system RAM mapped by spills, live and cached
     int64_t driver_spilled = 0;                                // live allocations of the driver (alloc_driver)
+    void* dxgi_adapter = nullptr;                              // Windows: IDXGIAdapter3 of the device, see room_now
     void* nvml_device = nullptr;                               // see vram_short
     int64_t nvml_free = 0, nvml_reserved = 0;                  // whole GPU free memory at the last NVML reading, reserved_now then
     std::chrono::steady_clock::time_point nvml_read{};
@@ -419,7 +426,7 @@ Event record_event(CUstream stream) {
     return Event(event, [](CUevent e) { cu.EventDestroy(e); });
 }
 
-void wait(CUstream stream, const Event& event) {
+void stream_wait(CUstream stream, const Event& event) {
     if (event) cu.StreamWaitEvent(stream, event.get(), 0);
 }
 
@@ -457,9 +464,43 @@ void trim_pools(Device& d) {
 // An allocation that would fail anyway is tried once more without it (beyond_gpu): Windows pages the VRAM of idle processes out.
 enum Refusal : int { REFUSED_BY_BUDGET = 1, REFUSED_BY_GPU, REFUSED_BY_LIMIT, REFUSED_BY_DRIVER };
 
-int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of the smallest of the limits
+// On Windows this process' budget is read from DXGI (budget - usage, what Windows manages residency by), not from the driver's free memory:
+// once a CUDA memory pool holds memory, the driver also limits that figure to the addresses left in a window the pools may grow into,
+// which address ranges without memory behind them (this allocator's arenas, RAM registered in pieces) shrink: by up to half of the VRAM,
+// while allocations still succeed.
+void* dxgi_adapter(CUdevice dev) {
+#ifdef _WIN32
+    char luid[8];
+    unsigned mask = 0;
+    if (!cu.DeviceGetLuid || cu.DeviceGetLuid(luid, &mask, dev) != CUDA_SUCCESS) return nullptr;
+    HMODULE library = LoadLibraryA("dxgi.dll");
+    auto create = library ? reinterpret_cast<HRESULT (WINAPI*)(REFIID, void**)>(GetProcAddress(library, "CreateDXGIFactory1")) : nullptr;
+    IDXGIFactory4* factory = nullptr;
+    if (!create || FAILED(create(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) return nullptr;
+    LUID id;
+    memcpy(&id, luid, sizeof(id));
+    IDXGIAdapter3* adapter = nullptr;
+    if (FAILED(factory->EnumAdapterByLuid(id, __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter)))) adapter = nullptr;
+    factory->Release();
+    return adapter;
+#else
+    return nullptr;
+#endif
+}
+
+size_t process_free(const Device& d) {  // VRAM this process may still take: its DXGI budget on Windows, otherwise the driver's free memory
     size_t free_bytes = 0, total = 0;
+#ifdef _WIN32
+    DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    if (d.dxgi_adapter && SUCCEEDED(static_cast<IDXGIAdapter3*>(d.dxgi_adapter)->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return info.Budget > info.CurrentUsage ? static_cast<size_t>(info.Budget - info.CurrentUsage) : 0;
+#endif
     cu.MemGetInfo(&free_bytes, &total);
+    return free_bytes;
+}
+
+int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of the smallest of the limits
+    size_t free_bytes = process_free(d);
     int64_t room = static_cast<int64_t>(free_bytes);
     int smallest = REFUSED_BY_BUDGET;
     if (d.nvml_device && !d.beyond_gpu) {
@@ -584,6 +625,7 @@ Device& device_state(int index) {  // created by the first allocation on a devic
     d.access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     CUdevice dev;
     cu.DeviceGet(&dev, index);
+    d.dxgi_adapter = dxgi_adapter(dev);
     cu.DevicePrimaryCtxRetain(&d.context, dev);  // PyTorch's context, kept for the life of the process
     bind_context(d);
     cu.DeviceGetDefaultMemPool(&d.small_pool, dev);
@@ -757,7 +799,7 @@ void take_chunks(Device& d, Range& range, size_t need, CUstream stream, bool wai
     // once that stream has finished with it, unless VRAM has run out
     for (size_t i = 0; i < d.spare.size() && range.chunks.size() < need;) {
         if (wait_for_others || reusable(d.spare[i].freed, d.spare[i].stream, stream)) {
-            if (d.spare[i].stream != stream) wait(stream, d.spare[i].freed);
+            if (d.spare[i].stream != stream) stream_wait(stream, d.spare[i].freed);
             range.chunks.push_back(d.spare[i].handle);
             d.spare[i] = d.spare.back();
             d.spare.pop_back();
@@ -769,7 +811,7 @@ void take_chunks(Device& d, Range& range, size_t need, CUstream stream, bool wai
         if (wait_for_others || reusable(it->freed, it->stream, stream)) {
             Range old = std::move(*it);
             it = d.cached.erase(it);
-            if (old.stream != stream) wait(stream, old.freed);
+            if (old.stream != stream) stream_wait(stream, old.freed);
             for (auto handle : old.chunks) {
                 if (range.chunks.size() < need) range.chunks.push_back(handle);
                 else d.spare.push_back({handle, old.freed, old.stream});
@@ -882,8 +924,8 @@ void* alloc_small(Device& d, size_t size, CUstream stream) {
 
 void borrow_eager_chunks(Device& d, const Pool* exclude, size_t need);
 
-bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chunks, size_t need, const Pool* exclude) {
-    if (chunks.size()+d.spare.size() < need) borrow_eager_chunks(d, exclude, need-chunks.size());
+bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chunks, size_t need, Pool& pool) {
+    if (chunks.size()+d.spare.size() < need) borrow_eager_chunks(d, &pool, need-chunks.size());
     // Pool growth consumes completed ordinary cache. Pending work is never waited on here.
     for (size_t i = 0; i < d.spare.size() && chunks.size() < need;) {
         if (d.spare[i].freed && cu.EventQuery(d.spare[i].freed.get()) != CUDA_SUCCESS) { ++i; continue; }
@@ -906,6 +948,19 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
         if (create_chunk(d, &handle, need - chunks.size()) != CUDA_SUCCESS) break;
         chunks.push_back(handle);
         ++d.chunks_total;
+    }
+    // Spill mode, VRAM has no room: a graph pool maps chunks of pinned system RAM at the addresses it needs (alloc_spilled cannot serve
+    // it), owned by the pool until it is destroyed and never given to ordinary allocations. Ordinary pools spill with alloc_spilled.
+    if (chunks.size() < need && spill && !pool.ordinary && d.host_granularity && !ram_short((need - chunks.size()) * chunk_size)) {
+        CUmemAllocationProp host = d.prop;
+        host.location = {CU_MEM_LOCATION_TYPE_HOST, 0};
+        while (chunks.size() < need) {
+            CUmemGenericAllocationHandle handle;
+            if (cu.MemCreate(&handle, chunk_size, &host, 0) != CUDA_SUCCESS) break;
+            chunks.push_back(handle);
+            pool.host_chunks.insert(handle);
+            d.spilled_bytes += static_cast<int64_t>(chunk_size);
+        }
     }
     return chunks.size() == need;
 }
@@ -932,11 +987,15 @@ bool map_shared_pool_chunks(Device& d, Pool& pool, CUdeviceptr va, size_t need,
         chunks.push_back(*it);
         it = pool.available_chunks.erase(it);
     }
-    size_t reused = chunks.size();
-    if (!take_pool_chunks(d, chunks, need, &pool) || !map_pool_chunks(d, va, chunks)) {
+    size_t reused = chunks.size(), hosted = pool.host_chunks.size();
+    if (!take_pool_chunks(d, chunks, need, pool) || !map_pool_chunks(d, va, chunks)) {
         for (size_t i = 0; i < chunks.size(); ++i) {
             if (i < reused) pool.available_chunks.insert(chunks[i]);
-            else d.spare.push_back({chunks[i], nullptr, nullptr});
+            else if (!pool.host_chunks.erase(chunks[i])) d.spare.push_back({chunks[i], nullptr, nullptr});
+            else {  // system RAM never goes to the spare chunks of ordinary allocations
+                cu.MemRelease(chunks[i]);
+                d.spilled_bytes -= static_cast<int64_t>(chunk_size);
+            }
         }
         return false;
     }
@@ -945,7 +1004,7 @@ bool map_shared_pool_chunks(Device& d, Pool& pool, CUdeviceptr va, size_t need,
         pool.uses.emplace(chunks[i], PoolUse{});
     }
     pool.available_chunks.insert(chunks.begin(), chunks.end());
-    if (!pool.ordinary) pool_takes_chunks(d, need - reused);
+    if (!pool.ordinary) pool_takes_chunks(d, need - reused - (pool.host_chunks.size() - hosted));
     else d.peak_reserved = std::max(d.peak_reserved, reserved_now(d));
     return true;
 }
@@ -1152,8 +1211,10 @@ void release_pool_memory(Device& d, std::map<MempoolId, Pool>::iterator pool) { 
         cu.MemAddressFree(range.first, range.second.size);
     }
     for (auto handle : pool->second.chunks) cu.MemRelease(handle);
+    size_t hosted = pool->second.host_chunks.size();
     if (pool->second.ordinary) d.chunks_total -= static_cast<int64_t>(pool->second.chunks.size());
-    else d.pools_bytes -= static_cast<int64_t>(pool->second.chunks.size() * chunk_size);
+    else d.pools_bytes -= static_cast<int64_t>((pool->second.chunks.size() - hosted) * chunk_size);
+    d.spilled_bytes -= static_cast<int64_t>(hosted * chunk_size);
     d.pools.erase(pool);
 }
 
@@ -1201,7 +1262,7 @@ void release_graph(Device& d, CUdeviceptr dptr, MempoolId id) {
         bool pending_capture = capturing(stream);
         for (CUstream other : uses->second) pending_capture = pending_capture || capturing(other);
         if (pending_capture) { d.deferred.push_back(dptr); return; }
-        for (CUstream other : uses->second) wait(stream, record_event(other));
+        for (CUstream other : uses->second) stream_wait(stream, record_event(other));
         d.stream_uses.erase(uses);
         pool->second.pending.emplace_back(dptr, record_event(stream));
         d.pool_of.erase(dptr);
@@ -1231,7 +1292,7 @@ void release(Device& d, CUdeviceptr dptr) {
     CUstream stream = it != d.live.end() ? it->second.stream : small != d.live_small.end() ? small->second.stream : spilled->second.stream;
     auto uses = d.stream_uses.find(dptr);
     if (uses != d.stream_uses.end()) {  // reuse must also wait for the other streams that used the memory
-        for (CUstream other : uses->second) wait(stream, record_event(other));
+        for (CUstream other : uses->second) stream_wait(stream, record_event(other));
         d.stream_uses.erase(uses);
     }
     if (it != d.live.end()) {
@@ -1268,18 +1329,18 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
     return text;
 }
 
-[[noreturn]] void out_of_memory(const Device& d, size_t size, int device) {
-    size_t free_bytes = 0, total = 0;
-    cu.MemGetInfo(&free_bytes, &total);
-    NvmlMemory gpu = {};  // the whole GPU's free memory, read now: the driver's figure is this process' budget on Windows
+[[noreturn]] void out_of_memory(const Device& d, size_t size, int device, bool to_pool) {
+    size_t free_bytes = process_free(d), unused_free = 0, total = 0;
+    cu.MemGetInfo(&unused_free, &total);
+    NvmlMemory gpu = {};  // the whole GPU's free memory, read now: free_bytes is this process' budget on Windows
     bool whole_gpu = d.nvml_device && nvml.DeviceGetMemoryInfo(d.nvml_device, &gpu) == 0;
     char request[32], capacity[32], available[32], driver_free[32], allocated[32], unused[32], need[32], headroom[32], spilled[32], ram[32],
         margin[32], message[1280];
-    int length = snprintf(message, sizeof(message), "CUDA out of memory. Tried to allocate %s. GPU %d has a total capacity of %s of which %s is free",
-             format_size(static_cast<double>(size), request), device, format_size(static_cast<double>(total), capacity),
+    int length = snprintf(message, sizeof(message), "CUDA out of memory. Tried to allocate %s%s. GPU %d has a total capacity of %s of which %s is free",
+             format_size(static_cast<double>(size), request), to_pool ? " for a CUDA graph" : "", device, format_size(static_cast<double>(total), capacity),
              format_size(static_cast<double>(whole_gpu ? gpu.free : free_bytes), available));
     if (whole_gpu)
-        length += snprintf(message + length, sizeof(message) - length, " (the driver reports %s free for this process)",
+        length += snprintf(message + length, sizeof(message) - length, " (%s free for this process)",
                            format_size(static_cast<double>(free_bytes), driver_free));
     length += snprintf(message + length, sizeof(message) - length, ". Of the allocated memory %s is allocated by PyTorch, and %s is reserved by "
              "the MMGP VRAM allocator but unallocated.", format_size(static_cast<double>(d.allocated), allocated),
@@ -1297,7 +1358,7 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
                            "free for the system.", format_size(static_cast<double>(d.spilled_bytes), spilled), format_size(static_cast<double>(ram_available), ram),
                            format_size(static_cast<double>(ram_margin(ram_total)), margin));
     }
-    if (driver_spill && d.refusal != REFUSED_BY_LIMIT) {
+    if (driver_spill && !to_pool && d.refusal != REFUSED_BY_LIMIT) {  // a graph's memory stays in its pool: never the driver's allocation
 #ifdef _WIN32
         snprintf(message + length, sizeof(message) - length, " The CUDA driver could not place it in shared GPU memory either (NVIDIA Control Panel: "
                  "CUDA - Sysmem Fallback Policy).");
@@ -1644,7 +1705,7 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
         ptr = alloc_ordinary_shared(d, size, stream);
         d.beyond_gpu = false;
     }
-    if (!ptr && spill && !to_pool) {
+    if (!ptr && spill && !to_pool) {  // a graph pool spills chunks of its own instead (take_pool_chunks)
         ptr = alloc_spilled(d, size, stream);
         if (ptr) kind = 3;
     }
@@ -1657,7 +1718,7 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
             debug_flush(d);
             debug_snapshot(d, d.debug_oom, static_cast<int64_t>(size));
         }
-        out_of_memory(d, size, device);
+        out_of_memory(d, size, device, to_pool);
     }
     count(d, static_cast<int64_t>(size));
     if (threshold) debug_allocated(d, ptr, size, origin, kind, threshold);
@@ -1732,10 +1793,10 @@ EXPORT int vmm_prepare_reuse(void* ptr, CUstream stream, int order) {
         else continue;  // externally owned or spilled storage is never adopted
         if (!order) return 1;
         bind_context(d);
-        if (owner != stream) wait(stream, record_event(owner));
+        if (owner != stream) stream_wait(stream, record_event(owner));
         auto uses = d.stream_uses.find(dptr);
         if (uses != d.stream_uses.end()) {
-            for (CUstream other : uses->second) if (other != stream && other != owner) wait(stream, record_event(other));
+            for (CUstream other : uses->second) if (other != stream && other != owner) stream_wait(stream, record_event(other));
             uses->second.clear();
         }
         if (owner != stream) d.stream_uses[dptr].push_back(stream);

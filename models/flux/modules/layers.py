@@ -142,6 +142,22 @@ def _norm_rope_(query, key, pe, segments):
             attention_kit.rows_(tensor, lambda part, first, last: apply_rope_([normalize(part)], pe[:, first:last]), start, stop)
 
 
+def _fused_norm_rope_quant_(query, key, pe, segments, core, settings):
+    """attention_kit's fused_quant: the QKNorm weights of each segment of tokens (RMSNorm: FP32 statistics, eps 1e-6, one rounding) and
+    pe's rotation matrices (interleaved channel pairs) fused with the staged SageAttention 2 quantization of q and / or k."""
+    return ops.split_half_norm_rope_quant_(query, key, pe.transpose(1, 2), [(start, stop, (norm.query_norm.scale, 1e-6)) for start, stop, norm in segments],
+                                           [(start, stop, (norm.key_norm.scale, 1e-6)) for start, stop, norm in segments], core, settings, interleaved=True)
+
+
+def _norm_modulate(x, norm, mod):
+    """norm(x) * (1 + mod.scale) + mod.shift through the shared segmented modulation, one row per batch item (mod tensors (batch or 1,
+    1, dim)); x is borrowed."""
+    batch, tokens = x.shape[:2]
+    rows = mod.scale.shape[0]
+    segments = [(b * tokens, (b + 1) * tokens, b if rows > 1 else 0) for b in range(batch)]
+    return ops.norm_modulate([x.view(-1, x.shape[-1])], norm, mod.shift[:, 0], mod.scale[:, 0], segments).view(x.shape)
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, proj_bias: bool = True):
         super().__init__()
@@ -170,18 +186,6 @@ class ChromaModulationOut(ModulationOut):
             gate=tensor[:, offset + 2 : offset + 3, :],
         )
 
-
-def split_mlp(mlp, x, divide = 8):
-    x_shape = x.shape
-    x = x.view(-1, x.shape[-1])
-    chunk_size = int(x.shape[0]/divide)
-    chunk_size = int(x_shape[1]/divide)
-    x_chunks = torch.split(x, chunk_size)
-    for i, x_chunk  in enumerate(x_chunks):
-        mlp_chunk = mlp[0](x_chunk)
-        mlp_chunk = mlp[1](mlp_chunk)
-        x_chunk[...] = mlp[2](mlp_chunk)
-    return x.reshape(x_shape)      
 
 class Modulation(nn.Module):
     def __init__(self, dim: int, double: bool, bias: bool = True):
@@ -220,6 +224,7 @@ class DoubleStreamBlock(nn.Module):
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.shared_modulation = shared_modulation
+        self.mlp_activation = "swiglu" if double_linear1_mlp_ratio is not None else "gelu"  # of both MLPs, for the shared chunked FFN
         if not shared_modulation:
             self.img_mod = Modulation(hidden_size, double=True, bias=mod_bias)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -266,15 +271,16 @@ class DoubleStreamBlock(nn.Module):
             txt_mod1, txt_mod2 = self.txt_mod(vec)
 
         # prepare image for attention
-        img_modulated = ops.norm_scale_shift([img], self.img_norm1, img_mod1.scale, img_mod1.shift)
+        img_modulated = _norm_modulate(img, self.img_norm1, img_mod1)
 
         if NAG is None:
-            txt_modulated = ops.norm_scale_shift([txt], self.txt_norm1, txt_mod1.scale, txt_mod1.shift)
+            txt_modulated = _norm_modulate(txt, self.txt_norm1, txt_mod1)
             txt_len, head_dim = txt.shape[1], self.hidden_size // self.num_heads
             streams = [([txt_modulated], (self.txt_attn.q, self.txt_attn.k, self.txt_attn.v)), ([img_modulated], (self.img_attn.q, self.img_attn.k, self.img_attn.v))]
             del txt_modulated, img_modulated
             segments = ((0, txt_len, self.txt_attn.norm), (txt_len, txt_len + img.shape[1], self.img_attn.norm))
-            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: _norm_rope_(query, key, pe, segments)).flatten(2)
+            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: _norm_rope_(query, key, pe, segments),
+                                                     fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
         else:
             img_list, img_modulated = [img_modulated], None
             attn = self._attention_nag(img_list, txt, txt_mod1, pe, NAG)
@@ -282,18 +288,13 @@ class DoubleStreamBlock(nn.Module):
 
         # calculate the img blocks
         ops.gated_residual_(img, [self.img_attn.proj(img_attn)], img_mod1.gate, fused=True)
-        mod_img = ops.norm_scale_shift([img], self.img_norm2, img_mod2.scale, img_mod2.shift)
-        mod_img = split_mlp(self.img_mlp, mod_img)
-        # mod_img = self.img_mlp(mod_img)
-        mod_img_list, mod_img = [mod_img], None
-        ops.gated_residual_(img, mod_img_list, img_mod2.gate, fused=True)
+        ops.mlp([_norm_modulate(img, self.img_norm2, img_mod2)], self.img_mlp[0], self.img_mlp[2], self.mlp_activation,
+                residual=img, segments=ops.gate_segments(img_mod2.gate, img.shape[0], img.shape[1]))
 
         # calculate the txt blocks
         ops.gated_residual_(txt, [self.txt_attn.proj(txt_attn)], txt_mod1.gate, fused=True)
-        mod_txt = ops.norm_scale_shift([txt], self.txt_norm2, txt_mod2.scale, txt_mod2.shift, in_place=False)
-        mod_txt = self.txt_mlp(mod_txt)
-        mod_txt_list, mod_txt = [mod_txt], None
-        ops.gated_residual_(txt, mod_txt_list, txt_mod2.gate, fused=True)
+        ops.mlp([_norm_modulate(txt, self.txt_norm2, txt_mod2)], self.txt_mlp[0], self.txt_mlp[2], self.mlp_activation,
+                residual=txt, segments=ops.gate_segments(txt_mod2.gate, txt.shape[0], txt.shape[1]))
         return img, txt
 
     def _attention_nag(self, img_list, txt, txt_mod1, pe, NAG):
@@ -309,7 +310,7 @@ class DoubleStreamBlock(nn.Module):
         img_k= self.img_attn.norm(None, img_k, img_v)
 
         # prepare txt for attention
-        txt_modulated = ops.norm_scale_shift([txt], self.txt_norm1, txt_mod1.scale, txt_mod1.shift)
+        txt_modulated = _norm_modulate(txt, self.txt_norm1, txt_mod1)
 
         shape = (*txt_modulated.shape[:2], self.num_heads, int(txt_modulated.shape[-1] / self.num_heads) )
         txt_q = self.txt_attn.q(txt_modulated).view(*shape).transpose(1,2)
@@ -374,7 +375,6 @@ class SingleStreamBlock(nn.Module):
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
-        self.mlp_act = SiLUActivation() if self.use_silu else nn.GELU(approximate="tanh")
         if not shared_modulation:
             self.modulation = Modulation(hidden_size, double=False, bias=modulation_bias)
         else:
@@ -385,7 +385,7 @@ class SingleStreamBlock(nn.Module):
             mod = vec
         elif self.modulation is not None:
             mod, _ = self.modulation(vec)
-        x_mod = ops.norm_scale_shift([x], self.pre_norm, mod.scale, mod.shift)
+        x_mod = _norm_modulate(x, self.pre_norm, mod)
 
 
         # x_mod = (1 + mod.scale) * x + mod.shift
@@ -393,7 +393,8 @@ class SingleStreamBlock(nn.Module):
         if NAG is None:  # x_mod stays: the MLP reads it after the attention
             segments = ((0, x_mod.shape[1], self.norm),)
             attn = attention_kit.qkv_attention([x_mod], self.linear1_attn_q, self.linear1_attn_k, self.linear1_attn_v, self.num_heads,
-                                               self.hidden_size // self.num_heads, lambda query, key, group: _norm_rope_(query, key, pe, segments)).flatten(2)
+                                               self.hidden_size // self.num_heads, lambda query, key, group: _norm_rope_(query, key, pe, segments),
+                                               fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
         else:
             shape = (*x_mod.shape[:2], self.num_heads, int(x_mod.shape[-1] / self.num_heads) )
             q = self.linear1_attn_q(x_mod).view(*shape).transpose(1,2)
@@ -407,25 +408,10 @@ class SingleStreamBlock(nn.Module):
             qkv_list = [q, k, v]
             del q, k, v
             attn = attention(qkv_list, pe=pe, txt_len=txt_len, NAG=NAG)
-        # compute activation in mlp stream, cat again and run second linear layer
-
-        x_mod_shape = x_mod.shape
-        x_mod = x_mod.view(-1, x_mod.shape[-1])
-        chunk_size = int(x_mod_shape[1]/6)
-        x_chunks = torch.split(x_mod, chunk_size)
-        attn = attn.view(-1, attn.shape[-1])
-        attn_chunks =torch.split(attn, chunk_size)
-        for x_chunk, attn_chunk in zip(x_chunks, attn_chunks):
-            mlp_chunk = self.linear1_mlp(x_chunk)
-            mlp_chunk = self.mlp_act(mlp_chunk)
-            attn_mlp_chunk = torch.cat((attn_chunk, mlp_chunk), -1)
-            del attn_chunk, mlp_chunk 
-            x_chunk[...] = self.linear2(attn_mlp_chunk)
-            del attn_mlp_chunk
-        del x_chunks, x_chunk, attn_chunks, attn
-        x_mod = x_mod.view(x_mod_shape)
+        # linear2 reads the attention output and the activated MLP stream together: the shared chunked FFN with the attention as prefix
         x_mod_list, x_mod = [x_mod], None
-        ops.gated_residual_(x, x_mod_list, mod.gate, fused=True)
+        ops.mlp(x_mod_list, self.linear1_mlp, self.linear2, "swiglu" if self.use_silu else "gelu", prefix=attn, residual=x,
+                segments=ops.gate_segments(mod.gate, x.shape[0], x.shape[1]))
         return x
 
 

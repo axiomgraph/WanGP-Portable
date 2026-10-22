@@ -2,7 +2,7 @@
     "model": {
         "name": "Music YuE2 3B",
         "architecture": "yue2",
-        "description": "Create complete songs with vocals and instrumental accompaniment from your lyrics and a description of the genre, mood, instruments and voice. Create a new cover using the melody extracted from a source song and lyrics you supply, or provide a musical score in ABC format. Optionally save the composition as ABC and MIDI files. Covers generate a new recording; they do not preserve the original backing track.",
+        "description": "Create stereo songs from lyrics and musical style. Choose a new composition, a supplied ABC score, or notation transcribed from source audio. Supplied and transcribed scores can be used directly or continued before rendering. Save the complete composition as ABC and MIDI. Audio conditioning creates a new rendition; it does not preserve the source recording.",
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/YuE2_Acoustic_bf16.safetensors",
             "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/YuE2_Acoustic_int8_convrot.safetensors"
@@ -19,5 +19,6 @@
     "model_mode": 0,
     "custom_guide": null,
     "custom_settings": {"save_score": 0},
-    "prompt_enhancer": ""
+    "prompt_enhancer": "",
+    "audio_prompt_type": "0"
 }

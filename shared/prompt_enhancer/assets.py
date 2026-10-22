@@ -70,6 +70,7 @@ QWEN35_VARIANT_SPECS = {
         "vision_filename": QWEN35_VISION_FILENAME,
         "tie_word_embeddings": False,
         "supports_mtp": True,
+        "mtp_draft_vocab_size": 98304,  # GGUF checkpoint: the MTP head drafts over the first 98304 tokens, as the 27B
         "mtp_speculative_tokens": 2,
         "mtp_speculative_sampling_tokens": 2,
         "mtp_speculative_confidence": 0.0,

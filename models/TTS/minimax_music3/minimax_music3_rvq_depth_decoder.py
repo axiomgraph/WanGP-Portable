@@ -11,7 +11,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
 
 from shared.attention import pay_attention
-from shared.llm_engines.cudagraph_kit import CUDAGraphRunner
+from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
 
 
 class MiniMaxMusic3DepthAttention(nn.Module):
@@ -95,7 +95,7 @@ class MiniMaxMusic3RVQDepthDecoder(ModelMixin, ConfigMixin):
             nn.Linear(hidden_size, audio_vocab_size, bias=False) for _ in range(num_codebooks - 1)
         ])
         self._interrupt_check = None
-        self._decode_engine = "legacy"
+        self._cuda_graphs = False
         self._decode_runner = None
         self._decode_causal_mask = None
         self._decode_positions = None
@@ -109,8 +109,8 @@ class MiniMaxMusic3RVQDepthDecoder(ModelMixin, ConfigMixin):
                 raise InterruptedError("MiniMax Music 3 generation interrupted")
         return self.norm(hidden_states)
 
-    def set_decode_engine(self, engine: str):
-        self._decode_engine = engine
+    def set_cuda_graphs(self, enabled: bool):
+        self._cuda_graphs = bool(enabled)
 
     def _decode_step(self, hidden_states: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
         hidden_states = self.projection(hidden_states).unsqueeze(1) + self.pos_embedding(position).unsqueeze(0)
@@ -119,7 +119,7 @@ class MiniMaxMusic3RVQDepthDecoder(ModelMixin, ConfigMixin):
         return self.norm(hidden_states)[:, -1]
 
     def prepare_decode_graph(self, batch_size: int, device: torch.device, dtype: torch.dtype):
-        if self._decode_engine == "legacy":
+        if not self._cuda_graphs:
             return
         self.release_decode_graph()
         for layer in self.layers:
@@ -128,13 +128,15 @@ class MiniMaxMusic3RVQDepthDecoder(ModelMixin, ConfigMixin):
             layer.attn.v_cache = torch.zeros(shape, device=device, dtype=dtype)
         self._decode_positions = torch.arange(self.config.max_position_embeddings, device=device)
         self._decode_causal_mask = self._decode_positions.unsqueeze(0) <= self._decode_positions.unsqueeze(1)
-        self._decode_runner = CUDAGraphRunner("minimax_music3:rvq_decode", self._decode_step)
+        # MMGP graphs of the step (this decoder is a model of its own for MMGP): its caches, positions and mask are graph state
+        self._decode_runner = AutoRegressiveCudaGraphKit("minimax_music3_rvq", owner=self)
+        self._decode_runner.register_state([tensor for layer in self.layers for tensor in (layer.attn.k_cache, layer.attn.v_cache)], self._decode_positions, self._decode_causal_mask)
         self._decode_step(torch.zeros((batch_size, self.config.hidden_size), device=device, dtype=dtype), self._decode_positions[:1])
 
     def decode_embedding(self, hidden_states: torch.Tensor, position: int) -> torch.Tensor:
         if self._decode_runner is None:
             raise RuntimeError("MiniMax Music 3 RVQ CUDA graph is not prepared")
-        return self._decode_runner.run(hidden_states, self._decode_positions[position:position + 1])
+        return self._decode_runner.run("decode", self._decode_step, hidden_states, self._decode_positions[position:position + 1])
 
     def release_decode_graph(self):
         if self._decode_runner is not None:

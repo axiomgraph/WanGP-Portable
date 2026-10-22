@@ -534,7 +534,7 @@ For Qwen3.8:
 - **GGUF IQ3_S** provides the recommended balance of quality and memory for most local Qwen3.8 users.
 - **GGUF Q2** has the lowest memory use and the greatest quality loss. Use it only when Q3 or Q4 cannot fit.
 
-The shared **Configuration > Performance > Language Models Decoder Engine** can accelerate supported local Qwen engines. **Auto** is recommended. CUDA Graph and vLLM can be much faster but load the whole language model into VRAM; vLLM also requires Triton and Flash Attention 2. Use the PyTorch option for maximum compatibility.
+The local Qwen engines always run at the fastest speed your installation allows: WanGP uses CUDA graphs and every accelerated kernel that is installed (Triton, FlashAttention 2, the GGUF kernels), with no setting to choose. Installing Triton and FlashAttention 2 makes them faster. When the language model does not fit in VRAM beside your other needs, WanGP keeps as many of its layers in VRAM as fit and streams the others from RAM: responses are slower, but they still work. **Configuration > Performance > Language Models CPU Compute** makes this case faster: the CPU processes the layers left in RAM while the model writes. **Auto** (default) lets the CPU help when it is faster on your PC, which with the Reserved RAM that these models borrow while they write (Memory Profile 0, which they always use) answers about twice as fast. See the Deepy guide for details. The audio and music models that use a language model work the same way, each optimization used wherever it is supported.
 
 ### Speculative Decoding (MTP)
 

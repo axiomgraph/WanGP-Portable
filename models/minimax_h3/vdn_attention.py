@@ -11,6 +11,7 @@ from mmgp import offload
 from torch import nn
 
 from shared import attention_kit
+from shared.kernels import ops as kernels
 
 try:
     import triton
@@ -107,7 +108,9 @@ class FrameKDAAlpha(nn.Module):
 
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            delta = F.linear(F.linear(x.float(), self.down.weight.float()), self.up.weight.float())
+            # Run the modules so quantization transforms and offload hooks apply.
+            delta = self.down(x.to(self.down.weight.dtype))
+            delta = self.up(delta.to(self.up.weight.dtype)).float()
             delta = delta.view(-1, self.heads, self.head_dim) + self.dt_bias.float().view(1, self.heads, self.head_dim)
             return torch.exp(-torch.exp(self.A_log.float())[None, :, None] * F.softplus(delta))
 
@@ -405,7 +408,8 @@ class VDNHybridAttention(nn.Module):
             branch[self.tokens_per_frame:(self.frames - 1) * self.tokens_per_frame] = readout.reshape(-1, self.heads * self.head_dim)
             readout = None
         query = states = project = source = gate = None
-        output[video].add_(self.to_out_linear(branch))
+        branch_list, branch = [branch], None
+        kernels.linear_residual_(self.to_out_linear, branch_list, output[video])
         return output
 
     def _forward_head_groups(self, x_handoff, qkv, norm_rope, original_out):
@@ -462,7 +466,8 @@ class VDNHybridAttention(nn.Module):
                 readout = None
             gated = None
         project = source = states = None
-        output[video].add_(self.to_out_linear(branch))
+        branch_list, branch = [branch], None
+        kernels.linear_residual_(self.to_out_linear, branch_list, output[video])
         return output
 
     def _window_softmax(self, qkv_handoff):

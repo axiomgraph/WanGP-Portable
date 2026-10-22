@@ -70,7 +70,7 @@ def install_gdn_decode(model):
         return
     capability = torch.cuda.get_device_capability(0)
     if capability[0] < 8:
-        return
+        return _install_turing_recurrence(model, capability)
     validated_launches = capability == (12, 0)
     count = 0
     for block in model.blk:
@@ -100,7 +100,7 @@ def install_gdn_decode(model):
 
 
 # Adapted from the FLA-derived recurrent_verify_kernel in
-# nanovllm/layers/speculative_state.py; its MIT notice applies.
+# lmgp/layers/speculative_state.py; its MIT notice applies.
 from fla.ops.utils.op import exp
 
 
@@ -295,10 +295,10 @@ def prepare_decode_checked(query, key, a, b, ssm_a, ssm_dt, num_v_heads):
 
 def _recurrent_reference(q, k, v, a, b, ssm_a, ssm_dt, initial, snapshots,
                          *, v_heads_tiled=False, ssm_params_tiled=False, interleave_ab=False):
-    from shared.llm_engines.nanovllm.layers.speculative_state import recurrent_verify
+    from shared.llm_engines.lmgp.layers.speculative_state import recurrent_verify
     # Preserve the established materialized path when a portable numerical
     # probe cannot use the direct-layout kernel, including during capture.
-    from shared.llm_engines.nanovllm.models.qwen3_5 import (
+    from shared.llm_engines.lmgp.models.qwen3_5 import (
         _interleave_axis_halves, _reorder_v_head_axis_tiled_to_grouped,
         _reorder_v_head_axis_grouped_to_tiled, _reorder_v_heads_tiled_to_grouped,
     )
@@ -386,12 +386,14 @@ def probe_replay_verification(block, max_verify_tokens):
     Checked once per configuration, outside capture, with the verification's tensor layouts: the direct kernel must pass the
     numerical check of recurrent_raw_gates_checked against the established path, and replays must equal its snapshots exactly."""
     state = block.recurrent_state_buffer
-    if block.ssm_a.device != state.device or block.ssm_dt.device != state.device:
-        return False  # weights not resident yet: decided once the warm-up before graph capture has loaded them
     direct = getattr(block, "_gdn_direct_layout", True)
     layout = block._recurrence_layout(direct)
     projection = "qkv_gate" if block.attn_qkv_gate is not None else ("separate" if block.attn_gate_ab is None else "gate_ab")
     key = (state.device, state.dtype, int(max_verify_tokens), block.num_k_heads, block.head_k_dim, block.num_v_heads, block.head_v_dim, projection, tuple(layout.values()))
+    if key in _replay_choices:
+        return _replay_choices[key]  # decided on a layer of the same configuration, whether this one's weights are resident or streamed
+    if block.ssm_a.device != state.device or block.ssm_dt.device != state.device:
+        return False  # weights not resident yet: decided once the warm-up before graph capture has loaded them
     if key not in _replay_choices:
         _replay_choices[key] = _probe_replay(block, int(max_verify_tokens), direct, layout, projection)
         print(f"[Qwen][GDN] Speculative State Replay: {'Enabled' if _replay_choices[key] else 'Snapshots Kept'} (Numerical Check).")
@@ -438,6 +440,130 @@ def _probe_replay(block, max_verify_tokens, direct, layout, projection):
     except (AssertionError, OutOfResources, CompilationError):
         return False
     return True
+
+
+# Turing (sm_75): no BF16 conversion instructions, so the kernels above do not compile there. This one reads and writes BF16 tensors as
+# their bits (RNE rounding as PyTorch's casts) and computes in FP32 with IEEE division, square root and exp; FP16 and FP32 tensors are
+# read directly. Strides of the last q/k/v dimension are explicit: the PyTorch convolution of this route leaves them transposed.
+@triton.jit
+def _bf16_bits_to_fp32(bits):
+    return (bits.to(tl.int32) << 16).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _fp32_to_bf16_bits(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    rounded = tl.where(x != x, 0x7FC0, (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16)
+    return rounded.to(tl.uint16).to(tl.int16, bitcast=True)
+
+
+@triton.jit
+def _load_fp32(pointer, mask, BITS: tl.constexpr):
+    if BITS:
+        return _bf16_bits_to_fp32(tl.load(pointer, mask, 0))
+    return tl.load(pointer, mask, 0).to(tl.float32)
+
+
+@triton.jit
+def _load_scalar_fp32(pointer, BITS: tl.constexpr):
+    if BITS:
+        return _bf16_bits_to_fp32(tl.load(pointer))
+    return tl.load(pointer).to(tl.float32)
+
+
+@triton.jit
+def _round_fp32(x, pointer, BITS: tl.constexpr):  # x rounded to the dtype of pointer's tensor
+    if BITS:
+        return _bf16_bits_to_fp32(_fp32_to_bf16_bits(x))
+    return x.to(pointer.dtype.element_ty).to(tl.float32)
+
+
+@triton.jit
+def _store_fp32(pointer, value, mask, BITS: tl.constexpr):
+    if BITS:
+        tl.store(pointer, _fp32_to_bf16_bits(value), mask)
+    else:
+        tl.store(pointer, value.to(pointer.dtype.element_ty), mask)
+
+
+@triton.jit(do_not_specialize=("T", "BATCH", "QS0", "QS1", "QS2", "QS3", "KS0", "KS1", "KS2", "KS3", "VS0", "VS1", "VS2", "VS3", "AS0", "AS1", "BS0", "BS1"),
+            do_not_specialize_on_alignment=("T", "BATCH", "QS0", "QS1", "QS2", "QS3", "KS0", "KS1", "KS2", "KS3", "VS0", "VS1", "VS2", "VS3", "AS0", "AS1", "BS0", "BS1"))
+def _recurrent_ieee_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, OUT, SNAPSHOTS,
+                           T, H: tl.constexpr, HV: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                           QS0, QS1, QS2, QS3, KS0, KS1, KS2, KS3, VS0, VS1, VS2, VS3, AS0, AS1, BS0, BS1,
+                           BATCH, BK: tl.constexpr, BV: tl.constexpr, SAVE_PREFIX: tl.constexpr,
+                           V_HEADS_TILED: tl.constexpr, SSM_PARAMS_TILED: tl.constexpr, INTERLEAVE_AB: tl.constexpr,
+                           BITS: tl.constexpr, SSM_BITS: tl.constexpr):
+    vb, bh = tl.program_id(0), tl.program_id(1)
+    batch, head = bh // HV, bh % HV
+    kh = head // (HV // H)
+    tiled_head = (head % (HV // H)) * H + kh
+    interleaved_head = head // 2 + (head % 2) * (HV // 2)
+    value_head = tiled_head if V_HEADS_TILED else head
+    gate_head = tiled_head if V_HEADS_TILED else (interleaved_head if INTERLEAVE_AB and HV % 2 == 0 else head)
+    param_head = tiled_head if SSM_PARAMS_TILED else (interleaved_head if INTERLEAVE_AB and HV % 2 == 0 else head)
+    keys = tl.arange(0, BK)
+    values = vb * BV + tl.arange(0, BV)
+    state_index = bh * DK * DV + keys[:, None] * DV + values[None, :]
+    mask = (keys[:, None] < DK) & (values[None, :] < DV)
+    state = _load_fp32(STATE + state_index, mask, BITS)
+    sa = _load_scalar_fp32(SSM_A + param_head, SSM_BITS)
+    dt = _load_scalar_fp32(DT + param_head, SSM_BITS)
+    for token in range(T):
+        q = _load_fp32(Q + batch * QS0 + token * QS1 + kh * QS2 + keys * QS3, keys < DK, BITS)
+        k = _load_fp32(K + batch * KS0 + token * KS1 + kh * KS2 + keys * KS3, keys < DK, BITS)
+        v = _load_fp32(V + batch * VS0 + token * VS1 + value_head * VS2 + values * VS3, values < DV, BITS)
+        a = _load_scalar_fp32(A + batch * AS0 + token * AS1 + gate_head, BITS) + dt
+        raw_beta = _load_scalar_fp32(BETA_IN + batch * BS0 + token * BS1 + gate_head, BITS)
+        q = tl.div_rn(q, tl.sqrt_rn(tl.sum(q * q) + 1e-6)) * DK ** -0.5
+        k = tl.div_rn(k, tl.sqrt_rn(tl.sum(k * k) + 1e-6))
+        g = sa * tl.where(a > 20., a, libdevice.log1p(libdevice.exp(a)))
+        # the gate's sigmoid rounded to the checkpoint compute dtype, as the established paths materialize it
+        beta = _round_fp32(tl.div_rn(1.0, 1.0 + libdevice.exp(-raw_beta)), BETA_IN, BITS)
+        state *= libdevice.exp(g)
+        v = beta * (v - tl.sum(state * k[:, None], 0))
+        state += k[:, None] * v
+        _store_fp32(OUT + ((batch * T + token) * HV + value_head) * DV + values, tl.sum(state * q[:, None], 0), values < DV, BITS)
+        if SAVE_PREFIX:
+            if token + 1 < T:
+                _store_fp32(SNAPSHOTS + token * BATCH * HV * DK * DV + state_index, state, mask, BITS)
+        # rounded to the state buffer's dtype after every token, as single-token decoding stores it: a verification of T tokens
+        # gives the results of T decoded tokens (speculative decoding reproduces plain decoding)
+        state = _round_fp32(state, STATE, BITS)
+    _store_fp32(STATE + state_index, state, mask, BITS)
+
+
+def recurrent_ieee(q, k, v, a, b, ssm_a, ssm_dt, initial, snapshots=None, replay=None,
+                   *, v_heads_tiled=False, ssm_params_tiled=False, interleave_ab=False):
+    """recurrent_raw_gates for GPUs without BF16 conversion instructions: same layouts and state handling (snapshots for the speculative
+    prefixes; no replay buffers), the state updated in place."""
+    if replay is not None:
+        raise RuntimeError("The sm_75 recurrence keeps snapshots of speculative prefixes, not replay buffers.")
+    batch, tokens, heads, dim_k = q.shape
+    hv, dim_v = v.shape[-2:]
+    output = torch.empty(v.shape, device=v.device, dtype=v.dtype)
+    bits = q.dtype == torch.bfloat16
+    ssm_bits = ssm_a.dtype == torch.bfloat16
+    as_bits = lambda x, flag=bits: None if x is None else (x.view(torch.int16) if flag else x)
+    _recurrent_ieee_kernel[(triton.cdiv(dim_v, 8), batch * hv)](
+        as_bits(q), as_bits(k), as_bits(v), as_bits(a), as_bits(b), as_bits(ssm_a, ssm_bits), as_bits(ssm_dt, ssm_bits), as_bits(initial),
+        as_bits(output), as_bits(snapshots),
+        tokens, heads, hv, dim_k, dim_v, *q.stride()[:4], *k.stride()[:4], *v.stride()[:4], *a.stride()[:2], *b.stride()[:2], batch,
+        triton.next_power_of_2(dim_k), 8, snapshots is not None, v_heads_tiled, ssm_params_tiled, interleave_ab, bits, ssm_bits,
+        num_warps=1, num_stages=3,
+    )
+    return output, initial
+
+
+def _install_turing_recurrence(model, capability):
+    """Decoding and speculative verification of the linear-attention layers on sm_75 (validated there only): the PyTorch recurrence
+    (one launch per operation and token) replaced by _recurrent_ieee_kernel, at least as precise (FP32 throughout, the inputs read once)."""
+    if capability != (7, 5):
+        return
+    blocks = [block for block in model.blk if block.layer_type == "linear_attention"]
+    for block in blocks:
+        block._gdn_recurrent_raw = recurrent_ieee
+    print(f"[Qwen][GDN] Turing Recurrence Kernel For {len(blocks)} Layers (BF16 Read As Bits, FP32 IEEE Math).")
 
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger

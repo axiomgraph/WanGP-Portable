@@ -18,6 +18,8 @@ limitations under the License.
 import importlib
 
 import torch
+import triton
+import triton.language as tl
 from spas_sage_attn.utils import hyperparameter_check, get_block_map_meansim_fuse_quant, get_vanilla_qk_quant, block_map_lut_triton
 from spas_sage_attn.triton_kernel_example import spas_sage_attn_meansim as spas_sage_attn_meansim_triton
 from einops import rearrange
@@ -410,3 +412,146 @@ def block_sparse_attn_cuda(q, k=None, v=None, mask_id=None, dropout_p=0.0, scale
 # For compatibility. spas_sage2_attn_meansim_cuda and spas_sage2_attn_meansim_topk_cuda already support sm80/86/89/90/120
 spas_sage_attn_meansim_cuda = spas_sage2_attn_meansim_cuda
 spas_sage_attn_meansim_topk_cuda = spas_sage2_attn_meansim_topk_cuda
+
+
+# ---- Staged quantization for the attention kit (shared.attention_kit): the q, k and v of a head group are quantized as soon as each
+# is projected and the block-sparse kernel runs on the group's slice of the block map, so that no whole-sequence BF16 copies and no
+# head-major (HND) copies exist. Same quantizers' arithmetic and same kernels as block_sparse_attn_cuda, on the kit's (batch, tokens,
+# heads, head_dim) tensors through their strides.
+
+_PV_THRESHOLD = 50
+_pv_thresholds = {}
+
+
+@triton.jit
+def _quant_block_nhd(X, Mean, Xq, Scale, tokens, heads, sxb, sxn, sxh, sqb, sqn, sqh, ssb, ssh, D: tl.constexpr, BLK: tl.constexpr, SUB_MEAN: tl.constexpr):
+    """qk_quantize's arithmetic (the mean subtracted in x's dtype, block scale max|x| / 127 + 1e-7, rounding half away from zero) on
+    strided (batch, tokens, heads, D) tensors; Mean is (batch, 1, heads, D) contiguous in x's dtype."""
+    block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    rows = block * BLK + tl.arange(0, BLK)
+    cols = tl.arange(0, D)
+    inside = rows[:, None] < tokens
+    x = tl.load(X + batch * sxb + head * sxh + rows[:, None] * sxn + cols[None, :], inside, 0.0)
+    if SUB_MEAN:
+        x -= tl.load(Mean + (batch * heads + head) * D + cols)[None, :]
+        x = tl.where(inside, x, 0.0)
+    x = x.to(tl.float32)
+    scale = tl.max(tl.abs(x)) / 127.0
+    scale += 1e-7
+    q = x / scale
+    q += 0.5 * tl.where(q >= 0, 1, -1)
+    tl.store(Xq + batch * sqb + head * sqh + rows[:, None] * sqn + cols[None, :], q.to(tl.int8), inside)
+    tl.store(Scale + batch * ssb + head * ssh + block, scale)
+
+
+def _quantize_block(x, mean, block):
+    """(x_int8, scales (batch, heads, blocks) fp32) of x (batch, tokens, heads, head_dim), minus mean (batch, 1, heads, head_dim) when given."""
+    b, tokens, heads, head_dim = x.shape
+    blocks = (tokens + block - 1) // block
+    x_int8 = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    scale = torch.empty((b, heads, blocks), dtype=torch.float32, device=x.device)
+    _quant_block_nhd[(blocks, heads, b)](x, mean if mean is not None else x, x_int8, scale, tokens, heads, x.stride(0), x.stride(1), x.stride(2),
+                                          x_int8.stride(0), x_int8.stride(1), x_int8.stride(2), scale.stride(0), scale.stride(1),
+                                          D=head_dim, BLK=block, SUB_MEAN=mean is not None)
+    return x_int8, scale
+
+
+def staged_settings(device, head_dim=128):
+    """Settings of the staged_* functions on this device: the block sizes of the block map (query blocks x key blocks) and the P.V
+    kernel block_sparse_attn_cuda runs there; None where its kernels are unavailable."""
+    if head_dim not in (64, 128):
+        return None
+    arch = _cuda_archs[device.index if device.index is not None else torch.cuda.current_device()]
+    if arch in {"sm80", "sm86", "sm87"} and SM80_ENABLED:
+        return {"arch": arch, "block_q": 128, "block_k": 64, "fp8": False}
+    if arch in {"sm89", "sm100", "sm120", "sm121"} and SM89_ENABLED:
+        kernel = (_qattn_sm89.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold if get_cuda_version() < (12, 8)
+                  else _qattn_sm89.qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold)
+        return {"arch": arch, "block_q": 128, "block_k": 64, "fp8": True, "scale_max": 2.25, "kernel": kernel}
+    if arch == "sm90" and SM90_ENABLED:
+        return {"arch": arch, "block_q": 64, "block_k": 128, "fp8": True, "scale_max": 448.0,
+                "kernel": _qattn_sm90.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90}
+    return None
+
+
+@triton.jit
+def _v_fp8_nhd(V, Low, High, V8, Scale, tokens, heads, svb, svn, svh, pad_len, scale_max, D: tl.constexpr, BLOCK: tl.constexpr):
+    """scale_fuse_quant_cuda's FP8 V straight from (batch, tokens, heads, D), without its 16-bit transposed copy: per channel the scale
+    amax / scale_max (amax from the channel's min and max over the tokens), the values times scale_max / amax rounded to e4m3, stored
+    transposed (batch, D, heads, padded tokens) with the fp8 MMA permutation inside every 16 tokens, zeros beyond the tokens. The
+    divisions are Triton's fp32 division, the instruction the CUDA kernel uses under fast math. The first block stores the scales."""
+    block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    rows = block * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, D)
+    channel = (batch * heads + head) * D + cols
+    amax = tl.maximum(-tl.load(Low + channel).to(tl.float32), tl.load(High + channel).to(tl.float32))
+    if block == 0:
+        tl.store(Scale + channel, amax / scale_max)
+    x = tl.load(V + batch * svb + head * svh + rows[:, None] * svn + cols[None, :], rows[:, None] < tokens, 0.0).to(tl.float32)
+    x = x * (scale_max / amax)[None, :]
+    t = rows % 16
+    col = (rows // 16) * 16 + (t // 8) * 2 + ((t // 2) % 4) * 4 + t % 2
+    tl.store(V8 + ((batch * D + cols)[None, :] * heads + head) * pad_len + col[:, None], x.to(tl.float8e4nv))
+
+
+@torch.compiler.disable
+def staged_quantize_v(v_list, settings):
+    """FP8 v (transposed, padded to 128, permuted, scaled per channel) with its scales, or on sm_80 fp16 v and None; v is released."""
+    v = v_list[0]
+    v_list.clear()
+    if not settings["fp8"]:
+        return v if v.dtype == torch.float16 else v.to(torch.float16), None
+    b, kv_len, heads, head_dim = v.shape
+    padded_len = (kv_len + 127) // 128 * 128
+    low, high = torch.aminmax(v, dim=1)
+    v_fp8 = torch.empty((b, head_dim, heads, padded_len), dtype=torch.float8_e4m3fn, device=v.device)
+    v_scale = torch.empty((b, heads, head_dim), dtype=torch.float32, device=v.device)
+    _v_fp8_nhd[(padded_len // 64, heads, b)](v, low, high, v_fp8, v_scale, kv_len, heads, v.stride(0), v.stride(1), v.stride(2), padded_len,
+                                             settings["scale_max"], D=head_dim, BLOCK=64, num_warps=4, enable_fp_fusion=False)
+    del v, low, high
+    return v_fp8, v_scale
+
+
+@torch.compiler.disable
+def staged_quantize_k(k_list, settings):
+    """INT8 k minus its mean over the tokens, in blocks of block_k, with its scales; k is released."""
+    k = k_list[0]
+    k_list.clear()
+    km = k.mean(dim=1, keepdim=True)
+    quantized = _quantize_block(k, km, settings["block_k"])
+    del k, km
+    return quantized
+
+
+@torch.compiler.disable
+def staged_quantize_q(q, settings):
+    """INT8 q in blocks of block_q with its scales; q is not released (staged_attention can write the output into it)."""
+    return _quantize_block(q, None, settings["block_q"])
+
+
+def _pv_threshold(heads, device):
+    key = (heads, device)
+    if key not in _pv_thresholds:
+        _pv_thresholds[key] = hyperparameter_check(_PV_THRESHOLD, heads, device)
+    return _pv_thresholds[key]
+
+
+@torch.compiler.disable
+def staged_attention(out, quantized_list, settings, attn_mask=None):
+    """Block-sparse attention of the staged [(q_int8, q_scale), (k_int8, k_scale), (v, v_scale)] over the block map attn_mask
+    (batch, heads, query blocks of block_q, key blocks of block_k; nonzero = attended), written into out and returned. out has q's
+    shape with a contiguous last dimension: q itself, or a slice of heads of a larger output."""
+    (q_int8, q_scale), (k_int8, k_scale), (v, v_scale) = quantized_list
+    quantized_list.clear()
+    lut, valid_block_num = block_map_lut_triton(attn_mask if attn_mask.dtype == torch.int8 else attn_mask.to(torch.int8))
+    options = (0, False, 1, out.shape[-1] ** -0.5, 0)  # NHD layout, not causal, per-block scales, softmax scale, no lse
+    pv_threshold = _pv_threshold(q_int8.shape[2], out.device)
+    if not settings["fp8"]:
+        _qattn_sm80.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(q_int8, k_int8, v, out, lut, valid_block_num, pv_threshold, q_scale, k_scale, *options)
+    else:
+        settings["kernel"](q_int8, k_int8, v, out, lut, valid_block_num, pv_threshold, q_scale, k_scale, v_scale, *options)
+    return out
+
+
+from shared.kernels.triton_compilation_log import install_triton_compilation_logger
+install_triton_compilation_logger()

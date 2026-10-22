@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from shared.kernels import dispatch
 from shared.kernels.triton_tuner import LaunchTuner
 
 _TUNER = LaunchTuner("wan2gp_conv3d_triton", 1, "VAE")
@@ -17,16 +18,15 @@ _TUNE_ELEMENTS = 1 << 24  # calls writing at least this many elements tune the c
 _CL = torch.channels_last_3d
 
 
-@functools.cache
 def supported(device):
-    """CUDA GPUs with compute capability 8.0+; other devices use the PyTorch path."""
-    return device.type == "cuda" and torch.version.hip is None and torch.cuda.get_device_capability(device) >= (8, 0)
+    """NVIDIA GPUs with compute capability 8.0+ (the 16-bit kernels' floor, shared.kernels.dispatch); other devices use the PyTorch path."""
+    return dispatch.device_supported(torch.device(device), torch.bfloat16)
 
 
-@functools.cache
 def conv_supported(device):
-    """Triton convolutions: validated on compute capability 12.x GPUs (GeForce RTX 50), where they beat cuDNN; others keep cuDNN."""
-    return supported(device) and torch.cuda.get_device_capability(device)[0] == 12
+    """Triton convolutions: measured faster than cuDNN on compute capability 12.x GPUs only (GeForce RTX 50; 0.7-1.3x slower on 8.9), so
+    other GPUs keep cuDNN. A performance choice, not an eligibility one."""
+    return supported(device) and dispatch.capability(torch.device(device).index)[0] == 12
 
 
 _CONV_MIN_PIXELS = 8192  # with fewer output pixels (small tiles at low resolution), cuDNN is as fast or faster (launch cost, occupancy)

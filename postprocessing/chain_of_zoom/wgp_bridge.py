@@ -121,7 +121,7 @@ class ChainOfZoomBridge(SimpleScaleSuffixMixin):
         return [("parallel_tile_processing", parallel_tile_processing)]
 
     def config_requires_release(self, old_config: dict[str, Any], new_config: dict[str, Any], changed_keys: set[str]) -> bool:
-        return old_config != new_config or bool({"image_profile", "lm_decoder_engine"} & changed_keys)
+        return old_config != new_config or bool({"image_profile"} & changed_keys)
 
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         if not self.is_upsampling(spatial_upsampling):
@@ -212,11 +212,10 @@ class ChainOfZoomBridge(SimpleScaleSuffixMixin):
             raise ValueError(f"Unknown Chain-of-Zoom upsampling mode: {spatial_upsampling}")
         self.download(process_files)
         from postprocessing.chain_of_zoom.runtime import load_models
-        from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
+        from shared.llm_engines.lmgp.vllm_support import resolve_lm_features
 
-        lm_decoder_engine = resolve_lm_decoder_engine(self.server_config.get("lm_decoder_engine", ""), ["cg", "vllm"])
         parallel_tile_processing = self.parallel_tile_processing()
-        load_models(self.paths(), lm_decoder_engine=lm_decoder_engine, vlm_vision_batch=parallel_tile_processing, vlm_prompt_batch=parallel_tile_processing * 2, init_pipe=init_pipe, profile=profile, progress_callback=progress_callback)
+        load_models(self.paths(), lm_features=resolve_lm_features(), vlm_vision_batch=parallel_tile_processing, vlm_prompt_batch=parallel_tile_processing * 2, init_pipe=init_pipe, profile=profile, progress_callback=progress_callback)
 
     def upscale(
         self,

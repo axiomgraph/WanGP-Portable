@@ -63,11 +63,11 @@ class KugelAudioPipeline:
         *,
         ckpt_root: Optional[Path] = None,
         device: Optional[torch.device] = None,
-        lm_decoder_engine: Optional[str] = None,
+        cuda_graphs: bool = False,
     ) -> None:
         self.device = device or torch.device("cpu")
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(fl.get_download_location())
-        self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
+        self.cuda_graphs = bool(cuda_graphs)
         self._interrupt = False
         self._early_stop = False
 
@@ -77,9 +77,8 @@ class KugelAudioPipeline:
         self.sample_rate = getattr(self.processor.audio_processor, "sampling_rate", 24000)
 
         self.generation_config = self._load_generation_config(assets["generation_config_path"])
-        engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
         attn = getattr(self.model, "_attn_implementation", "sdpa")
-        print(f"[KugelAudio] LM engine='{engine}', attention='{attn}'")
+        print(f"[KugelAudio] CUDA graphs: {'on' if self.cuda_graphs else 'off'}, attention='{attn}'")
 
     def _abort_requested(self) -> bool:
         return bool(self._interrupt)
@@ -153,7 +152,7 @@ class KugelAudioPipeline:
             default_dtype=None,
             writable_tensors=False,
         )
-        model.set_lm_decoder_engine(self.lm_decoder_engine)
+        model.set_cuda_graphs(self.cuda_graphs)
         model.eval()
         language_model = getattr(getattr(model, "model", None), "language_model", None)
         if language_model is not None and hasattr(language_model, "config"):

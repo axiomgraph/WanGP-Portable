@@ -1,5 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Bounded, lazy image previews served through Gradio's authorized file route."""
+"""Bounded, lazy media previews served through Gradio's authorized file route."""
 import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -75,9 +75,22 @@ class GalleryFileResponse(DisconnectAwareFileResponse):
         edge = parse_qs(scope['query_string'].decode()).get('__wangp_gallery_preview')
         if edge is None:
             return await super().__call__(scope, receive, send)
-        if edge not in (['320'], ['1600']):
+        if edge not in (['320'], ['1600'], ['video']):
             return await Response('Invalid gallery preview size.', status_code=400)(scope, receive, send)
         path = Path(self.path)
+        if edge == ['video']:
+            from shared.deepy.thumbnails import render_thumbnail
+            from shared.deepy.gallery import _VIDEO_EXTENSIONS
+            if path.suffix.lower() not in _VIDEO_EXTENSIONS:
+                return await Response('Invalid video preview.', status_code=400)(scope, receive, send)
+            data = await render_thumbnail(path)
+            if not data:
+                return await Response('Video preview unavailable.', status_code=404)(scope, receive, send)
+            headers = {'ETag': '"' + sha256(data).hexdigest() + '"', 'Cache-Control': 'private, no-cache'}
+            if dict(scope['headers']).get(b'if-none-match') == headers['ETag'].encode():
+                return await Response(status_code=304, headers=headers)(scope, receive, send)
+            headers['Content-Length'] = str(len(data))
+            return await Response(b'' if scope['method'] == 'HEAD' else data, media_type='image/jpeg', headers=headers)(scope, receive, send)
         if path.suffix.lower() not in ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.gif'):
             return await super().__call__(scope, receive, send)
         stat = path.stat()

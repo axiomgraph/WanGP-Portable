@@ -12,9 +12,9 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Qwen2_5OmniThinkerConfig
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAudioEncoder, Qwen2_5OmniThinkerForConditionalGeneration
 
-from shared.llm_engines.nanovllm.models.qwen2_5_vl import Qwen2_5_VLDecoderLayer, Qwen2_5_VLTextRotaryEmbedding, clear_qwen25_vl_runtime_caches
-from shared.llm_engines.nanovllm.layers.embed_head import VocabParallelEmbedding
-from shared.llm_engines.nanovllm.layers.layernorm import RMSNorm
+from shared.llm_engines.lmgp.models.qwen2_5_vl import Qwen2_5_VLDecoderLayer, Qwen2_5_VLTextRotaryEmbedding, clear_qwen25_vl_runtime_caches
+from shared.llm_engines.lmgp.layers.embed_head import VocabParallelEmbedding
+from shared.llm_engines.lmgp.layers.layernorm import RMSNorm
 
 
 class Qwen2_5OmniPrefillAttention(nn.Module):

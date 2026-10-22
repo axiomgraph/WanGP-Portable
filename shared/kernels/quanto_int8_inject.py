@@ -151,6 +151,9 @@ def _add_bias_in_place_or_fallback(output: torch.Tensor, bias: Optional[torch.Te
 
 def _default_quanto_qbytes_linear_forward(ctx, input, other, bias=None):
     ctx.save_for_backward(input, other)
+    if getattr(other, "_mm_cpu_compute", False) and other._data.device.type == "cpu" and not _is_qbytes_tensor(input):  # MMGP cpuCompute
+        from shared.kernels import cpu_linear
+        return cpu_linear.linear(other, input, bias, input.dtype)
     if _is_qbytes_tensor(input):
         # MPS: torch.ops.quanto.qbytes_mm has no MPS kernel → CPU fallback
         # → CPU/MPS op interleaving corrupts Metal command buffer.

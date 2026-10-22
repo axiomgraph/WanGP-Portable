@@ -5,9 +5,11 @@ import argparse
 import json
 import math
 import os
+import platform
 import re
 import struct
 import subprocess
+import sys
 import threading
 from fractions import Fraction
 from functools import lru_cache
@@ -30,7 +32,9 @@ DEPTH_MODEL_VARIANT = "vitl"
 LEGACY_NR_WORKER = HOST_DIR / "nvngx.dll"
 DEPTH_NR_WORKER = HOST_DIR / "nr-depth-worker.exe"
 NR_WORKER = DEPTH_NR_WORKER if USE_DEPTH_GUIDE else LEGACY_NR_WORKER
-DLSSG_WORKER = DLSSG_DIR / "dlssg-worker.exe"
+DLSSG_LINUX = sys.platform == "linux"
+NR_WSL = DLSSG_LINUX and "microsoft" in platform.release().lower()
+DLSSG_WORKER = DLSSG_DIR / ("dlssg-worker" if DLSSG_LINUX else "dlssg-worker.exe")
 
 NR_FILES = (
     HOST_DIR / "dxgi.dll",
@@ -39,7 +43,7 @@ NR_FILES = (
     DLSS_DIR / "nvngx_dlss.dll",
     NR_WORKER,
 )
-DLSSG_FILES = (DLSSG_DIR / "nvngx_dlssg.dll", DLSSG_WORKER)
+DLSSG_FILES = (DLSSG_DIR / ("libnvidia-ngx-dlssg.so.310.9.16" if DLSSG_LINUX else "nvngx_dlssg.dll"), DLSSG_WORKER)
 
 NR_MODES = {
     1.0: ("DLAA", 5),
@@ -125,7 +129,7 @@ def _missing(files: tuple[Path, ...]) -> list[Path]:
 
 @lru_cache(maxsize=1)
 def dlssg_capabilities() -> dict:
-    if _missing(DLSSG_FILES) or os.name != "nt":
+    if _missing(DLSSG_FILES) or (os.name != "nt" and not DLSSG_LINUX):
         return {}
     try:
         result = subprocess.run([str(DLSSG_WORKER), "--probe"], cwd=str(DLSSG_DIR), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -137,10 +141,10 @@ def dlssg_capabilities() -> dict:
 
 @lru_cache(maxsize=1)
 def _gpu_series() -> int:
-    if os.name != "nt":
+    if os.name != "nt" and not NR_WSL:
         return 0
     try:
-        result = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        result = subprocess.run(["/usr/lib/wsl/lib/nvidia-smi" if NR_WSL else "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return 0
     series = [int(match.group(1)) for match in re.finditer(r"GeForce\s+RTX\s+(\d{2})\d{2}", result.stdout, re.IGNORECASE)]
@@ -187,7 +191,16 @@ def unavailable_reason(*, temporal: bool) -> str:
     missing = _missing(DLSSG_FILES if temporal else NR_FILES)
     if missing:
         return f"missing {missing[0].name}"
-    if os.name != "nt":
+    if temporal and DLSSG_LINUX:
+        capabilities = dlssg_capabilities()
+        if not capabilities:
+            return "Linux DLSS Frame Generation probe failed (run dlss5/dlssg/dlssg-worker --probe)"
+        return "" if capabilities["available"] else capabilities.get("reason", "NVIDIA Vulkan Frame Generation unavailable")
+    if not temporal and NR_WSL:
+        interop = Path("/proc/sys/fs/binfmt_misc/WSLInterop")
+        if not interop.is_file() or not interop.read_text().startswith("enabled\n"):
+            return "WSL Windows interoperability must be enabled for Neural Rendering"
+    elif os.name != "nt":
         return "Windows 11 required"
     series = _gpu_series()
     minimum = 40 if temporal else 30

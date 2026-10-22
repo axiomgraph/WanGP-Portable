@@ -4,6 +4,8 @@ weights, down weights, gate/up scales, down scales), for the FP8 block and INT4 
 
 This vLLM backend uses float32 activations/accumulation, matching the CPU backend. It never transfers weights. Nonresident ids
 contribute zero to the GPU result."""
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -106,11 +108,19 @@ def _int4_down(Mid, IDs, Probs, PTR, Out, H: tl.constexpr, I: tl.constexpr, K: t
 _KERNELS = {"fp8_block": (_fp8_gate_up, _fp8_down), "int4_group": (_int4_gate_up, _int4_down)}
 
 
+@cache
+def _needs_fp32_inputs(device):
+    return torch.version.hip is None and torch.cuda.get_device_capability(device) < (8, 0)
+
+
 def forward(kind, x, ids, probabilities, pointers, intermediate, block, out=None, mid=None, rotation=0, rows=8):
     """float32 [tokens, hidden] sum of the resident selected experts (zero for the others); out and the float32 [tokens * topk,
     intermediate] scratch mid may be preallocated. rotation: the ConvRot group of the activations of both projections, or 0."""
     tokens, hidden = x.shape
     topk = ids.shape[-1]
+    # These kernels already compute in FP32. Convert exactly before launch on GPUs without native BF16 conversion instructions.
+    if _needs_fp32_inputs(x.device):
+        x, probabilities = x.float(), probabilities.float()
     gate_up, down = _KERNELS[kind]
     mid = torch.empty(tokens * topk, intermediate, dtype=torch.float32, device=x.device) if mid is None else mid
     out = torch.empty(tokens, hidden, dtype=torch.float32, device=x.device) if out is None else out

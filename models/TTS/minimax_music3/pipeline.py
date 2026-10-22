@@ -92,10 +92,10 @@ class MiniMaxMusic3Pipeline:
     latent_hop_length = 512
     sample_rate = 44100
 
-    def __init__(self, flow_weights: str, text_encoder_weights: str, asset_paths: dict[str, str], dtype: torch.dtype, lm_decoder_engine: str = "legacy"):
+    def __init__(self, flow_weights: str, text_encoder_weights: str, asset_paths: dict[str, str], dtype: torch.dtype, lm_features=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
-        self.lm_decoder_engine = lm_decoder_engine
+        self.lm_features = lm_features  # the LM decoder optimizations (LMFeatures)
         self._interrupt = False
         self._early_stop = False
 
@@ -106,7 +106,7 @@ class MiniMaxMusic3Pipeline:
             default_dtype=dtype,
             writable_tensors=False,
         )
-        accelerated = lm_decoder_engine in ("cg", "vllm")
+        accelerated = lm_features.graphs  # the semantic decoder of the LM engine, graphed by MMGP; otherwise transformers
         self.text_encoder = offload.fast_load_transformers_model(
             text_encoder_weights,
             modelClass=MiniMaxMusic3Qwen3ForCausalLM if accelerated else Qwen3ForCausalLM,
@@ -115,6 +115,7 @@ class MiniMaxMusic3Pipeline:
             default_dtype=dtype,
             writable_tensors=False,
         )
+        self.text_encoder._mm_pinned_pool = True  # registered as text_encoder but decodes token by token: its blocks enter MMGP's pinned pool
         self.rvq_depth_decoder = offload.fast_load_transformers_model(
             asset_paths["rvq_weights"],
             modelClass=MiniMaxMusic3RVQDepthDecoder,
@@ -136,15 +137,16 @@ class MiniMaxMusic3Pipeline:
             default_dtype=None,
             writable_tensors=False,
         )
+        self.condition_encoder._convertWeightsFloatTo = self.vocoder._convertWeightsFloatTo = None  # prepared in FP32: in FP16 (GPUs without BF16) the vocoder overflows
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(asset_paths["scheduler_dir"], local_files_only=True)
         self.tokenizer = AutoTokenizer.from_pretrained(asset_paths["tokenizer_dir"], local_files_only=True, use_fast=True)
         self.sample_rate = int(self.vocoder.config.sampling_rate)
         self.frame_rate = self.condition_encoder.config.input_sampling_rate / self.condition_encoder.config.input_hop_length
         self.latent_hop_length = int(self.condition_encoder.config.output_hop_length)
         self.model = self.transformer
-        self.semantic_acceleration = MiniMaxMusic3SemanticAcceleration(self.text_encoder, self.rvq_depth_decoder, lm_decoder_engine, self.device) if accelerated else None
+        self.semantic_acceleration = MiniMaxMusic3SemanticAcceleration(self.text_encoder, self.rvq_depth_decoder, lm_features, self.device) if accelerated else None
         self._install_abort_checks()
-        print(f"[MiniMax Music 3] LM Engine='{lm_decoder_engine}'")
+        print(f"[MiniMax Music 3] LM: {lm_features.describe()}")
 
     def _install_abort_checks(self):
         self.transformer._interrupt_check = self._abort_requested
@@ -169,12 +171,12 @@ class MiniMaxMusic3Pipeline:
             f"{_IM_START}{_CAPTION_START}{_clean_caption(caption)}{_CAPTION_END}"
             f"{_LYRICS_START}{_normalize_lyrics(lyrics)}{_LYRICS_END}{_IM_END}{_AUDIO_START}"
         )
-        input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+        input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"].to(self.device)  # built on the CPU: device-explicit generate()
         if input_ids.shape[1] > _MAX_PROMPT_TOKENS:
             raise ValueError(f"The assembled MiniMax Music 3 prompt has {input_ids.shape[1]} tokens; the maximum is {_MAX_PROMPT_TOKENS}")
         unconditional_ids = input_ids.clone()
         unconditional_ids[:, 1:-2] = _AUDIO_CFG_TOKEN_ID
-        return torch.cat((input_ids, unconditional_ids), dim=0).to(self.device)
+        return torch.cat((input_ids, unconditional_ids), dim=0)
 
     def _embed_audio_frame(self, frame_codes: torch.Tensor) -> torch.Tensor:
         num_codebooks = self.rvq_depth_decoder.config.num_codebooks
@@ -285,7 +287,7 @@ class MiniMaxMusic3Pipeline:
             callback(step_idx=-1, force_refresh=True)
         frame_hiddens = torch.stack(frame_hiddens, dim=1)
         if self.semantic_acceleration is not None and not bool(torch.isfinite(frame_hiddens).all()):
-            raise RuntimeError(f"MiniMax Music 3 {self.lm_decoder_engine} semantic decoder produced non-finite frame states")
+            raise RuntimeError("MiniMax Music 3 semantic decoder produced non-finite frame states")
         return frame_hiddens
 
     def _denoise(self, frame_hiddens: torch.Tensor, num_inference_steps: int, guidance_scale: float, generator: torch.Generator, callback=None):

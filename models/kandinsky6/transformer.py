@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from mmgp import cuda_graphs
 
 from shared import attention_kit
-from shared.kernels import kernel_policy
+from shared.kernels import kernel_policy, ops
 from shared.utils.phase_progress import check_abort
 
 try:
@@ -188,7 +188,9 @@ class MultiheadSelfAttention(nn.Module):
 
     def forward(self, x_list, rope):
         out = attention_kit.qkv_attention(x_list, self.to_query, self.to_key, self.to_value, self.num_heads, self.head_dim,
-                                          lambda query, key, group: self._norm_rope_(query, key, rope))
+                                          lambda query, key, group: self._norm_rope_(query, key, rope),
+                                          fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(
+                                              query, key, None if rope is None else rope[2], self.query_norm, self.key_norm, core, settings, interleaved=True))
         return self.out_layer(out.flatten(2))
 
 
@@ -358,10 +360,12 @@ class Kandinsky6Transformer(nn.Module):
             module._lock_dtype = torch.float32
 
     def rope_tables(self, frames, height, width, text_tokens, audio_tokens, scale_factor, device, reference_frame=False):
-        """RoPE (cos, sin) tables of shape (tokens, 1, head_dim / 2), computed once per generation: frequencies on the CPU, positions
-        scaled and rotated on the device, as upstream RoPE1D / RoPE3D. A reference frame reuses temporal position 0."""
+        """RoPE (cos, sin, cos / sin pairs) tables of shapes (tokens, 1, head_dim / 2) and (1, tokens, 1, head_dim / 2, 2) (the layout of
+        ops.split_half_norm_rope_quant_), computed once per generation: frequencies on the CPU, positions scaled and rotated on the device,
+        as upstream RoPE1D / RoPE3D. A reference frame reuses temporal position 0."""
         def table(args):
-            return torch.cos(args).unsqueeze(1), torch.sin(args).unsqueeze(1)
+            cos, sin = torch.cos(args).unsqueeze(1), torch.sin(args).unsqueeze(1)
+            return cos, sin, torch.stack((cos, sin), dim=-1)[None]
 
         def args_1d(dim, length, scaling=1.0):
             return torch.outer(torch.arange(length, dtype=torch.float32, device=device), get_freqs(dim // 2).to(device) * scaling)

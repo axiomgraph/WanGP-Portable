@@ -28,10 +28,26 @@ class FlashVSRBridge:
     UPSAMPLING_TWO_PASS_VALUE_PREFIX = "flashvsr2pass"
     UPSAMPLING_RATIOS = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
     MODE_CHOICES = [
-        ("FlashVSR v1.1 Tiny (Slightly Lower Quality, Faster VAE Decoding, Needs Less RAM)", MODE_TINY),
-        ("FlashVSR v1.1 Full (Best Quality, Slower VAE Decoding, Needs More RAM)", MODE_FULL),
+        ("Tiny Decoder (Slightly Lower Quality, Faster Decoding, Needs Less RAM)", MODE_TINY),
+        ("Full Wan VAE Decoder (Best Quality, Slower Decoding, Needs More RAM)", MODE_FULL),
     ]
+    MODEL_V11 = "v1_1"
+    MODEL_PLUS_TURBO = "plus_turbo"
+    MODEL_CHOICES = [
+        ("FlashVSR+ Turbo (Hybrid Attention: Faster At High Resolutions, Preference-Aligned Detail)", MODEL_PLUS_TURBO),
+        ("FlashVSR v1.1", MODEL_V11),
+    ]
+    MODEL_DEFAULT = MODEL_PLUS_TURBO  # a configuration without an explicit model choice runs FlashVSR+ Turbo
+    PLUS_MODELS = (MODEL_PLUS_TURBO,)
+    QUANTIZATION_BF16 = "bf16"
+    QUANTIZATION_INT8 = "int8"
+    QUANTIZATION_CHOICES = [("BF16", QUANTIZATION_BF16), ("INT8 ConvRot (Half The Transformer Size, Faster With INT8 Kernels)", QUANTIZATION_INT8)]
+    QUANTIZATION_DEFAULT = QUANTIZATION_BF16
+    CACHE_WINDOWS_DEFAULT = 3
+    CACHE_WINDOWS_MAX = 3
 
+    # transformer and LQ projection file stems per model; the TCDecoder, the Wan VAE and the prompt tensor are shared by every model
+    _MODEL_FILE_STEMS = {MODEL_V11: "FlashVSR_v1.1", MODEL_PLUS_TURBO: "FlashVSR_plus_turbo"}
     TRANSFORMER_FILENAME = "FlashVSR_v1.1_transformer_bf16.safetensors"
     LQ_PROJ_FILENAME = "FlashVSR_v1.1_lq_proj_bf16.safetensors"
     TCDECODER_FILENAME = "FlashVSR_v1.1_tcdecoder_bf16.safetensors"
@@ -49,6 +65,32 @@ class FlashVSRBridge:
         self.files_locator = files_locator
 
     @classmethod
+    def transformer_filename(cls, model: str, quantization: str) -> str:
+        return f"{cls._MODEL_FILE_STEMS[model]}_transformer_{'int8_convrot' if quantization == cls.QUANTIZATION_INT8 else 'bf16'}.safetensors"
+
+    @classmethod
+    def lq_proj_filename(cls, model: str) -> str:
+        return f"{cls._MODEL_FILE_STEMS[model]}_lq_proj_bf16.safetensors"
+
+    @classmethod
+    def normalize_model(cls, value: Any) -> str:
+        value = str(value or cls.MODEL_DEFAULT).strip().lower()
+        return value if value in cls._MODEL_FILE_STEMS else cls.MODEL_DEFAULT
+
+    @classmethod
+    def normalize_quantization(cls, value: Any) -> str:
+        value = str(value or cls.QUANTIZATION_DEFAULT).strip().lower()
+        return value if value in (cls.QUANTIZATION_BF16, cls.QUANTIZATION_INT8) else cls.QUANTIZATION_DEFAULT
+
+    @classmethod
+    def normalize_cache_windows(cls, value: Any) -> int:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = cls.CACHE_WINDOWS_DEFAULT
+        return max(1, min(cls.CACHE_WINDOWS_MAX, value))
+
+    @classmethod
     def normalize_topk_ratio(cls, value: Any) -> float:
         try:
             value = float(value)
@@ -62,7 +104,7 @@ class FlashVSRBridge:
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
-        return {"mode": cls.MODE_OFF, "backend": cls.BACKEND_AUTO, "topk_ratio": cls.TOPK_RATIO_DEFAULT}
+        return {"mode": cls.MODE_OFF, "model": cls.MODEL_DEFAULT, "quantization": cls.QUANTIZATION_DEFAULT, "backend": cls.BACKEND_AUTO, "topk_ratio": cls.TOPK_RATIO_DEFAULT, "cache_windows": cls.CACHE_WINDOWS_DEFAULT}
 
     @classmethod
     def legacy_config_keys(cls) -> tuple[str, ...]:
@@ -86,8 +128,11 @@ class FlashVSRBridge:
             normalized["mode"] = cls.MODE_OFF
         if normalized["mode"] not in cls._VARIANTS and normalized["mode"] != cls.MODE_OFF:
             normalized["mode"] = cls.MODE_OFF
+        normalized["model"] = cls.normalize_model(normalized.get("model", cls.MODEL_DEFAULT))
+        normalized["quantization"] = cls.normalize_quantization(normalized.get("quantization", cls.QUANTIZATION_DEFAULT))
         normalized["backend"] = cls.normalize_backend(normalized.get("backend", cls.BACKEND_AUTO))
         normalized["topk_ratio"] = cls.normalize_topk_ratio(normalized.get("topk_ratio", cls.TOPK_RATIO_DEFAULT))
+        normalized["cache_windows"] = cls.normalize_cache_windows(normalized.get("cache_windows", cls.CACHE_WINDOWS_DEFAULT))
         return normalized
 
     @classmethod
@@ -118,6 +163,20 @@ class FlashVSRBridge:
 
     def backend(self) -> str:
         return self.config()["backend"]
+
+    def model(self) -> str:
+        return self.config()["model"]
+
+    def quantization(self) -> str:
+        return self.config()["quantization"]
+
+    def cache_windows(self) -> int:
+        return self.config()["cache_windows"]
+
+    def overlap_frames(self) -> int:
+        """The output frames of a chunk that the next source chunk regenerates (the Media Flow overlap and the continuation tail)."""
+        from postprocessing.flashvsr.runtime import continue_cache_frames
+        return continue_cache_frames(self.model())
 
     def enabled(self) -> bool:
         return self.settings()[0]
@@ -165,10 +224,10 @@ class FlashVSRBridge:
             "multipliers": {cls.UPSAMPLING_VALUE_PREFIX: cls.UPSAMPLING_RATIOS, cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: cls.UPSAMPLING_RATIOS},
             "default_spatial_upsampling": cls.upsampling_value(2.0),
             "postprocessing_category": "upsampler",
-            "description": "Provides learned detail recovery and is optimized for modest VRAM use. The Full variant's final VAE decode can be slow; Tiny is faster, and Two Pass may reduce horizontal banding.",
+            "description": "Provides learned detail recovery and is optimized for modest VRAM use. FlashVSR v1.1 and FlashVSR+ Turbo (faster at high resolutions, preference-aligned detail) are selected in Configuration > Extensions. The Full decoder's final VAE decode can be slow; Tiny is faster, and Two Pass may reduce horizontal banding.",
             "media_descriptions": {"video": "Its learned reconstruction is designed for good temporal stability."},
             "method_descriptions": {
-                cls.UPSAMPLING_VALUE_PREFIX: "Restore detail and spatially upscale with learned FlashVSR reconstruction. The Full variant's final VAE decode can be slow; Tiny is faster and large outputs can consume substantial VRAM.",
+                cls.UPSAMPLING_VALUE_PREFIX: "Restore detail and spatially upscale with learned FlashVSR reconstruction (v1.1 or FlashVSR+ Turbo, chosen in Configuration > Extensions). The Full decoder's final VAE decode can be slow; Tiny is faster and large outputs can consume substantial VRAM.",
                 cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: "Apply two FlashVSR restoration passes for stronger detail reconstruction and reduced horizontal banding, at approximately twice the processing cost.",
             },
         }
@@ -206,9 +265,13 @@ class FlashVSRBridge:
             with gr.Row():
                 mode = gr.Dropdown(choices=self.MODE_CHOICES, value=config["mode"], label="FlashVSR Spatial Upsampling (Needs Triton; SpargeAttn optional)", interactive=not lock_config)
             with gr.Row():
+                model = gr.Dropdown(choices=self.MODEL_CHOICES, value=config["model"], label="Model", info="FlashVSR+ Turbo always runs with memory profile 0 and processes 16 frames per step.", interactive=not lock_config)
+                quantization = gr.Dropdown(choices=self.QUANTIZATION_CHOICES, value=config["quantization"], label="Transformer Quantization", interactive=not lock_config)
+            with gr.Row():
                 backend = gr.Dropdown(choices=SPARSE_BACKEND_CHOICES, value=config["backend"], label="Backend", interactive=not lock_config)
-                topk_ratio = gr.Slider(0.0, self.TOPK_RATIO_MAX, value=config["topk_ratio"], step=0.05, label="FlashVSR Quality / Sparse Top-K Ratio (0 = Auto)", info="Higher keeps more sparse attention candidates and can improve quality at the cost of speed and memory.", interactive=not lock_config)
-        return [("mode", mode), ("backend", backend), ("topk_ratio", topk_ratio)]
+                topk_ratio = gr.Slider(0.0, self.TOPK_RATIO_MAX, value=config["topk_ratio"], step=0.05, label="FlashVSR Quality / Sparse Top-K Ratio (0 = Auto)", info="Higher keeps more sparse attention candidates and can improve quality at the cost of speed and memory. Auto: the released setting (FlashVSR+: 2.5 per 16-frame step).", interactive=not lock_config)
+                cache_windows = gr.Slider(1, self.CACHE_WINDOWS_MAX, value=config["cache_windows"], step=1, label="FlashVSR+ Cache Windows", info="Previous 8-frame windows the FlashVSR+ global attention layers remember (3 = the released setting). Fewer windows save RAM at high resolutions with less temporal context.", interactive=not lock_config)
+        return [("mode", mode), ("model", model), ("quantization", quantization), ("backend", backend), ("topk_ratio", topk_ratio), ("cache_windows", cache_windows)]
 
     def validate_config_section(self, config: dict[str, Any]):
         if config["mode"] <= 0:
@@ -226,7 +289,7 @@ class FlashVSRBridge:
         if enabled_only and not self.enabled():
             return None
         _, variant = self.settings()
-        files = [self.TRANSFORMER_FILENAME, self.LQ_PROJ_FILENAME, self.POSI_PROMPT_FILENAME]
+        files = [self.transformer_filename(self.model(), self.quantization()), self.lq_proj_filename(self.model()), self.POSI_PROMPT_FILENAME]
         if variant != "full":
             files.append(self.TCDECODER_FILENAME)
         return {
@@ -238,11 +301,13 @@ class FlashVSRBridge:
     def _locate_flashvsr_file(self, filename: str) -> str:
         return self.files_locator.locate_file(os.path.join("FlashVSR", filename))
 
-    def paths(self, variant: str):
+    def paths(self, variant: str, model: str | None = None, quantization: str | None = None):
         from postprocessing.flashvsr.runtime import FlashVSRPaths
+        model = self.normalize_model(self.model() if model is None else model)
+        quantization = self.normalize_quantization(self.quantization() if quantization is None else quantization)
         return FlashVSRPaths(
-            transformer=self._locate_flashvsr_file(self.TRANSFORMER_FILENAME),
-            lq_proj=self._locate_flashvsr_file(self.LQ_PROJ_FILENAME),
+            transformer=self._locate_flashvsr_file(self.transformer_filename(model, quantization)),
+            lq_proj=self._locate_flashvsr_file(self.lq_proj_filename(model)),
             posi_prompt=self._locate_flashvsr_file(self.POSI_PROMPT_FILENAME),
             tcdecoder=None if variant == "full" else self._locate_flashvsr_file(self.TCDECODER_FILENAME),
             vae=self.files_locator.locate_file(self.VAE_FILENAME) if variant == "full" else None,
@@ -272,7 +337,9 @@ class FlashVSRBridge:
         set_sparse_backend(self.backend())
         from postprocessing.flashvsr.runtime import load_models
 
-        load_models(self.paths(variant), variant=variant, init_pipe=init_pipe, profile=profile, progress_callback=progress_callback)
+        model = self.model()
+        preload_mode = str(self.server_config.get("video_preload_mode", "default"))
+        load_models(self.paths(variant, model), variant=variant, init_pipe=init_pipe, profile=profile, model=model, preload_mode=preload_mode, progress_callback=progress_callback)
 
     def upscale(self, sample, spatial_upsampling, *, vae_config: int, seed=0, continue_cache=None, return_continue_cache=False, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
         scale = self.scale_for_upsampling(spatial_upsampling)
@@ -293,6 +360,7 @@ class FlashVSRBridge:
             topk_ratio=self.topk_ratio(),
             still_image=still_image,
             two_pass=self.is_two_pass_upsampling(spatial_upsampling),
+            cache_windows=self.cache_windows(),
             abort_callback=abort_callback,
             progress_callback=progress_callback,
         )

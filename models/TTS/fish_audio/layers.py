@@ -11,7 +11,7 @@ from torch.types import Device
 from .config import FishOmniTextConfig
 from . import kernels
 from shared import attention_kit
-from shared.llm_engines.nanovllm.layerwise import cached_attention, delta_rule
+from shared.llm_engines.lmgp.layerwise import cached_attention, delta_rule
 
 GDN_CHUNK_SIZE = 64
 
@@ -30,7 +30,7 @@ class ZeroCenteredRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype, device=device))
-        self.fused = False  # the vLLM engine's fused kernel (kernels.py)
+        self.fused = False  # the fused Triton kernel (kernels.py), with the Triton LM feature
 
     def forward(self, x: Tensor) -> Tensor:
         if self.fused and kernels.available(x):
@@ -54,7 +54,7 @@ class GatedRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device=device))
-        self.fused = False  # the vLLM engine's fused kernel (kernels.py)
+        self.fused = False  # the fused Triton kernel (kernels.py), with the Triton LM feature
 
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
         if self.fused and kernels.available(x) and gate.is_contiguous():
@@ -127,7 +127,7 @@ class FullAttention(nn.Module):
 
         attended = attention_kit.qkv_attention([x], self.query_proj, self.k_proj, self.v_proj, self.num_heads, self.head_dim,
             normalize, kv_heads=self.num_kv_heads,
-            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, context.input_pos, context.kv_len, self.engine))
+            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, context.input_pos, context.kv_len, self.features))
         return self.o_proj(attended.reshape(batch, length, -1) * gate.sigmoid())
 
 
@@ -331,7 +331,7 @@ class GatedDeltaNet(nn.Module):
             if context.continue_state and length == 1
             else chunk_gated_delta_rule
         )
-        core, final_state = delta_rule(query, key, value, decay, beta, initial_state, engine=self.engine, recurrent=context.continue_state and length == 1, torch_impl=rule)
+        core, final_state = delta_rule(query, key, value, decay, beta, initial_state, features=self.features, recurrent=context.continue_state and length == 1, torch_impl=rule)
         if context.use_cache:
             assert recurrent_state is not None
             recurrent_state[:batch].copy_(final_state)

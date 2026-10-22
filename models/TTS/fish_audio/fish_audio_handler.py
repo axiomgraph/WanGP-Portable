@@ -6,7 +6,7 @@ from shared.utils import files_locator as fl
 from .help import INFOS, PROMPT_INFOS, DEEPY_INFOS, DEEPY_PROMPT_INFOS, ENHANCER, DIALOGUE_ENHANCER, DEFAULT_PROMPT
 
 ARCHITECTURE = "fish_drama3"
-ASSETS = ["tokenizer.json", "Fish_Drama3_codec_bf16.safetensors"]
+ASSETS = ["tokenizer.json", "Fish_Drama3_codec_bf16.safetensors", "fish_audio_silence_probe.safetensors"]
 # Optional cuts of long scripts at whole lines; each part is prompted with the last parts (text and generated audio) as history.
 DIALOGUE_CUT_LINES = {"id": "dialogue_cut_lines", "label": "Cut Script Every N Lines (0 = One Pass)", "name": "Cut Every N Lines", "type": "int",
                       "default": 0, "min": 0, "max": 50, "inc": 1}
@@ -42,7 +42,7 @@ class family_handler:
             "device_explicit": True, "dtype": "bf16", "auto_quantize": False,
             "no_negative_prompt": True, "inference_steps": False, "guidance_max_phases": 0,
             "temperature": True, "compile": False, "cuda_graphs": True, "supports_early_stop": True,
-            "profiles_dir": [ARCHITECTURE], "lm_engines": ["legacy", "cg", "vllm"], "lm_engine_supports_offload": True,
+            "profiles_dir": [ARCHITECTURE], "lm_decoder": True,
             "image_prompt_types_allowed": "", "any_audio_prompt": True, "audio_prompt_choices": True,
             "audio_prompt_type_sources": {"selection": ["", "A", "AB", "ABD"], "default": "", "letters_filter": "ABD",
                 "labels": {"": "New Voice", "A": "Voice Reference", "AB": "Voice References for Speakers 1 and 2", "ABD": "Voice References for Speakers 1, 2 and 3"}},
@@ -64,22 +64,22 @@ class family_handler:
         return [{"repoId": "DeepBeepMeep/TTS", "sourceFolderList": ["fish_audio"], "fileList": [ASSETS]}]
 
     @staticmethod
-    def load_model(model_filename, model_type, base_model_type, model_def, save_quantized=False, lm_decoder_engine="legacy", profile=0, **kwargs):
+    def load_model(model_filename, model_type, base_model_type, model_def, save_quantized=False, lm_features=None, profile=0, **kwargs):
         from .pipeline import FishAudioPipeline
         paths = {name: fl.locate_file(str(Path("fish_audio") / name)) for name in ASSETS}
         backbone, codebooks = model_filename
         experts = fl.locate_file(os.path.basename(model_def["preload_URLs"][0]))  # routed experts, in their own format (FP8 or INT4)
-        pipeline = FishAudioPipeline([backbone, experts], codebooks, paths[ASSETS[1]], paths[ASSETS[0]], lm_decoder_engine)
+        pipeline = FishAudioPipeline([backbone, experts], codebooks, paths[ASSETS[1]], paths[ASSETS[0]], paths[ASSETS[2]], lm_features)
         if save_quantized:
             from wgp import save_quantized_model
             config = str(Path(__file__).with_name("fish_drama3.json"))
             save_quantized_model(pipeline.transformer, model_type, backbone, torch.bfloat16, config, submodel_no=1, convrot_prefixes=("",))
             save_quantized_model(pipeline.transformer2, model_type, codebooks, torch.bfloat16, config, submodel_no=2, convrot_prefixes=("",))
-        offload_def = {"pipe": {"transformer": pipeline.transformer, "transformer2": pipeline.transformer2, "vae": pipeline.vae}, "cudaGraphs": lm_decoder_engine != "legacy",
+        offload_def = {"pipe": {"transformer": pipeline.transformer, "transformer2": pipeline.transformer2, "vae": pipeline.vae}, "cudaGraphs": lm_features.graphs,
             "coTenantsMap": {"transformer": ["transformer2"], "transformer2": ["transformer"]}}
-        if int(profile) in (2, 4, 5):
-            # Both stages run at every audio frame: streaming them would cost a full transfer of their weights per frame. Without a
-            # VRAM preload they stay whole in VRAM (their routed experts stay on the CPU).
+        if int(profile) in (0, 2, 4, 5):
+            # Both stages run at every audio frame: streaming them would cost a full transfer of their weights per frame. They stay
+            # whole in VRAM, also with a VRAM preload (their routed experts stay on the CPU).
             offload_def["budgets"] = {"transformer": 0, "transformer2": 0}
         return pipeline, offload_def
 

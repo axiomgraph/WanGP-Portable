@@ -1,0 +1,15 @@
+{
+    "settings_version": 2.73,
+    "model_type": "fibo2_dev",
+    "type": "Fibo 2.0 Dev",
+    "prompt_enhancer": "",
+    "prompt": "",
+    "image_mode": 1,
+    "resolution": "1024x1024",
+    "num_inference_steps": 50,
+    "guidance_scale": 5.0,
+    "batch_size": 1,
+    "video_prompt_type": "",
+    "remove_background_images_ref": 0,
+    "multi_prompts_gen_type": "FG"
+}

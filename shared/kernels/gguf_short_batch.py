@@ -89,7 +89,7 @@ def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0.):
             native.set_short_batch_mode(mode)
             native.linear(peers[0], qtype, shape, x, None, dtype)  # load the timed variant before capture
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for raw in peers:
                     native.linear(raw, qtype, shape, x, None, dtype)
             graphs[mode] = graph

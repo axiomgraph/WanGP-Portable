@@ -26,7 +26,7 @@ COZ_STEP_FACTORS = {2.0: (2,), 4.0: (4,), 8.0: (4, 2), 16.0: (4, 4)}
 COZ_VLM_CONTEXT_SIZE = 512
 COZ_VLM_MAX_NEW_TOKENS = 16
 COZ_VLM_VISION_BATCH = 8  # tile image pairs encoded per vision tower pass
-COZ_VLM_PROMPT_BATCH = 16  # tile prompts decoded concurrently by the nano-vllm engine
+COZ_VLM_PROMPT_BATCH = 16  # tile prompts decoded concurrently by the LM engine
 COZ_VLM_PROCESSOR_USE_FAST = True  # fast (torchvision) image preprocessing; cheaper CPU prep, slightly different pixel values
 COZ_VLM_MESSAGE = "The second image is a zoom-in of the first image. Based on this knowledge, what is in the second image? Give me a set of English words."
 COZ_CLIP_MAX_LENGTH = 77
@@ -54,14 +54,6 @@ def _config_path(filename: str) -> str:
     return os.path.join(_CONFIGS_DIR, filename)
 
 
-def _flash_attention_2_available() -> bool:
-    try:
-        import flash_attn  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 def _abort_requested(abort_callback) -> bool:
     return callable(abort_callback) and abort_callback()
 
@@ -78,27 +70,6 @@ def _coz_phase(phase: str, step_label: str) -> str:
 
 def _batch_count(total_items: int, batch_size: int) -> int:
     return (int(total_items) + int(batch_size) - 1) // int(batch_size)
-
-
-def _normalize_vlm_lm_engine(lm_decoder_engine: str | None) -> str:
-    engine = str(lm_decoder_engine or "legacy").strip().lower()
-    if engine == "cudagraph":
-        engine = "cg"
-    if engine not in ("legacy", "cg", "vllm"):
-        raise ValueError(f"Unsupported Chain-of-Zoom VLM LM engine '{lm_decoder_engine}'. Expected one of: legacy, cg, vllm.")
-    return engine
-
-
-def _disable_vlm_text_vllm_kernels(model) -> None:
-    for module in model.modules():
-        if hasattr(module, "flash_attn_varlen_func"):
-            module.flash_attn_varlen_func = None
-        if hasattr(module, "flash_attn_with_kvcache"):
-            module.flash_attn_with_kvcache = None
-        if hasattr(module, "use_triton_kv_cache"):
-            module.use_triton_kv_cache = False
-        if hasattr(module, "use_triton_rmsnorm"):
-            module.use_triton_rmsnorm = False
 
 
 def _grid_positions(length: int, tile: int, stride: int) -> list[int]:
@@ -142,26 +113,24 @@ class ChainOfZoomRuntime:
         self.offloadobj = None
         self.profile = None
         self.paths: CoZPaths | None = None
-        self.use_vllm_decoder = False
-        self.vlm_lm_engine = None
+        self.use_lm_engine = False
+        self.vlm_lm_features = None
         self.vlm_vision_batch = COZ_VLM_VISION_BATCH
         self.vlm_prompt_batch = COZ_VLM_PROMPT_BATCH
 
     @controlled_model_loading
-    def load(self, paths: CoZPaths, profile, init_pipe, lm_decoder_engine: str = "legacy", vlm_vision_batch: int = COZ_VLM_VISION_BATCH, vlm_prompt_batch: int = COZ_VLM_PROMPT_BATCH) -> None:
-        lm_decoder_engine = _normalize_vlm_lm_engine(lm_decoder_engine)
+    def load(self, paths: CoZPaths, profile, init_pipe, lm_features, vlm_vision_batch: int = COZ_VLM_VISION_BATCH, vlm_prompt_batch: int = COZ_VLM_PROMPT_BATCH) -> None:
         vlm_vision_batch = int(vlm_vision_batch)
         vlm_prompt_batch = int(vlm_prompt_batch)
-        use_vllm_decoder = lm_decoder_engine in ("cg", "vllm")
-        if self.offloadobj is not None and self.paths == paths and self.profile == profile and self.vlm_lm_engine == lm_decoder_engine and self.vlm_vision_batch == vlm_vision_batch and self.vlm_prompt_batch == vlm_prompt_batch:
+        if self.offloadobj is not None and self.paths == paths and self.profile == profile and self.vlm_lm_features == lm_features and self.vlm_vision_batch == vlm_vision_batch and self.vlm_prompt_batch == vlm_prompt_batch:
             return
         self.release()
         from accelerate import init_empty_weights
         from diffusers import AutoencoderKL
         from transformers import AutoConfig, AutoProcessor, CLIPTextModelWithProjection, CLIPTokenizer, GenerationConfig, Qwen2_5_VLForConditionalGeneration, T5Tokenizer
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel
-        from shared.llm_engines.nanovllm.models.qwen2_5_vl import Qwen2_5_VLForCausalLM
-        from shared.llm_engines.nanovllm.vllm_support import NanoVllmTextEngine
+        from shared.llm_engines.lmgp.models.qwen2_5_vl import Qwen2_5_VLForCausalLM
+        from shared.llm_engines.lmgp.vllm_support import TextEngine, configure_engine_kernels
         from postprocessing.chain_of_zoom.sd3_transformer import SD3Transformer, SD3_MEDIUM_CONFIG
 
         with init_empty_weights(include_buffers=True):
@@ -177,16 +146,14 @@ class ChainOfZoomRuntime:
         self.vlm_generation_config = GenerationConfig.from_pretrained(paths.vlm_dir)
         self.vlm_generation_config.do_sample = False
         self.vlm_generation_config.temperature = None
-        self.use_vllm_decoder = use_vllm_decoder
-        self.vlm_lm_engine = lm_decoder_engine
+        self.use_lm_engine = lm_features.graphs  # the LM engine's decoder (MMGP graphs), otherwise transformers
+        self.vlm_lm_features = lm_features
         self.vlm_vision_batch = vlm_vision_batch
         self.vlm_prompt_batch = vlm_prompt_batch
-        print(f"[Chain-of-Zoom] VLM LM Engine='{self.vlm_lm_engine}'")
+        print(f"[Chain-of-Zoom] VLM LM: {lm_features.describe()}")
         print(f"[Chain-of-Zoom] VLM tile batch sizes: vision tower={self.vlm_vision_batch}, decoder={self.vlm_prompt_batch}")
-        # Only vllm mode may use vLLM kernels. cg still uses nano-vLLM CUDA graphs,
-        # but keeps the VLM on non-Flash2/non-Triton kernels.
-        vision_attn = "flash_attention_2" if lm_decoder_engine == "vllm" and _flash_attention_2_available() else None
-        if self.use_vllm_decoder:
+        vision_attn = "flash_attention_2" if lm_features.flash else None
+        if self.use_lm_engine:
             with init_empty_weights(include_buffers=True):
                 self.vlm = Qwen2_5_VLForConditionalGeneration(self.vlm_config)
                 self.vlm_text = Qwen2_5_VLForCausalLM(self.vlm_config.text_config)
@@ -197,15 +164,14 @@ class ChainOfZoomRuntime:
                     self.vlm_visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(self.vlm_config.vision_config)
             offload.load_model_data(self.vlm_visual, paths.vlm, modelPrefix="model.visual", writable_tensors=False, default_dtype=self.dtype, ignore_unused_weights=True, verboseLevel=-1)
             offload.load_model_data(self.vlm_text, paths.vlm, modelPrefix="model.language_model", writable_tensors=False, default_dtype=self.dtype, ignore_unused_weights=True, verboseLevel=-1)
-            if lm_decoder_engine == "cg":
-                _disable_vlm_text_vllm_kernels(self.vlm_text)
+            configure_engine_kernels(self.vlm_text, lm_features)
         else:
             self.vlm = offload.fast_load_transformers_model(paths.vlm, modelClass=Qwen2_5_VLForConditionalGeneration, defaultConfigPath=os.path.join(paths.vlm_dir, "config.json"), writable_tensors=False)
             self.vlm.tie_weights()
             self.vlm.generation_config = self.vlm_generation_config
             if vision_attn:
                 self.vlm.model.visual.config._attn_implementation = vision_attn
-        for model in (self.transformer, self.vae, self.clip_l, self.clip_g, self.t5, self.vlm_visual if self.use_vllm_decoder else self.vlm, self.vlm_text):
+        for model in (self.transformer, self.vae, self.clip_l, self.clip_g, self.t5, self.vlm_visual if self.use_lm_engine else self.vlm, self.vlm_text):
             if model is None:
                 continue
             model.eval().requires_grad_(False)
@@ -214,8 +180,8 @@ class ChainOfZoomRuntime:
         self.tokenizer_g = CLIPTokenizer.from_pretrained(paths.clip_tokenizer_dir, pad_token="!")
         self.tokenizer_t5 = T5Tokenizer.from_pretrained(os.path.dirname(paths.t5))
         self.vlm_processor = AutoProcessor.from_pretrained(paths.vlm_dir, use_fast=COZ_VLM_PROCESSOR_USE_FAST)
-        if self.use_vllm_decoder:
-            self.vlm_engine = NanoVllmTextEngine(model=self.vlm_text, model_path=paths.vlm_dir, tokenizer=self.vlm_processor.tokenizer, enforce_eager=False)
+        if self.use_lm_engine:
+            self.vlm_engine = TextEngine(model=self.vlm_text, model_path=paths.vlm_dir, tokenizer=self.vlm_processor.tokenizer, enforce_eager=False)
             self.vlm_llm = self.vlm_text
         else:
             self.vlm_llm = torch.nn.ModuleDict({"language_model": self.vlm.model.language_model, "lm_head": self.vlm.lm_head})
@@ -226,7 +192,7 @@ class ChainOfZoomRuntime:
             "clip_l": self.clip_l,
             "clip_g": self.clip_g,
             "t5": self.t5,
-            "vlm_visual": self.vlm_visual if self.use_vllm_decoder else self.vlm.model.visual,
+            "vlm_visual": self.vlm_visual if self.use_lm_engine else self.vlm.model.visual,
             "vlm_llm": self.vlm_llm,
         }
         kwargs = {}
@@ -234,7 +200,7 @@ class ChainOfZoomRuntime:
         kwargs.setdefault("budgets", {})["clip_l"] = 0
         kwargs["budgets"]["clip_g"] = 0
         kwargs["budgets"]["vlm_visual"] = 0
-        if self.use_vllm_decoder:
+        if self.use_lm_engine:
             kwargs["budgets"]["vlm_llm"] = 0
         kwargs.setdefault("coTenantsMap", {}).update({"clip_l": ["clip_g"], "clip_g": ["clip_l"]})
         kwargs["pinnedMemory"] = False
@@ -252,9 +218,9 @@ class ChainOfZoomRuntime:
             torch.cuda.empty_cache()
 
     def _current_vlm_engine_label(self) -> str | None:
-        if self.vlm_lm_engine is None:
+        if self.vlm_lm_features is None:
             return None
-        return f"LM Engine='{self.vlm_lm_engine}'"
+        return "LM engine" if self.use_lm_engine else "transformers decoder"
 
     def release(self) -> None:
         vlm_engine_label = self._current_vlm_engine_label()
@@ -283,8 +249,8 @@ class ChainOfZoomRuntime:
         self.tokenizer_t5 = None
         self.vlm_processor = None
         self.vlm_llm = None
-        self.use_vllm_decoder = False
-        self.vlm_lm_engine = None
+        self.use_lm_engine = False
+        self.vlm_lm_features = None
         self.vlm_vision_batch = COZ_VLM_VISION_BATCH
         self.vlm_prompt_batch = COZ_VLM_PROMPT_BATCH
         self.profile = None
@@ -305,7 +271,7 @@ class ChainOfZoomRuntime:
         """One vision tower pass over the images of several tile jobs; returns per-job packed embeds."""
         pixel_values = torch.cat([inputs["pixel_values"] for inputs in inputs_batch], dim=0).to(self.device)
         image_grid_thw = torch.cat([inputs["image_grid_thw"] for inputs in inputs_batch], dim=0).to(self.device)
-        if self.use_vllm_decoder:
+        if self.use_lm_engine:
             pixel_values = pixel_values.type(self.vlm_visual.dtype)
             with checkpoint_modules(self.vlm_visual.blocks):
                 image_embeds = self.vlm_visual(pixel_values, grid_thw=image_grid_thw)
@@ -325,8 +291,8 @@ class ChainOfZoomRuntime:
         del pixel_values, image_grid_thw
         return list(torch.split(image_embeds, job_sizes, dim=0))
 
-    def _vlm_prompts_from_embeds_vllm(self, jobs: list[dict]) -> list[str]:
-        """Decode the prompts of several tile jobs concurrently through the nano-vllm engine."""
+    def _vlm_prompts_from_embeds_lm_engine(self, jobs: list[dict]) -> list[str]:
+        """Decode the prompts of several tile jobs concurrently through the LM engine."""
         requests = []
         for job in jobs:
             input_ids = job["input_ids"].to(self.device)
@@ -564,7 +530,7 @@ class ChainOfZoomRuntime:
 
         prompts = []
         text_phase = _coz_phase("VLM Text", step_label)
-        if self.use_vllm_decoder and vlm_jobs:
+        if self.use_lm_engine and vlm_jobs:
             max_prompt_len = max(int(job["attention_mask"].sum().item()) if job["attention_mask"] is not None else int(job["input_ids"].shape[-1]) for job in vlm_jobs)
             self.vlm_engine.reserve_runtime(prompt_len=max_prompt_len, max_tokens=COZ_VLM_MAX_NEW_TOKENS, cfg_scale=1.0, num_seqs=min(self.vlm_prompt_batch, len(vlm_jobs)))
             for batch_start in range(0, len(vlm_jobs), self.vlm_prompt_batch):
@@ -572,7 +538,7 @@ class ChainOfZoomRuntime:
                     return None
                 batch_jobs = vlm_jobs[batch_start:batch_start + self.vlm_prompt_batch]
                 _report_progress(progress_callback, text_phase, batch_start + len(batch_jobs), total_tiles)
-                for tile_offset, prompt in enumerate(self._vlm_prompts_from_embeds_vllm(batch_jobs)):
+                for tile_offset, prompt in enumerate(self._vlm_prompts_from_embeds_lm_engine(batch_jobs)):
                     prompts.append(prompt)
                     print(f"[Chain-of-Zoom] {step_label} VLM tile {batch_start + tile_offset + 1}/{total_tiles} prompt: {prompt}")
                 for job in batch_jobs:
@@ -589,7 +555,7 @@ class ChainOfZoomRuntime:
                 for job in batch_jobs:
                     job.clear()
         vlm_jobs.clear()
-        if self.use_vllm_decoder and self.vlm_engine is not None:
+        if self.use_lm_engine and self.vlm_engine is not None:
             # VLM phase over: free the engine KV cache + CUDA graph pool before the
             # text-encode/VAE/diffusion phases. MMGP will move the weights anyway, which
             # invalidates the captured graphs; the engine rebuilds them next VLM phase.
@@ -678,9 +644,9 @@ class ChainOfZoomRuntime:
 _RUNTIME = ChainOfZoomRuntime()
 
 
-def load_models(paths: CoZPaths, *, init_pipe, profile, lm_decoder_engine: str = "legacy", vlm_vision_batch: int = COZ_VLM_VISION_BATCH, vlm_prompt_batch: int = COZ_VLM_PROMPT_BATCH, progress_callback=None) -> None:
+def load_models(paths: CoZPaths, *, init_pipe, profile, lm_features, vlm_vision_batch: int = COZ_VLM_VISION_BATCH, vlm_prompt_batch: int = COZ_VLM_PROMPT_BATCH, progress_callback=None) -> None:
     _report_progress(progress_callback, "CoZ Loading Models")
-    _RUNTIME.load(paths, profile=profile, init_pipe=init_pipe, lm_decoder_engine=lm_decoder_engine, vlm_vision_batch=vlm_vision_batch, vlm_prompt_batch=vlm_prompt_batch)
+    _RUNTIME.load(paths, profile=profile, init_pipe=init_pipe, lm_features=lm_features, vlm_vision_batch=vlm_vision_batch, vlm_prompt_batch=vlm_prompt_batch)
 
 
 def upscale_image(sample: torch.Tensor, scale: float, *, seed: int = 0, abort_callback=None, progress_callback=None) -> torch.Tensor | None:

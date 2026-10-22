@@ -493,21 +493,79 @@ def _find_objects():
     return found
 
 
+def _model_tensors(model):
+    """(path, tensor) of the parameters and buffers of model and of the inner tensors of wrapper subclasses (quantized weights), each once."""
+    seen = set()
+    for path, module in model.named_modules():  # memoized: module graphs with cycles (a child refers to its parent) are walked once
+        for name, tensor in list(module._parameters.items()) + list(module._buffers.items()):
+            pending = [(tensor, f"{path}.{name}" if path else name)]
+            while pending:
+                tensor, tensor_path = pending.pop()
+                if isinstance(tensor, torch.Tensor) and id(tensor) not in seen:
+                    seen.add(id(tensor))
+                    yield tensor_path, tensor
+                    if hasattr(type(tensor), "__tensor_flatten__"):
+                        pending += [(getattr(tensor, attribute, None), f"{tensor_path}.{attribute}") for attribute in tensor.__tensor_flatten__()[0]]
+
+
+def _offload_models(offloads):
+    return {model_id: model for offloader in offloads for model_id, model in (offloader.models or {}).items() if isinstance(model, torch.nn.Module)}
+
+
 def _model_names(offloads):
     names = {}
-    for offloader in offloads:
-        for model_id, model in (offloader.models or {}).items():
-            if isinstance(model, torch.nn.Module):
-                for path, module in model.named_modules():  # memoized: module graphs with cycles (a child refers to its parent) are walked once
-                    for name, tensor in list(module._parameters.items()) + list(module._buffers.items()):
-                        pending = [(tensor, f"{path}.{name}" if path else name)]
-                        while pending:  # the tensor, and the inner tensors of a wrapper subclass (quantized weights)
-                            tensor, tensor_path = pending.pop()
-                            if isinstance(tensor, torch.Tensor) and id(tensor) not in names:
-                                names[id(tensor)] = (model_id, tensor_path)
-                                if hasattr(type(tensor), "__tensor_flatten__"):
-                                    pending += [(getattr(tensor, attribute, None), f"{tensor_path}.{attribute}") for attribute in tensor.__tensor_flatten__()[0]]
+    for model_id, model in _offload_models(offloads).items():
+        for path, tensor in _model_tensors(model):
+            names.setdefault(id(tensor), (model_id, path))
     return names
+
+
+def weight_backing(models, top=8, regions=None):
+    """Where the CPU weights of models live. Weights read from a checkpoint file through a memory mapping cost no private RAM: under memory
+    pressure the system drops their pages and rereads them from the file. Weights in private RAM (made at load: dtype conversions,
+    concatenations, merged LoRAs, quantization at load) are written to the page file instead, and read back at their next use. Pinned weights
+    (locked RAM) are never paged out. Returns {model_id: {file_gb, private_gb, pinned_gb, files {name: GiB}, private [groups of tensors whose
+    names differ by their block numbers, largest first: tensors, count, gb, mb_mean, type], private_groups}}."""
+    lookup = _region_lookup(regions if regions is not None else reservations(residency=False))
+    cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+    result = {}
+    for model_id, model in models.items():
+        totals, files, groups, seen = collections.Counter(), collections.Counter(), {}, set()
+        for path, tensor in _model_tensors(model):
+            if tensor.device.type != "cpu" or hasattr(type(tensor), "__tensor_flatten__"):
+                continue  # on the GPU or the meta device, or a wrapper subclass whose inner tensors are listed
+            pointer, nbytes = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+            if not nbytes or (pointer, nbytes) in seen:
+                continue  # tied weights are counted once
+            seen.add((pointer, nbytes))
+            region = lookup(pointer)
+            if region is not None and region["kind"] == "mapped" and region["path"]:
+                where = "file"
+                files[os.path.basename(region["path"])] += nbytes
+            elif cuda and tensor.is_pinned():
+                where = "pinned"
+            else:
+                where = "private"
+                group = groups.setdefault(re.sub(r"(^|\.)\d+(?=\.)", r"\1*", path), {"count": 0, "bytes": 0, "type": f"{type(tensor).__name__} {str(tensor.dtype).replace('torch.', '')}"})
+                group["count"] += 1
+                group["bytes"] += nbytes
+            totals[where] += nbytes
+        largest = sorted(groups.items(), key=lambda item: -item[1]["bytes"])
+        result[model_id] = {"file_gb": round(totals["file"] / GB, 3), "private_gb": round(totals["private"] / GB, 3), "pinned_gb": round(totals["pinned"] / GB, 3),
+                            "files": {name: round(size / GB, 3) for name, size in files.most_common()}, "private_groups": len(largest),
+                            "private": [{"tensors": name, "count": group["count"], "gb": round(group["bytes"] / GB, 3), "mb_mean": round(group["bytes"] / group["count"] / MB, 1),
+                                         "type": group["type"]} for name, group in largest[:top]]}
+    return result
+
+
+def weight_backing_text(model_id, info):
+    """One line on where the CPU weights of a model live (see weight_backing)."""
+    text = f"Weights of '{model_id}' in RAM: {info['file_gb']:.2f} GiB read from checkpoint files, {info['private_gb']:.2f} GiB in private RAM"
+    text += f", {info['pinned_gb']:.2f} GiB pinned" if info["pinned_gb"] else ""
+    if info["private"] and info["private"][0]["gb"] >= 0.01:
+        group = info["private"][0]
+        text += f" (largest: {group['tensors']}, {group['count']} x {group['mb_mean']:.1f} MB {group['type']})"
+    return text
 
 
 def _buffers(found):
@@ -925,6 +983,7 @@ def _census_objects(min_bytes, holders, budget_s):
     found = _find_objects()
     buffers, images, totals = _buffers(found)
     registrations = _registrations(found)
+    weights = weight_backing(_offload_models(found["offloads"]))
     found_time = time.perf_counter() - started
     found_types = list(found["types"])
     del found
@@ -948,7 +1007,7 @@ def _census_objects(min_bytes, holders, budget_s):
         if holders and first != pointer:
             paths[pointer] = [f"(as the {first:#x} {buffer['what']} above)"]
     return {"buffers": buffers, "images": images, "totals": totals, "registrations": registrations, "top": top, "paths": paths, "complete": complete, "types": types_by_address,
-            "garbage": garbage, "times": (round(found_time, 2), round(holder_time, 2))}
+            "garbage": garbage, "times": (round(found_time, 2), round(holder_time, 2)), "weights": weights}
 
 
 def _region_lookup(found_regions):
@@ -1040,6 +1099,7 @@ def census(min_mb=16, objects=True, holders=True, budget_s=20, label="census", _
         result["vram_spilled_to_ram"] = vmm
     if objs:
         result["objects"] = _objects_report(objs, min_bytes)
+        result["weights"] = objs["weights"]
         if WINDOWS and _hook is not None:
             result["c_heap"] = _hook.heap_report(objs["buffers"], registrations, objs["types"])
     if _hook is not None:
@@ -1637,8 +1697,8 @@ def report(path=None, label=None, snapshot_label="report"):
                                  "phase": peak_all["phase"], "process_peak_private_gb": None if process["peak_private"] is None else round(process["peak_private"] / GB, 3),
                                  "available_min_gb": None if peak_all["available_min"] is None else round(peak_all["available_min"] / GB, 2),
                                  "other_processes_at_peak_gb": None if peak_all["others_at_peak"] is None else round(peak_all["others_at_peak"] / GB, 2)},
-              "releases": releases, "pinned_by_owner": {owner: {"blocks": count, "gb": round(size / GB, 3), "files": _events.owner_files.get(owner, [])}
-                                                        for owner, (count, size) in _events.pinned_by_owner().items()},
+              "releases": releases, "pinned_by_owner": {owner: {"blocks": count, "gb": round(size / GB, 3), "pool_blocks": pooled.get(owner, 0), "files": _events.owner_files.get(owner, [])}
+                                                        for pooled in [_events.pooled_by_owner()] for owner, (count, size) in _events.pinned_by_owner().items()},
               "retained_frames": _retained_frames(), "ram_allocator": allocator_report, "events": _events.as_json(entries, rec.t0),
               "snapshots": rec.snapshots, "history": rec.history, "origins": origins[:200],
               "stacks": {str(stack_id): [_vram_debug._frame_text(code, line) for code, line in rec.stack_frames[stack_id][:40]] for stack_id in sorted(used) if stack_id >= 0}}
@@ -1733,6 +1793,18 @@ def _census_summary(snap, title):
                 holders = "<br>".join(item["holders"]) or "-"
                 text.append(f"| {item['mb']:.0f} | {item['what']} | {item['memory']} | {holders} |\n")
             text.append("\n")
+    weights = snap.get("weights")
+    if weights:
+        text.append("| model | weights read from checkpoint files, GiB | in private RAM (paged out to disk under memory pressure), GiB | pinned, GiB |\n|---|---:|---:|---:|\n")
+        for model_id, info in weights.items():
+            text.append(f"| {model_id} | {info['file_gb']:.2f} | {info['private_gb']:.2f} | {info['pinned_gb']:.2f} |\n")
+        text.append("\n")
+        rows = [(model_id, group) for model_id, info in weights.items() for group in info["private"] if group["gb"] >= 0.01]
+        if rows:
+            text.append("| model | weights in private RAM (block numbers as *) | tensors | GiB | type |\n|---|---|---:|---:|---|\n")
+            for model_id, group in sorted(rows, key=lambda row: -row[1]["gb"])[:20]:
+                text.append(f"| {model_id} | {group['tensors']} | {group['count']} | {group['gb']:.2f} | {group['type']} |\n")
+            text.append("\n")
     heap = snap.get("c_heap")
     if heap:
         sizes = ", ".join(f"{row['blocks']} {row['gb']:.2f} GiB ({row['count']})" for row in heap["by_size"] if row["count"])
@@ -1811,7 +1883,9 @@ def summary(result):
     if result.get("retained_frames"):
         text.append(_retained_summary(result["retained_frames"]))
     if result.get("pinned_by_owner"):
-        text.append("Pinned RAM registered now, by model: " + ", ".join(f"{owner} {item['gb']:.2f} GiB ({item['blocks']} blocks" + (", from " + ", ".join(item["files"]) if item.get("files") else "") + ")"
+        text.append("Pinned RAM registered now, by model: " + ", ".join(f"{owner} {item['gb']:.2f} GiB ({item['blocks']} blocks"
+                                                                       + (f", {item['pool_blocks']} of them in the pinned pool" if item.get("pool_blocks") else "")
+                                                                       + (", from " + ", ".join(item["files"]) if item.get("files") else "") + ")"
                                                                        for owner, item in result["pinned_by_owner"].items()) + ".\n\n")
     if len(result.get("history", [])) > 1:
         text.append(_trend_summary(result["history"]))
@@ -1856,12 +1930,13 @@ def _trend_summary(history):
     labels = list(dict.fromkeys(label for entry in history for label in entry["classes"]))
     spans = {label: [entry["classes"].get(label, 0.0) for entry in history] for label in labels}
     changing = sorted((label for label in labels if max(spans[label]) - min(spans[label]) >= 0.1), key=lambda label: -abs(spans[label][-1] - spans[label][0]))[:6]
-    text = ["## RAM after each report since the start of the recording (GiB)\n\n| census | time (s) | private | resident | memory-mapped files resident | "
-            + " | ".join(changing) + " |\n|---|---:|---:|---:|---:|" + "---:|" * len(changing) + "\n"]
+    columns = ["census", "time (s)", "private", "resident", "memory-mapped files resident", *changing]
+    text = ["## RAM after each report since the start of the recording (GiB)\n\n| " + " | ".join(columns) + " |\n|---|" + "---:|" * (len(columns) - 1) + "\n"]
     for entry in history:
         mapped = entry.get("mapped_files_gb")
-        text.append(f"| {entry['label']} | {entry['time_s']:.0f} | {entry['private_gb']:.2f} | {entry['resident_gb']:.2f} | {'-' if mapped is None else f'{mapped:.2f}'} | "
-                    + " | ".join(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing) + " |\n")
+        values = [entry["label"], f"{entry['time_s']:.0f}", f"{entry['private_gb']:.2f}", f"{entry['resident_gb']:.2f}", "-" if mapped is None else f"{mapped:.2f}",
+                  *(f"{entry['classes'].get(label, 0.0):.2f}" for label in changing)]
+        text.append("| " + " | ".join(values) + " |\n")
     text.append(f"\nChange since the start: private {last['private_gb'] - first['private_gb']:+.2f} GiB, resident {last['resident_gb'] - first['resident_gb']:+.2f} GiB.\n\n")
     previous = next((entry for entry in reversed(history[:-1]) if entry["census"] == last["census"]), None)
     if previous is None:

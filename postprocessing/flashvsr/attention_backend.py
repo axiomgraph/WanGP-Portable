@@ -290,6 +290,12 @@ def get_sparse_backend_name() -> str:
     return _BACKEND_NAME or "unknown"
 
 
+def staged_sparge_available() -> bool:
+    """True when the resolved backend is the WanGP SpargeAttn block-sparse CUDA core: FlashVSR's self-attention then runs through the
+    attention kit by head groups (shared.spas_sage_attn_core's staged functions), with the same quantization and kernels."""
+    return get_sparse_backend_name() == "WanGP SpargeAttn block sparse CUDA"
+
+
 def log_sparse_backend() -> None:
     global _PRINTED_BACKEND
     backend_name = get_sparse_backend_name()

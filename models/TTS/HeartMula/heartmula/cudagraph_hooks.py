@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mmgp import runtime
 
 from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
 
@@ -16,13 +17,13 @@ class HeartMuLaCudaGraphHooks:
         self.model = model
         self._enabled = False
         self._kit: AutoRegressiveCudaGraphKit | None = None
+        self._decoder_kit: AutoRegressiveCudaGraphKit | None = None  # the decoder is a model of its own for MMGP: its steps, its graphs
         self._backbone_tokens = 0
         self._decoder_tokens = 0
         self._backbone_flash_graph = False
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        engine = str(lm_decoder_engine or "legacy").strip().lower()
-        self._enabled = engine == "cg"
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
         if not self._enabled:
             self.release()
 
@@ -45,7 +46,7 @@ class HeartMuLaCudaGraphHooks:
         self.release()
         if not self._enabled:
             return
-        model_device = next(self.model.parameters()).device
+        model_device = runtime.execution_device(self.model)  # its weights may be on the CPU (streamed)
         if model_device.type != "cuda":
             return
         if not self.model.backbone.caches_are_enabled() or not self.model.decoder[0].caches_are_enabled():
@@ -53,6 +54,7 @@ class HeartMuLaCudaGraphHooks:
         if max_backbone_tokens <= 0 or max_decoder_tokens <= 0:
             raise ValueError("CUDA graph token limits must be > 0.")
         kit = AutoRegressiveCudaGraphKit("heartmula", owner=self.model)
+        decoder_kit = AutoRegressiveCudaGraphKit("heartmula_decoder", owner=self.model.decoder[0])
         backbone_attn = self._collect_attention_modules(self.model.backbone)
         decoder_attn = self._collect_attention_modules(self.model.decoder[0])
         self._backbone_flash_graph = self._can_use_flash_graph(backbone_attn)
@@ -61,21 +63,25 @@ class HeartMuLaCudaGraphHooks:
             kit.attach_attention_modules(backbone_attn, max_backbone_tokens, graph_mode=backbone_graph_mode)
         )
         self._decoder_tokens = int(
-            kit.attach_attention_modules(decoder_attn, max_decoder_tokens, graph_mode="index")
+            decoder_kit.attach_attention_modules(decoder_attn, max_decoder_tokens, graph_mode="index")
         )
-        self._kit = kit
+        # the KV caches (buffers made after MMGP's profiling, never moved by it) that the decoding steps read and update in place
+        kit.register_state([tensor for attn in backbone_attn for tensor in (attn.kv_cache.k_cache, attn.kv_cache.v_cache)])
+        decoder_kit.register_state([tensor for attn in decoder_attn for tensor in (attn.kv_cache.k_cache, attn.kv_cache.v_cache)])
+        self._kit, self._decoder_kit = kit, decoder_kit
         self._prime_decode_kernels()
 
     def release(self) -> None:
-        if self._kit is not None:
-            self._kit.release()
-            self._kit = None
+        for kit in (self._kit, self._decoder_kit):
+            if kit is not None:
+                kit.release()
+        self._kit = self._decoder_kit = None
         self._backbone_tokens = 0
         self._decoder_tokens = 0
         self._backbone_flash_graph = False
 
     def _active(self) -> bool:
-        return self._kit is not None and self._backbone_tokens > 0 and self._decoder_tokens > 0
+        return self._kit is not None and self._decoder_kit is not None and self._backbone_tokens > 0 and self._decoder_tokens > 0
 
     def is_active(self) -> bool:
         return self._active()
@@ -86,9 +92,12 @@ class HeartMuLaCudaGraphHooks:
         mask = self.model.backbone_causal_mask[input_pos, : self._backbone_tokens]
         return self.model.backbone(hidden_states, input_pos=input_pos, mask=mask)
 
-    def _decoder_decode_step(self, hidden_states: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
-        mask = self.model.decoder_causal_mask[input_pos, : self._decoder_tokens]
-        return self.model.decoder[0](self.model.projection(hidden_states), input_pos=input_pos, mask=mask)
+    def _decoder_inputs(self, hidden_states: torch.Tensor, input_pos: torch.Tensor):
+        # outside the decoder's step: the projection and the causal mask belong to the backbone's model
+        return self.model.projection(hidden_states), input_pos, self.model.decoder_causal_mask[input_pos, : self._decoder_tokens]
+
+    def _decoder_decode_step(self, projected: torch.Tensor, input_pos: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.model.decoder[0](projected, input_pos=input_pos, mask=mask)
 
     def _prime_decode_kernels(self) -> None:
         if not self._active():
@@ -105,7 +114,7 @@ class HeartMuLaCudaGraphHooks:
         with torch.no_grad():
             _ = self._backbone_decode_step(hidden, pos)
             self.model.backbone.reset_caches()
-            _ = self._decoder_decode_step(hidden, pos)
+            _ = self._decoder_decode_step(*self._decoder_inputs(hidden, pos))
             self.model.decoder[0].reset_caches()
 
     def run_backbone_decode(self, hidden_states: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
@@ -135,7 +144,7 @@ class HeartMuLaCudaGraphHooks:
                         f"Decoder decode position {absolute_pos} exceeds CUDA graph cache capacity {self._decoder_tokens}."
                     )
                 token_hidden = hidden_states[:, token_idx : token_idx + 1]
-                last_output = self._kit.run("decoder_decode", self._decoder_decode_step, token_hidden, token_pos)
+                last_output = self._decoder_kit.run("decoder_decode", self._decoder_decode_step, *self._decoder_inputs(token_hidden, token_pos))
         except Exception as exc:
             self.release()
             raise RuntimeError(f"HeartMuLa decoder CUDA graph decode failed: {exc}") from exc

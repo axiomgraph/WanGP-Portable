@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
-from shared.llm_engines.nanovllm.vllm_support import NanoVllmTextEngine
+from shared.llm_engines.lmgp.vllm_support import TextEngine
 
 from .qwen3_audio_codes import generate_text_sampling
 
@@ -103,7 +103,7 @@ class Qwen3LegacyEngine:
         )
 
 
-class Qwen3VllmEngine(NanoVllmTextEngine):
+class Qwen3VllmEngine(TextEngine):
     keep_loaded_for_phase2 = True
 
     def __init__(self, model, tokenizer, device, lm_weights_path: str):
@@ -111,6 +111,10 @@ class Qwen3VllmEngine(NanoVllmTextEngine):
         super().__init__(model=model, model_path=lm_weights_path, tokenizer=tokenizer)
 
     def reserve_runtime(self, prompt_len: int, max_tokens: int, cfg_scale: float):
+        # the reservation covers the longest songs, the KV cache starts at the first phase's budget (512 tokens, about 100 s of codes) and
+        # grows with the generation: a short song does not hold the cache of the longest
+        if self._llm is None:
+            self._kv_cache_options = dict(kv_cache_initial_tokens=min(512, max_tokens), kv_cache_max_tokens=max_tokens, kv_cache_prompt_tokens=prompt_len)
         return super().reserve_runtime(prompt_len=prompt_len, max_tokens=max_tokens, cfg_scale=cfg_scale)
 
     def release_runtime_allocations(self):

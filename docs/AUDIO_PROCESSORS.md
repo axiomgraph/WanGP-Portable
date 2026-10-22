@@ -185,7 +185,10 @@ Model persistence is shared by all processors at
 persistence control. The registry retains at most one audio processor handler and
 fully releases it before dispatching a different handler. Model-backed handlers
 should obtain the policy through `audio_processors.persistent_models(...)` when
-deciding whether their runtime may keep weights in RAM after use.
+deciding whether their runtime may keep weights in RAM after use. *Auto* (the
+default of new installations) keeps them loaded with memory profile 0 and the
+VRAM Preload of the current model: their Reserved RAM is only borrowed while
+they run. Handlers obtain this through the `init_pipe` WanGP passes them.
 
 Handlers with configuration should implement `default_config()` and
 `normalize_config_section(...)`. If they expose Configuration-tab controls, return

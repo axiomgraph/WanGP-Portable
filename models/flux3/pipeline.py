@@ -86,7 +86,7 @@ class Flux3Pipeline:
         # The released schedule and random generator run on CPU, independent of
         # PyTorch's default device; Euler state remains FP32 between steps.
         schedule = torch.linspace(1, 0, sampling_steps + 1, device='cpu')
-        schedule = 6.93 * schedule / (1 + 5.93 * schedule)
+        schedule = 16.0 * schedule / (1 + 15.0 * schedule)
         schedule_device = schedule.to(device)
         results = []
         for image_no in range(batch_size):

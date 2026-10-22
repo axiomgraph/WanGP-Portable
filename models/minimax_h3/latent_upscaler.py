@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from shared.kernels import ops as kernels
 from .interrupt import GenerationInterrupted
 
 
@@ -39,8 +40,8 @@ class ResidualBlock3D(nn.Module):
     def forward(self, hidden_states, embedding):
         residual = hidden_states
         hidden_states = self.in_layers(hidden_states)
-        scale, shift = self.emb_layers(embedding).to(hidden_states.dtype).chunk(2, dim=1)
-        hidden_states = self.out_norm(hidden_states) * (1 + scale[:, :, None, None, None]) + shift[:, :, None, None, None]
+        scale, shift = self.emb_layers(embedding).to(hidden_states.dtype)[:, :, None, None, None].chunk(2, dim=1)
+        hidden_states = kernels.scale_shift([self.out_norm(hidden_states)], scale, shift)
         return residual + self.out_layers(hidden_states)
 
 

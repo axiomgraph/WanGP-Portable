@@ -146,7 +146,7 @@ def save_audio_metadata(path, configs):
     elif ext == ".flac":
         from mutagen.flac import FLAC
         audio = FLAC(path)
-        audio["WanGP"] = [payload]
+        audio["WanGP"] = payload
         audio.save()
     else:
         raise ValueError(f"Unsupported audio metadata format: {ext}")

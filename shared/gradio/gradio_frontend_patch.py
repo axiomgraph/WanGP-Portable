@@ -14,11 +14,29 @@ from shared.gradio import metadata_events
 
 
 _EDITOR_PATH = Path(__file__).parent / 'wangp_image_editor/templates/component/index.js'
+# Gradio's upload control and the editor's bundled upload action must resolve
+# gallery previews identically. Fetch the original only when a drop occurs.
+_GALLERY_DROP_FILES = r'''async function wangpGalleryDropFiles(event) {
+    const files = Array.from(event.dataTransfer.files);
+    const media = event.dataTransfer.getData('application/x-wangp-gallery-media');
+    const source = media || event.dataTransfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
+    if (!source || !URL.canParse(source)) return files;
+    const url = new URL(source);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=') || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
+    // Replace the browser's reduced-resolution image File entirely.
+    url.searchParams.delete('__wangp_gallery_preview');
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Could Not Load Original Gallery Media.');
+    const blob = await response.blob();
+    const name = decodeURIComponent(url.pathname.split('/file=')[1]).split(/[\\/]/).pop();
+    return [new File([blob], name, {type: blob.type})];
+}
+'''
 # Pixi's scheduler only serves wall-clock GC tasks in this bundle. Retain its
 # callbacks, offsets and repeat bookkeeping, but wake at their actual deadlines.
 # The separate pointer ticker must still run whenever hit testing unpauses it.
 _EDITOR_SCHEDULER = """
-JC = class extends JC {
+XC = class extends XC {
     init() {}
     repeat(...args) {
         const id = super.repeat(...args);
@@ -169,9 +187,18 @@ function wangpGalleryVideoPoster(video) {
     }, "image/jpeg", 0.9));
 }
 function wangpGalleryVideoMount(video) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, video.src);
     if (video.dataset.testid === "detailed-video") queueMicrotask(() => {
         if (video.isConnected) wangpGalleryVideoSource(video, video.src);
     });
+}
+function wangpGalleryThumbnailPoster(video, src) {
+    const url = new URL(src, document.baseURI);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=')) return;
+    // Set this during mount, before the browser starts resource selection.
+    video.preload = 'none';
+    url.searchParams.set('__wangp_gallery_preview', 'video');
+    video.poster = url.href;
 }
 function wangpGalleryPosterEntry(video, src) {
     const entry = {src, value: null};
@@ -191,6 +218,7 @@ function wangpGalleryVideoError(event) {
     event.currentTarget.removeAttribute("poster");
 }
 function wangpGalleryVideoSource(video, src) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, src);
     if (video.dataset.testid !== "detailed-video" || !video.closest(".gallery-container")) {
         j(video, "src", src);
         return;
@@ -294,6 +322,21 @@ _PATCHES = {
         ('S(e,"selected",t[33]?.id===t[6])},m(d,u)', 'S(e,"selected",t[33]?.id===t[6]),e.disabled=!t[33].interactive,m(e,"aria-disabled",e.disabled)},m(d,u)'),
         ('u[0]&320&&S(e,"selected",t[33]?.id===t[6])', 'u[0]&320&&S(e,"selected",t[33]?.id===t[6]),u[0]&256&&(e.disabled=!t[33].interactive,m(e,"aria-disabled",e.disabled))'),
     ],
+    'Image-CnqB5dbD.js': [
+        ('function k(s){', Path(__file__).with_name('image_zoom.js').read_text(encoding='utf-8') + '\nfunction k(s){'),
+        ('x(t,e,o),i||', 'x(t,e,o),window.WanGPImageZoom.mount(e),i||'),
+        ('d(e,"svelte-1pijsyv",!0)},i:m', 'd(e,"svelte-1pijsyv",!0),window.WanGPImageZoom.mount(e)},i:m'),
+        ('d(t){t&&b(e),i=!1', 'd(t){window.WanGPImageZoom.destroy(e);t&&b(e),i=!1'),
+    ],
+    'Upload-B_zkKtR-.js': [
+        ('function it(){', _GALLERY_DROP_FILES + 'function it(){'),
+        ('function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;const c=Array.from(f.dataTransfer.files);c.length>0&&e.on_files?.(c)}',
+         'async function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;try{const c=await wangpGalleryDropFiles(f);c.length>0&&e.on_files?.(c)}catch(error){e.on_error?.(error.message)}}'),
+        ('on_files:t[31],accepted_types:', 'on_files:t[31],on_error:t[32],accepted_types:'),
+        ('on_files:a[31],accepted_types:', 'on_files:a[31],on_error:a[32],accepted_types:'),
+        ('l,o,i,qe]}class Pt', 'l,o,i,qe,message=>A("error",message)]}class Pt'),
+        ('const h=Array.from(r.dataTransfer.files).filter(ae);', 'let h;try{h=(await wangpGalleryDropFiles(r)).filter(ae)}catch(error){A("error",error.message);return;}'),
+    ],
     'Gallery-D7vc32lN.js': [
         ('function Ve(s){', '''function wangpGalleryGap(event) {
             const container = event.target.closest('.thumbnails, .grid-container');
@@ -308,9 +351,26 @@ _PATCHES = {
             }
             if (closest) {event.preventDefault(); event.stopPropagation(); closest.click();}
         }
+        function wangpGalleryDrag(event) {
+            const thumbnail = event.target.closest('.thumbnail-item[data-wangp-video-url]');
+            if (!thumbnail || !this.contains(thumbnail)) return;
+            const source = new URL(thumbnail.dataset.wangpVideoUrl, location.href).href;
+            event.dataTransfer.effectAllowed = 'copy';
+            event.dataTransfer.setData('application/x-wangp-gallery-media', source);
+            event.dataTransfer.setData('text/uri-list', source);
+            event.dataTransfer.setData('text/plain', source);
+        }
         function Ve(s){'''),
-        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V=s,V?.addEventListener("click",wangpGalleryGap),l(18,V)'),
-        ('function dt(n){', '''function wangpGalleryImage(src, edge) {
+        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V?.removeEventListener("dragstart",wangpGalleryDrag),V=s,V?.addEventListener("click",wangpGalleryGap),V?.addEventListener("dragstart",wangpGalleryDrag),l(18,V)'),
+        ('B(e,"class","thumbnail-item thumbnail-small svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-small svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[50])'),
+        ('B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[47])'),
+        ('n=w;let m=l;', 'n=w;y[0]&65536&&wangpGalleryVideoThumbnail(e,n[50]);let m=l;'),
+        ('n=$;let y=l;', 'n=$;w[0]&65536&&wangpGalleryVideoThumbnail(e,n[47]);let y=l;'),
+        ('function dt(n){', '''function wangpGalleryVideoThumbnail(button, item) {
+            B(button, 'draggable', item.video ? 'true' : null);
+            B(button, 'data-wangp-video-url', item.video?.url);
+        }
+        function wangpGalleryImage(src, edge) {
             if (!src || !edge) return src;
             const url = new URL(src, window.location.href);
             if (url.origin !== window.location.origin || !url.pathname.includes('/file=') || !/\\.(png|jpe?g|webp|bmp|tiff?|gif)$/i.test(url.pathname)) return src;
@@ -339,18 +399,38 @@ _PATCHES = {
         ('_[0]&8454274){b=te(a[16]);', '_[0]&12648706){b=te(a[22]&&a[7]?[]:a[16]);'),
         # Do not animate the strip when the selected thumbnail is already visible.
         ('Q=x-S+X/2-H/2+A.scrollLeft;A&&', 'Q=x-S+X/2-H/2+A.scrollLeft;if(x>=S&&x+X<=S+H)return;A&&'),
-        ('function Re(s){switch(s.code){', 'function Re(s){if(["Escape","ArrowLeft","ArrowRight"].includes(s.code))wangpGalleryUser=true;switch(s.code){'),
+        # Escape exits fullscreen without discarding the selected preview and
+        # exposing the large grid underneath. Preview=False galleries can close.
+        ('function Re(s){switch(s.code){', 'function Re(s){if(s.code==="Escape"&&a){s.preventDefault();if(document.fullscreenElement)document.exitFullscreen().catch(console.error);return;}if(["Escape","ArrowLeft","ArrowRight"].includes(s.code))wangpGalleryUser=true;switch(s.code){'),
         ('const qe=s=>l(1,m=s);', 'const qe=s=>{wangpGalleryUser=true;return l(1,m=s)};'),
         ('Oe=s=>{m===null', 'Oe=s=>{wangpGalleryUser=true;m===null'),
         ('Ge=()=>{l(1,m=null)', 'Ge=()=>{wangpGalleryUser=true;l(1,m=null)'),
         ('n.$$set=s=>{"show_label"', 'n.$$set=s=>{wangpGalleryExplicit||="selected_index"in s&&("value"in s||s.selected_index!==m);if(wangpGalleryUser&&(("selected_index"in s&&s.selected_index!==m)||("value"in s&&!et(r,s.value))))wangpGalleryUser=false;"show_label"'),
         ('K?(l(1,m=a&&r?.length?0:null),l(29,K=!1))', 'K?(!wangpGalleryExplicit&&l(1,m=a&&r?.length?0:null),l(29,K=r==null||r.length===0))'),
+        ('Math.min(m,r.length-1))):l(1,m=null)', 'Math.min(m,r.length-1))):l(1,m=a&&r?.length?0:null)'),
         ('J("change"),l(30,le=r)', 'wangpGalleryChanged=true,l(30,le=r)'),
         ('(l(31,ne=m),m!==null&&(P!=null&&l(1,m=Math.max(0,Math.min(m,P.length-1))),J("select",{index:m,value:P?.[m]})))', '(m!==null&&P!=null&&l(1,m=Math.max(0,Math.min(m,P.length-1))),l(31,ne=m),wangpGalleryUser?(m!==null&&J("select",{index:m,value:P?.[m]})):wangpGalleryChanged=true)'),
         ('l(22,i=m!=null&&P!=null?P[m]:null)},[r,m', 'l(22,i=m!=null&&P!=null?P[m]:null);if(wangpGalleryChanged)J("change");wangpGalleryChanged=wangpGalleryUser=wangpGalleryExplicit=false},[r,m'),
+        # Full-resolution media belongs only to the gallery being enlarged.
+        # Release the listener when a form rebuild destroys this component.
+        ('_t(()=>{document.addEventListener("fullscreenchange",()=>{l(17,j=!!document.fullscreenElement)})})', '_t(()=>{const changed=()=>l(17,j=document.fullscreenElement===V);document.addEventListener("fullscreenchange",changed);return()=>document.removeEventListener("fullscreenchange",changed)})'),
     ],
     'index.js': [
-        ('QC.SchedulerSystem = JC;', _EDITOR_SCHEDULER + 'QC.SchedulerSystem = JC;'),
+        ('function yq() {', _GALLERY_DROP_FILES + 'function yq() {'),
+        ('''function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        const m = Array.from(f.dataTransfer.files);
+        m.length > 0 && e.on_files?.(m);
+      }''', '''async function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        try {
+          const m = await wangpGalleryDropFiles(f);
+          if (m.length > 0) await e.on_files?.(m);
+        } catch (error) { e.on_error?.(error.message); }
+      }'''),
+        ('r[33]\n        ),\n        accepted_types:', 'r[33]\n        ),\n        on_error: message => r[32]("download_error", message),\n        accepted_types:'),
+        ('E[33]\n        ),\n        accepted_types:', 'E[33]\n        ),\n        on_error: message => E[32]("download_error", message),\n        accepted_types:'),
+        ('jC.SchedulerSystem = XC;', _EDITOR_SCHEDULER + 'jC.SchedulerSystem = XC;'),
         ('this._pauseUpdate = e;', 'this._pauseUpdate = e; e ? this.removeTickerListener() : this.addTickerListener();'),
         ('this._tickerAdded || !this.domElement ||', 'this._pauseUpdate || this._tickerAdded || !this.domElement ||'),
     ],
@@ -397,6 +477,12 @@ _PATCHES = {
         ('return l.$$set=w=>{' + _NODE_INPUTS, 'return l.$$set=w=>{' + _NODE_SKIP + _NODE_INPUTS),
     ],
     'index-Do3LSwBC.js': [
+        # UI submissions include State slots and private events absent from
+        # /info. Their dependency inputs describe the actual positional payload.
+        # Named API calls retain the public parameter/keyword validation.
+        ('const Ig=(e=[],o)=>{', 'const Ig=(e=[],o,wangpInputCount)=>{'),
+        ('return e.length>t.length&&console.warn("Too many arguments provided for the endpoint."),e;', 'return e.length>(wangpInputCount??t.length)&&console.warn("Too many arguments provided for the endpoint."),e;'),
+        ('P=Ig(o,k)', 'P=Ig(o,k,typeof e==="number"?g.inputs.length:undefined)'),
         ('function Qo(e,o,t,r){', _UPDATE_SCHEDULER + 'function Qo(e,o,t,r){'),
         ('uv(q)', 'wangpScheduleUpdate(q)'),
         ('function lf(e,o={}){', 'function lf(e,o={}){' + _NATIVE_EVENT_STREAM),
@@ -422,6 +508,11 @@ _PATCHES = {
         ('function q(){l.update(k=>{for(let g=0;', 'function q(){l.update(k=>{const wangpDirty=new Set;for(let g=0;'),
         ('f.props[v.prop]=j}return k}),ge=[]', 'f.props[v.prop]=j;' + _MARK_ANCESTORS + 'return k}),ge=[]'),
         ('l.set(h)', 'Object.values(s).forEach(node=>node.__wangp_revision=(node.__wangp_revision||0)+1),l.set(h)'),
+    ],
+    'Index-Cuq53rtW.js': [
+        # This handshake is for a Hugging Face iframe host. A standalone page
+        # has no parent receiver and Chrome reports a target-origin mismatch.
+        ('window.parent.postMessage(b,Te)', 'window.parent!==window&&window.parent.postMessage(b,Te)'),
     ],
 }
 
@@ -520,6 +611,9 @@ def install():
         if patched != source:
             patched = patched.replace('<script type="importmap">', '<script>' + proxy_root_script + '</script><script type="importmap">', 1)
             config = response.context['config']
+            # Gradio advertises this URL even when its route returns 404.
+            if not config.get('pwa'):
+                patched = patched.replace('<link rel="manifest" href="/manifest.json" />', '')
             if not config.get('auth_required'):
                 guard = session_script.replace('__WANGP_UI_SIGNATURE__', json.dumps(config['wangp_ui_signature']))
                 patched = patched.replace('<script type="importmap">', '<script>' + guard + '</script><script type="importmap">', 1)

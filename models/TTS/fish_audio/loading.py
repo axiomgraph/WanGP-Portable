@@ -37,17 +37,17 @@ def audio_head_rows(config):
     return preprocess
 
 
-def load_transformers(backbone_paths, codebook_path, engine="legacy"):
+def load_transformers(backbone_paths, codebook_path, features):
     """backbone_paths: the dense backbone file, then the routed-expert file (pageable mmap, outside MMGP's block offload)."""
     config = FishOmniConfig.from_dict(json.loads(Path(__file__).with_name("fish_drama3.json").read_text()))
     with torch.device("meta"):
-        backbone = FishOmniBackbone(config.text, engine, config.audio_logit_rows, config.audio_decoder.vq_backbone_codebooks)
+        backbone = FishOmniBackbone(config.text, features, config.audio_logit_rows, config.audio_decoder.vq_backbone_codebooks)
         codebooks = FishOmniAudioDecoder(config, dtype=torch.bfloat16)
     for layer in (*codebooks.shared_layers, *codebooks.residual_layers):
-        layer.transformer_layer.attention.engine = engine
+        layer.transformer_layer.attention.features = features
     for module in (*backbone.modules(), *codebooks.modules()):
         if isinstance(module, (ZeroCenteredRMSNorm, GatedRMSNorm)):
-            module.fused = engine == "vllm"
+            module.fused = features.triton
     offload.load_model_data(backbone, [str(path) for path in backbone_paths], writable_tensors=False, default_dtype=None, preprocess_sd=audio_head_rows(config),
                             fused_split_map=backbone_split_map(config))
     offload.load_model_data(codebooks, str(codebook_path), writable_tensors=False, default_dtype=None,

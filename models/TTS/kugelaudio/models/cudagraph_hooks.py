@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mmgp import runtime
 from transformers.cache_utils import StaticCache
 
 from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
@@ -22,9 +23,8 @@ class KugelAudioCudaGraphHooks:
         self._last_prepare_reused = False
         self._decode_cache_position: torch.Tensor | None = None
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        engine = str(lm_decoder_engine or "legacy").strip().lower()
-        self._enabled = engine == "cg"
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
         if not self._enabled:
             self.release()
 
@@ -34,7 +34,7 @@ class KugelAudioCudaGraphHooks:
             return
         if max_batch_size <= 0 or max_cache_tokens <= 0:
             raise ValueError("KugelAudio CUDA graph capacities must be > 0.")
-        model_device = next(self.model.parameters()).device
+        model_device = runtime.execution_device(self.model)  # its weights may be on the CPU (streamed)
         if model_device.type != "cuda":
             return
         if (
@@ -58,7 +58,9 @@ class KugelAudioCudaGraphHooks:
             dtype=model_dtype,
         )
         self._decode_cache_position = torch.zeros(1, device=model_device, dtype=torch.long)
-        self._kit = AutoRegressiveCudaGraphKit("kugelaudio", owner=self.model)
+        # the steps run the language model only: its layers in VRAM give one graph per step, whatever the acoustic tokenizer's blocks
+        self._kit = AutoRegressiveCudaGraphKit("kugelaudio", owner=self.model, resident=self.model.model.language_model)
+        self._kit.register_state(self._cache)  # the KV cache the decoding steps read and update in place
         self._max_batch_size = int(max_batch_size)
         self._max_cache_tokens = int(max_cache_tokens)
 
@@ -116,14 +118,9 @@ class KugelAudioCudaGraphHooks:
             raise RuntimeError(f"KugelAudio CUDA graph prefill failed: {exc}") from exc
 
     def _decode_step(self, token_embeds: torch.Tensor, cache_position: torch.Tensor):
-        outputs = self.model(
-            inputs_embeds=token_embeds,
-            past_key_values=self._cache,
-            use_cache=True,
-            return_dict=True,
-            cache_position=cache_position,
-        )
-        return outputs.logits, outputs.last_hidden_state
+        # the language model alone (the graph stage's module), its head applied after the step
+        return self.model.model.language_model(inputs_embeds=token_embeds, past_key_values=self._cache, use_cache=True, return_dict=True,
+                                               cache_position=cache_position).last_hidden_state
 
     def run_decode(self, token_embeds: torch.Tensor, token_position: int) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_active():
@@ -142,7 +139,8 @@ class KugelAudioCudaGraphHooks:
             self._decode_cache_position = torch.empty(1, device=token_embeds.device, dtype=torch.long)
         cache_position = self._decode_cache_position.fill_(absolute_pos)
         try:
-            return self._kit.run("lm_decode", self._decode_step, token_embeds, cache_position)
+            hidden_states = self._kit.run("lm_decode", self._decode_step, token_embeds, cache_position)
+            return self.model.lm_head(hidden_states), hidden_states
         except Exception as exc:
             self.release()
             raise RuntimeError(f"KugelAudio CUDA graph decode failed: {exc}") from exc

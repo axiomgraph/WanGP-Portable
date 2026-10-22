@@ -1,5 +1,5 @@
 SDR_VIDEO_CODEC_CHOICES = [
-    ("x265 CRF 28 (Small)", "libx265_28"),
+    ("x265 CRF 28 (Smaller Files)", "libx265_28"),
     ("x265 CRF 18 (Balanced)", "libx265_18"),
     ("x264 Level 8 (Balanced)", "libx264_8"),
     ("x265 CRF 8 (High Quality)", "libx265_8"),
@@ -24,11 +24,6 @@ SUPPORTED_VIDEO_CONTAINERS = {"mkv", "mov", "mp4"}
 CONFIG_VIDEO_CONTAINERS = {value for _, value in VIDEO_CONTAINER_CHOICES}
 PROFESSIONAL_VIDEO_CODECS = {"prores_422", "dnxhr_hq"}
 QUICKTIME_AUDIO_CODEC_KEYS = {"aac_128", "aac_192", "aac_256", "aac_320", "alac"}
-# ffmpeg muxes FLAC into MP4 and Matroska, but refuses it in MOV.
-CONTAINER_AUDIO_CODEC_KEYS = {
-    "mp4": QUICKTIME_AUDIO_CODEC_KEYS | {"flac"},
-    "mov": QUICKTIME_AUDIO_CODEC_KEYS,
-}
 
 
 def normalize_video_container(container: str | None) -> str:
@@ -95,8 +90,9 @@ def validate_video_output_settings(video_codec: str | None, video_container: str
         return f"Unsupported video container: {video_container}."
     if video_codec in PROFESSIONAL_VIDEO_CODECS and video_container not in {"mkv", "mov"}:
         return "ProRes 422 and DNxHR HQ require the MOV / QuickTime or MKV container."
-    allowed_audio_codecs = CONTAINER_AUDIO_CODEC_KEYS.get(video_container)
-    if allowed_audio_codecs is not None and audio_codec not in allowed_audio_codecs:
+    if video_container == "mov" and audio_codec == "flac":
+        return "FLAC soundtracks require MP4 or MKV; choose AAC or ALAC for MOV."
+    if video_container in {"mp4", "mov"} and audio_codec not in QUICKTIME_AUDIO_CODEC_KEYS and not (video_container == "mp4" and audio_codec == "flac"):
         return f"{video_container.upper()} output does not support audio codec setting '{audio_codec}'."
     if video_codec == "dnxhr_hq" and width is not None and height is not None and (int(width) < 256 or int(height) < 120):
         return "DNxHR HQ output requires a resolution of at least 256x120."

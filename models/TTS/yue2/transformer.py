@@ -8,21 +8,18 @@ import torch.nn.functional as F
 from mmgp import offload
 
 from shared.attention import pay_attention
-from shared.llm_engines.nanovllm.models.qwen3 import Qwen3ForCausalLM
-from shared.llm_engines.nanovllm.layers.attention import Attention as PagedAttention
-from shared.llm_engines.nanovllm.layers.layernorm import RMSNorm as EngineRMSNorm
-from shared.llm_engines.nanovllm.layers.activation import SiluAndMul
-from shared.llm_engines.nanovllm.vllm_support import probe_vllm_runtime
-from shared.llm_engines.nanovllm.utils.context import get_context, set_context
+from shared.llm_engines.lmgp.models.qwen3 import Qwen3ForCausalLM
+from shared.llm_engines.lmgp.vllm_support import configure_engine_kernels
+from shared.llm_engines.lmgp.utils.context import get_context, set_context
 
 from .modules import Attention, AudioPositionEmbedding, MLP, RMSNorm, RotaryEmbedding, TimestepEmbedder
 
 
-def attend(q, k, v, engine, causal=False):
+def attend(q, k, v, flash, causal=False):
     groups = q.shape[-2] // k.shape[-2]
     if groups != 1:
         k, v = k.repeat_interleave(groups, dim=-2), v.repeat_interleave(groups, dim=-2)
-    return pay_attention([q, k, v], causal=causal, force_attention="flash" if engine == "vllm" else "sdpa")
+    return pay_attention([q, k, v], causal=causal, force_attention="flash" if flash else "sdpa")
 
 
 class YuE2AR(Qwen3ForCausalLM):
@@ -31,53 +28,41 @@ class YuE2AR(Qwen3ForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.engine = "legacy"
+        self.features = None  # LMFeatures, set by configure_engine
         self.abort_fn = lambda: False
 
-    def configure_engine(self, engine, abort_fn):
-        if engine == "vllm" and not probe_vllm_runtime()["supported"]:
-            raise RuntimeError("YuE2 vllm mode requires Triton and FlashAttention 2")
-        self.engine, self.abort_fn = engine, abort_fn
-        self.config._prompt_enhancer_safe_legacy = engine != "vllm"
-        for module in self.modules():
-            if isinstance(module, PagedAttention):
-                if engine != "vllm":
-                    module.flash_attn_varlen_func = module.flash_attn_with_kvcache = None
-                module.use_triton_kv_cache = engine == "vllm"
-            elif isinstance(module, EngineRMSNorm):
-                module.use_triton_rmsnorm = engine == "vllm"
-            elif isinstance(module, SiluAndMul):
-                module.use_triton = engine == "vllm"
+    def configure_engine(self, features, abort_fn):
+        self.features, self.abort_fn = features, abort_fn
+        self.config._prompt_enhancer_safe_legacy = not features.triton
+        configure_engine_kernels(self, features)
+        self._lm_engine_mmgp_graphs = features.graphs  # the engine's decoding passes are MMGP graphs: the AR model may stream its layers
 
     @torch.inference_mode()
     def forward(self, input_ids, positions):
+        context = get_context()
+        if not context.is_prefill:
+            # decoding: the CFG sequences (one token each) as one batch through each layer, the paged attention reading each sequence's
+            # pages; the layers run through cuda_graphs.run_blocks, so that MMGP graphs them whether they are kept in VRAM or streamed
+            return super().forward(input_ids, positions)
         x = self.model.embed_tokens(input_ids)
         residual = None
-        context = get_context()
         branches = []
-        if context.is_prefill:
-            offsets = context.cu_seqlens_q.tolist()
-            key_offsets = context.cu_seqlens_k.tolist()
-            count = len(offsets) - 1
-        else:
-            count = x.shape[0]
-            offsets = range(count + 1)
+        offsets = context.cu_seqlens_q.tolist()
+        key_offsets = context.cu_seqlens_k.tolist()
+        count = len(offsets) - 1
         if count > 1:
             for index in range(count):
                 start, end = offsets[index:index + 2]
                 branch = replace(context, slot_mapping=context.slot_mapping[start:end], block_tables=context.block_tables[index:index + 1] if context.block_tables is not None else None)
-                if context.is_prefill:
-                    branch.cu_seqlens_q = context.cu_seqlens_q[index:index + 2] - start
-                    branch.cu_seqlens_k = context.cu_seqlens_k[index:index + 2] - key_offsets[index]
-                    branch.max_seqlen_q = end - start
-                    branch.max_seqlen_k = key_offsets[index + 1] - key_offsets[index]
-                else:
-                    branch.context_lens = context.context_lens[index:index + 1]
+                branch.cu_seqlens_q = context.cu_seqlens_q[index:index + 2] - start
+                branch.cu_seqlens_k = context.cu_seqlens_k[index:index + 2] - key_offsets[index]
+                branch.max_seqlen_q = end - start
+                branch.max_seqlen_k = key_offsets[index + 1] - key_offsets[index]
                 branches.append((slice(start, end), branch))
         try:
             for layer in self.model.layers:
                 if branches:
-                    # Both CFG paths share the same loaded layer, processed sequentially.
+                    # Both CFG prompts share the same loaded layer, processed sequentially (prefill: their activations are large).
                     outputs, residuals = [], []
                     for span, branch in branches:
                         set_context(**vars(branch))
@@ -107,7 +92,7 @@ class YuE2AR(Qwen3ForCausalLM):
             v = attn.v_proj(h).view(-1, attn.num_kv_heads, attn.head_dim)
             q, k = attn.rotary_emb(positions, q, k)
             cache.append((k, v))
-            h = attend(q[None], k[None], v[None], self.engine, causal=True)
+            h = attend(q[None], k[None], v[None], self.features.flash, causal=True)
             x = x + attn.o_proj(h.flatten(2)[0])
             x = x + layer.mlp(layer.post_attention_layernorm(x))
             if self.abort_fn():
@@ -124,10 +109,10 @@ class AcousticLayer(nn.Module):
         self.nar_mlp = MLP(config)
         self.ffn_chunk_size = config.ffn_chunk_size
 
-    def forward(self, x_list, cache, cos, sin, engine):
+    def forward(self, x_list, cache, cos, sin, flash):
         x = x_list.pop()
         # x remains live only as the residual; normalized activations are consumed.
-        x.add_(self.nar_self_attn([self.nar_input_layernorm([x])], cache, cos, sin, engine))
+        x.add_(self.nar_self_attn([self.nar_input_layernorm([x])], cache, cos, sin, flash))
         # Keep long-song FFN intermediates bounded; each token is independent.
         chunk_size = min(self.ffn_chunk_size, max(1, x.shape[1] * x.shape[2] // self.nar_mlp.gate_proj.out_features))
         for start in range(0, x.shape[1], chunk_size):
@@ -159,7 +144,7 @@ class YuE2Acoustic(nn.Module):
         self.time_embedder = TimestepEmbedder(config.hidden_size)
         self.latent_pos_embed = AudioPositionEmbedding(config.max_latent_frames, config.hidden_size)
         self.rotary = RotaryEmbedding(config.head_dim, config.rope_theta)
-        self.engine = "legacy"
+        self.flash = False  # FlashAttention 2 where supported (set by the pipeline)
         self.abort_fn = lambda: False
 
     def forward(self, state_list, raw_t, cache, cos, sin, position_embedding, hum_features=None):
@@ -175,7 +160,7 @@ class YuE2Acoustic(nn.Module):
                 x.add_(hum_features[index])
             x_list = [x]
             x = None
-            x = layer(x_list, layer_cache, cos, sin, self.engine)
+            x = layer(x_list, layer_cache, cos, sin, self.flash)
             if self.abort_fn():
                 raise InterruptedError("YuE2 acoustic synthesis interrupted")
         x_list = [x]

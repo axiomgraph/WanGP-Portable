@@ -23,8 +23,10 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import TimestepEmbedding
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
+from mmgp import cuda_graphs
 
-from shared.attention import pay_attention
+from shared import attention_kit
+from shared.kernels import ops
 
 
 class MiniMaxMusic3FourierEmbedding(nn.Module):
@@ -51,20 +53,6 @@ class MiniMaxMusic3RotaryEmbedding(nn.Module):
         return freqs.cos().contiguous(), freqs.sin().contiguous()
 
 
-def _apply_partial_rotary_emb(hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-    cos, sin = rotary_emb
-    rotary_dim = cos.shape[-1]
-    cos, sin = cos[:, None, :].to(hidden_states.dtype), sin[:, None, :].to(hidden_states.dtype)
-    rotated = hidden_states[..., :rotary_dim]
-    first, second = rotated.chunk(2, dim=-1)
-    half = first.shape[-1]
-    first_out = first * cos[..., :half] - second * sin[..., :half]
-    second_out = second * cos[..., half:] + first * sin[..., half:]
-    first.copy_(first_out)
-    second.copy_(second_out)
-    return hidden_states
-
-
 class MiniMaxMusic3Attention(nn.Module):
     def __init__(self, dim: int, heads: int, head_dim: int):
         super().__init__()
@@ -76,16 +64,20 @@ class MiniMaxMusic3Attention(nn.Module):
         self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, dim, bias=False), nn.Dropout(0.0)])
 
-    def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
-        query = self.to_q(hidden_states).view(batch_size, seq_len, self.heads, self.head_dim)
-        key = self.to_k(hidden_states).view(batch_size, seq_len, self.heads, self.head_dim)
-        value = self.to_v(hidden_states).view(batch_size, seq_len, self.heads, self.head_dim)
-        query = _apply_partial_rotary_emb(query, rotary_emb)
-        key = _apply_partial_rotary_emb(key, rotary_emb)
-        hidden_states = pay_attention([query, key, value], causal=False, recycle_q=True)
-        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
-        return self.to_out[1](self.to_out[0](hidden_states))
+    def forward(self, x_list: list[torch.Tensor], rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Attention of x (handed off in x_list), (batch, tokens, heads, head_dim), before the output projection. RoPE rotates the
+        first rotary_dim channels of each head (split-half pairs); the other channels pass through."""
+        cos, sin = rotary_emb
+        rotary_dim = 2 * cos.shape[-1]
+        table = torch.stack((cos, sin), dim=-1).unsqueeze(0)  # (1, tokens, 1, pairs, 2) for the fused quantization
+
+        def rope_(query, key, group):
+            for x in (query, key):
+                if x is not None:
+                    ops.paired_rope_(x[..., :rotary_dim], cos, sin)
+
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, rope_,
+                                           fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, None, None, core, settings))
 
 
 class MiniMaxMusic3TransformerBlock(nn.Module):
@@ -98,9 +90,15 @@ class MiniMaxMusic3TransformerBlock(nn.Module):
         self.ff_out = nn.Linear(ff_inner_dim, dim)
 
     def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), rotary_emb)
-        gate_states, gate = self.ff_in(self.norm2(hidden_states)).chunk(2, dim=-1)
-        return hidden_states + self.ff_out(gate_states * torch.nn.functional.silu(gate))
+        """Updates hidden_states in place: the residual adds are the output projections' epilogues where the weight format has them."""
+        attention = [self.attn([self.norm1(hidden_states)], rotary_emb).flatten(2)]
+        ops.linear_residual_(self.attn.to_out[0], attention, hidden_states)
+        # SwiGLU of the rows value | gate in one fc1 GEMM (ops.mlp takes gate | value rows, or a separate up projection that costs more
+        # here); the activation in a new contiguous tensor: a 16-bit ff_out reading a strided view picks a less precise GEMM
+        value, gate = self.ff_in(self.norm2(hidden_states)).chunk(2, dim=-1)
+        activation = [ops.swiglu([gate, value], packed=False, in_place=False)]
+        del value, gate
+        return ops.linear_residual_(self.ff_out, activation, hidden_states)
 
 
 class MiniMaxMusic3Transformer1DModel(ModelMixin, ConfigMixin):
@@ -154,11 +152,13 @@ class MiniMaxMusic3Transformer1DModel(ModelMixin, ConfigMixin):
         temb = self.time_embed(self.time_proj(timestep))
         hidden_states = self.proj_in(hidden_states)
         hidden_states = torch.cat((temb.unsqueeze(1), hidden_states), dim=1)
-        rotary_emb = self.rotary_emb(hidden_states.shape[1], hidden_states.device)
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_emb)
-            if self._interrupt_check is not None and self._interrupt_check():
-                raise InterruptedError("MiniMax Music 3 generation interrupted")
+        # half of each split-half table (its two halves are equal), in the activation dtype, once per call
+        rotary_emb = tuple(table[:, None, :table.shape[-1] // 2].to(hidden_states.dtype) for table in self.rotary_emb(hidden_states.shape[1], hidden_states.device))
+        with cuda_graphs.scope():  # the blocks replay CUDA graphs in the CUDA Graph mode (model def cuda_graphs)
+            for block in self.transformer_blocks:
+                hidden_states = block(hidden_states, rotary_emb)
+                if self._interrupt_check is not None and self._interrupt_check():
+                    raise InterruptedError("MiniMax Music 3 generation interrupted")
         hidden_states = self.proj_out(hidden_states[:, 1:]).transpose(1, 2)
         hidden_states = self.postprocess_conv(hidden_states) + hidden_states
         if not return_dict:

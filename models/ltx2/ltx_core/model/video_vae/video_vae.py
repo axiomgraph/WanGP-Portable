@@ -977,7 +977,7 @@ def encode_video(
                     mask = latent.new_ones(latent.shape[3:])
                     for axis, view in ((3, (-1, 1)), (4, (1, -1))):
                         if tile.masks_1d[axis] is not None:
-                            mask *= tile.masks_1d[axis].view(view).to(mask.dtype)
+                            mask *= tile.masks_1d[axis].view(view).to(device=mask.device, dtype=mask.dtype)
                     weights[tile.out_coords[3], tile.out_coords[4]] += mask
                 output[:, :, index - count : index, tile.out_coords[3], tile.out_coords[4]] += latent * mask
     return output if weights is None else output / weights.clamp_min(1e-6)

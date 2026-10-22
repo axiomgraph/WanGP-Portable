@@ -17,13 +17,16 @@ try:
 except:
     BLOCK_ATTN_AVAILABLE = False
 
-from .attention_backend import sparse_attention
+from .attention_backend import sparse_attention, staged_sparge_available
+from shared import attention_kit
+from shared.kernels import ops as kernels
 from shared.attention import get_supported_attention_modes, pay_attention
 from mmgp import offload
 from PIL import Image
 import numpy as np
 
 USE_BLOCK_ATTN = False
+STAGED_SPARGE = os.environ.get("WGP_FLASHVSR_STAGED", "1") != "0"  # debug comparison switch: 0 runs the SpargeAttn backend on whole q/k/v
 _FLASHVSR_ATTENTION_MODE = None
 
 
@@ -176,26 +179,11 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
 
 
 @torch.no_grad()
-def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
-                                      qk_list, topk=10, local_attn_mask=None):
-    assert batch_size == 1, "Only batch_size=1 supported for now"
-    assert local_attn_mask is not None, "local_attn_mask must be provided"
-    
-    q_w, k_w = qk_list
-    qk_list.clear()
-    avgpool_q = torch.mean(q_w, dim=1) 
-    del q_w
-    avgpool_q = rearrange(avgpool_q, 's (h d) -> s h d', h=nheads)
-    q_heads = avgpool_q.permute(1, 0, 2)
-    D = avgpool_q.shape[-1]
-    
-    k_w_split = k_w.view(k_w.shape[0], 2, 64, k_w.shape[2])
-    avgpool_k_split = torch.mean(k_w_split, dim=2)
-    del k_w, k_w_split
-    avgpool_k_refined = rearrange(avgpool_k_split, 's two d -> (s two) d', two=2) # shape: (s*2, C)
-    avgpool_k_refined = rearrange(avgpool_k_refined, 's (h d) -> s h d', h=nheads) # shape: (s*2, h, d)
-    k_heads_doubled = avgpool_k_refined.permute(1, 0, 2) # shape: (h, s*2, d)
-    
+def _draft_block_mask(q_heads, k_heads_doubled, seqlen, topk, local_attn_mask, groups=None):
+    """Block map (1, heads, query windows, key half-windows) int8 of the window-pooled q_heads (heads, windows, d) against the
+    half-window-pooled k_heads_doubled (heads, 2 x key windows, d): local windows only, the top-k entries of every temporal slab
+    (one slab per temporal window, or `groups` slabs of several windows: FlashVSR+ ranks its budget over a 2-window chunk)."""
+    nheads, D = q_heads.shape[0], q_heads.shape[-1]
     k_heads_1, k_heads_2 = torch.chunk(k_heads_doubled, 2, dim=1)
     scores_1 = torch.einsum("hld,hmd->hlm", q_heads, k_heads_1)
     scores_1.mul_(1 / math.sqrt(D))
@@ -214,17 +202,58 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 
     attn_map = torch.softmax(scores, dim=-1)
     del scores
-    attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen)
+    attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen if groups is None else groups)
     loop_num, s1, s2 = attn_map.shape
     flat = attn_map.reshape(loop_num, -1)
     apply_topk = min(flat.shape[1]-1, topk)
 
     mask_new = _topk_threshold_mask(flat, apply_topk)
     del flat, attn_map
-    mask_new = mask_new.reshape(loop_num, s1, s2)
-    mask_new = mask_new.reshape(nheads, seqlen * s1, s2)
+    mask_new = mask_new.reshape(nheads, -1, s2)
     mask_new = mask_new.to(torch.int8)
     return mask_new.unsqueeze(0)
+
+
+@torch.no_grad()
+def structural_block_candidates(block_h, block_w, seqlen, cached_windows, local_range, device=None):
+    """The candidate relation of a local attention layer (FlashVSR+ hybrid attention): every key window of the cached and current
+    temporal windows within the local_range x local_range neighborhood ("normal slide", no clamping at the borders) of each query
+    window. Returns the (query windows, key windows) bool map, its candidate count and its entry count (upstream's window-level
+    top-k budget applies to the entries of the whole chunk)."""
+    local = build_local_block_mask_shifted_vec_normal_slide(block_h, block_w, local_range, local_range, include_self=True, device=device)
+    key_windows = cached_windows + seqlen
+    candidates = local.repeat(seqlen, key_windows)
+    return candidates, int(local.sum().item()) * seqlen * key_windows, candidates.numel()
+
+
+@torch.no_grad()
+def structural_block_mask(block_h, block_w, seqlen, cached_windows, local_range, nheads, device):
+    """The int8 block map (1, heads, query windows, key half-windows) of structural_block_candidates, the layout the sparse kernels
+    consume (two 64-token key blocks per window), the same for every head."""
+    candidates, _, _ = structural_block_candidates(block_h, block_w, seqlen, cached_windows, local_range, device)
+    return candidates.repeat_interleave(2, dim=1).to(torch.int8).unsqueeze(0).expand(nheads, -1, -1).contiguous().unsqueeze(0)
+
+
+@torch.no_grad()
+def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
+                                      qk_list, topk=10, local_attn_mask=None, groups=None):
+    assert batch_size == 1, "Only batch_size=1 supported for now"
+    assert local_attn_mask is not None, "local_attn_mask must be provided"
+
+    q_w, k_w = qk_list
+    qk_list.clear()
+    avgpool_q = torch.mean(q_w, dim=1)
+    del q_w
+    avgpool_q = rearrange(avgpool_q, 's (h d) -> s h d', h=nheads)
+    q_heads = avgpool_q.permute(1, 0, 2)
+
+    k_w_split = k_w.view(k_w.shape[0], 2, 64, k_w.shape[2])
+    avgpool_k_split = torch.mean(k_w_split, dim=2)
+    del k_w, k_w_split
+    avgpool_k_refined = rearrange(avgpool_k_split, 's two d -> (s two) d', two=2) # shape: (s*2, C)
+    avgpool_k_refined = rearrange(avgpool_k_refined, 's (h d) -> s h d', h=nheads) # shape: (s*2, h, d)
+    k_heads_doubled = avgpool_k_refined.permute(1, 0, 2) # shape: (h, s*2, d)
+    return _draft_block_mask(q_heads, k_heads_doubled, seqlen, topk, local_attn_mask, groups=groups)
 
 
 # ----------------------------
@@ -399,7 +428,9 @@ class SelfAttention(nn.Module):
     def forward(self, x, freqs, f=None, h=None, w=None, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, pre_cache_refs=None, local_range = 9, cache_next=True,
-                allow_short_start=False):
+                allow_short_start=False, topk_groups=None, block_mask=None):
+        """topk_groups: top-k slabs per chunk (None: one per temporal window). block_mask: a structural (1, heads, query windows, key
+        half-windows) int8 map that replaces the draft top-k (FlashVSR+ local layers)."""
         if isinstance(x, list):
             x_ref = x
             x = x_ref[0]
@@ -407,15 +438,18 @@ class SelfAttention(nn.Module):
         if pre_cache_refs is not None:
             pre_cache_k, pre_cache_v = pre_cache_refs
         B, L, D = x.shape
-        if is_stream and pre_cache_k is not None and pre_cache_v is not None:
-            assert f==2, "f must be 2"
-        if is_stream and (pre_cache_k is None or pre_cache_v is None):
-            assert f==6 or (allow_short_start and f==2), " start f must be 6"
+        win = (2, 8, 8)
+        assert f % win[0] == 0, "stream chunks hold whole temporal windows"
         assert L == f * h * w, "Sequence length mismatch with provided (f,h,w)."
 
-        win = (2, 8, 8)
         x_w = WindowPartition3D.partition([x.view(B, f, h, w, D)], win)
         x = None
+        if block_mask is None:
+            self._local_mask(h, w, local_range, x_w.device)
+        if STAGED_SPARGE and staged_sparge_available():
+            x_list = [x_w]
+            x_w = None
+            return self._forward_staged(x_list, freqs, f, h, w, win, B, topk, is_stream, pre_cache_k, pre_cache_v, pre_cache_refs, kv_len, cache_next, topk_groups, block_mask)
 
         v_w = self.v(x_w)
 
@@ -461,21 +495,17 @@ class SelfAttention(nn.Module):
 
         del v_w
 
-        window_size = win[0]*h*w//128
-
-        if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
-            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
-            self.local_attn_mask_h = h//8
-            self.local_attn_mask_w = w//8
-            self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+        if block_mask is not None:  # structural map: no pooled scores, no top-k
+            q_w = k_w = None
+            attention_mask = block_mask
+        elif USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
             qk_list = [q_w, k_w]
             q_w = k_w = None
             attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, qk_list, topk=topk, local_attn_mask=self.local_attn_mask)
         else:
             qk_list = [q_w, k_w]
             q_w = k_w = None
-            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, qk_list, topk=topk, local_attn_mask=self.local_attn_mask)
+            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, qk_list, topk=topk, local_attn_mask=self.local_attn_mask, groups=topk_groups)
         qkv_list = [reorder_q, reorder_k, reorder_v]
         attention_mask_list = [attention_mask]
         del reorder_q, reorder_k, reorder_v, attention_mask
@@ -486,6 +516,92 @@ class SelfAttention(nn.Module):
         x = x.view(B, f*h*w, D)
 
         if is_stream:
+            return self.o(x), cache_k, cache_v
+        return self.o(x)
+
+    def _local_mask(self, h, w, local_range, device):
+        if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
+            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=device)
+            self.local_attn_mask_h = h//8
+            self.local_attn_mask_w = w//8
+            self.local_range = local_range
+
+    def _forward_staged(self, x_list, freqs, f, h, w, win, B, topk, is_stream, pre_cache_k, pre_cache_v, pre_cache_refs, kv_len, cache_next, topk_groups=None, structural_mask=None):
+        """The attention through the attention kit: q, k and v projected by head groups from one prepared input (the windows handed
+        off in x_list), each quantized for the SpargeAttn block-sparse kernel as soon as it is ready (k before q is projected), the
+        block map, the window RoPE and the stream cache slices computed per group. Same math as the whole-tensor path: RMS norm over
+        all heads, windowed RoPE, window-pooled block map (or the head slice of a structural map)."""
+        assert B == 1, "Only batch_size=1 supported for now"
+        heads, head_dim, D = self.num_heads, self.head_dim, self.dim
+        block_s = win[0] * win[1] * win[2]
+        x_w = x_list[0]
+        x_list.clear()
+        block_n = x_w.shape[0] // B
+        seqlen = f // win[0]
+        one_len = block_n // seqlen
+        prefix = None
+        if pre_cache_k is not None and pre_cache_v is not None:
+            prefix = (pre_cache_k.view(B, -1, heads, head_dim), pre_cache_v.view(B, -1, heads, head_dim))
+            if pre_cache_refs is not None:
+                pre_cache_refs[0] = pre_cache_refs[1] = None
+            pre_cache_k = pre_cache_v = None
+        new_tokens = block_n * block_s
+        block_n_kv = block_n + (0 if prefix is None else prefix[0].shape[1] // block_s)
+        cache_k = cache_v = None
+        if is_stream and cache_next:  # the last cache_blocks windows of the (prefixed) k and v, copied to the CPU per head group
+            cache_blocks = min(block_n_kv, one_len * max(1, int(kv_len)))
+            cache_tokens = cache_blocks * block_s
+            from_prefix = max(0, cache_tokens - new_tokens)
+            cache_k = torch.empty((B, cache_tokens, heads, head_dim), dtype=x_w.dtype, device="cpu")
+            cache_v = torch.empty((B, cache_tokens, heads, head_dim), dtype=x_w.dtype, device="cpu")
+            if from_prefix:
+                cache_k[:, :from_prefix].copy_(prefix[0][:, -from_prefix:])
+                cache_v[:, :from_prefix].copy_(prefix[1][:, -from_prefix:])
+            cached_new = cache_tokens - from_prefix
+        norms = (self.norm_q, self.norm_k)
+
+        def norm_rope(query, key, group):
+            for which, tensor in enumerate((query, key)):
+                if tensor is None:
+                    continue
+                norm = norms[which]
+                if group.mean_squares is None:  # all heads: the row's mean square from the tensor itself
+                    inv_rms = torch.linalg.vector_norm(tensor, ord=2, dim=(-2, -1), keepdim=True, dtype=torch.float32)
+                    inv_rms.pow_(2).div_(D).add_(norm.eps).rsqrt_()
+                else:
+                    inv_rms = group.mean_squares[which].add(norm.eps).rsqrt_().unsqueeze(-1)
+                tensor.mul_(inv_rms.to(dtype=tensor.dtype))
+                tensor.mul_(norm.weight.view(heads, head_dim)[group.q].to(dtype=tensor.dtype))
+                rope_apply_windowed([tensor.view(B * block_n, block_s, -1)], freqs, len(group.q), f, h, w, win, B)
+            if key is not None and cache_k is not None:
+                cache_k[:, from_prefix:, group.kv.start:group.kv.stop].copy_(key[:, -cached_new:])
+
+        def norm_v(value, group):
+            if cache_v is not None:
+                cache_v[:, from_prefix:, group.kv.start:group.kv.stop].copy_(value[:, -cached_new:])
+
+        pooled = {}
+
+        def block_mask(query, key, group):  # the key (with its prefix) comes first and is pooled per half window, then the query
+            if structural_mask is not None:
+                return None if query is None else structural_mask[:, group.q].contiguous()
+            if key is not None:
+                pooled["k"] = key.view(B * block_n_kv, 2, block_s // 2, -1, head_dim).mean(dim=2).permute(2, 0, 1, 3).reshape(len(group.kv), -1, head_dim)
+            if query is None:
+                return None
+            q_heads = query.view(B * block_n, block_s, -1, head_dim).mean(dim=1).permute(1, 0, 2)
+            return _draft_block_mask(q_heads, pooled.pop("k"), seqlen, topk, self.local_attn_mask, groups=topk_groups)
+
+        x_list = [x_w.view(B, new_tokens, D)]
+        x_w = None
+        x = attention_kit.qkv_attention(x_list, self.q, self.k, self.v, heads, head_dim, norm_rope, norm_spans_heads=True,
+                                        kv_prefix=prefix, attention_mask=block_mask, force_attention="sparge", norm_v=norm_v)
+        prefix = None
+        x = WindowPartition3D.reverse([x.view(B * block_n, block_s, D)], win, (f, h, w)).view(B, f * h * w, D)
+        if is_stream:
+            if cache_k is not None:
+                cache_k = cache_k.view(B * cache_blocks, block_s, D)
+                cache_v = cache_v.view(B * cache_blocks, block_s, D)
             return self.o(x), cache_k, cache_v
         return self.o(x)
 
@@ -569,21 +685,14 @@ class DiTBlock(nn.Module):
         self.gate = GateModule()
 
     def forward_ffn(self, x: torch.Tensor) -> torch.Tensor:
+        """Training: the FFN by chunks of tokens * dim / ffn_dim tokens (inference uses the shared chunked kernels.mlp)."""
         chunk_size = max(1, min(x.shape[1], int(x.shape[1] * self.dim / self.ffn_dim)))
-        if chunk_size >= x.shape[1]:
-            return self.ffn(x)
-        if self.training:
-            return torch.cat([self.ffn(chunk) for chunk in x.split(chunk_size, dim=1)], dim=1)
-        out = torch.empty_like(x)
-        for start in range(0, x.shape[1], chunk_size):
-            end = min(start + chunk_size, x.shape[1])
-            out[:, start:end] = self.ffn(x[:, start:end])
-        return out
+        return self.ffn(x) if chunk_size >= x.shape[1] else torch.cat([self.ffn(chunk) for chunk in x.split(chunk_size, dim=1)], dim=1)
 
     def forward(self, x, context, t_mod, freqs, f, h, w, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, pre_cache_refs=None, local_range = 9, cache_next=True,
-                allow_short_start=False):
+                allow_short_start=False, topk_groups=None, block_mask=None):
         if isinstance(x, list):
             x_ref = x
             x = x_ref[0]
@@ -591,13 +700,13 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x_list = [input_x] 
+        x_list = [input_x]
         input_x = None
         self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
             x_list , freqs, f, h, w, local_num, topk, train_img, block_id,
             kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
             pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, pre_cache_refs=pre_cache_refs, local_range = local_range, cache_next=cache_next,
-            allow_short_start=allow_short_start)
+            allow_short_start=allow_short_start, topk_groups=topk_groups, block_mask=block_mask)
 
         x = self.gate(x, gate_msa, self_attn_output)
         del self_attn_output
@@ -605,11 +714,11 @@ class DiTBlock(nn.Module):
         cross = self.cross_attn([cross_input], context, is_stream=is_stream)
         x.add_(cross)
         del cross, cross_input
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        ffn_out = self.forward_ffn(input_x)
-        del input_x
-        x = self.gate(x, gate_mlp, ffn_out)
-        del ffn_out
+        x_list = [modulate(self.norm2(x), shift_mlp, scale_mlp)]
+        if self.training:
+            x = self.gate(x, gate_mlp, self.forward_ffn(x_list.pop()))
+        else:  # the FFN by chunks, its gated output added to x
+            kernels.mlp(x_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(gate_mlp, x.shape[0], x.shape[1]))
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

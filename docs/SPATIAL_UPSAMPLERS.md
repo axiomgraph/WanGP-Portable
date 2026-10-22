@@ -292,7 +292,10 @@ tiles, text-encoder layers and VAE tiles with their units.
 
 Model persistence is a registry-wide setting stored at
 `wgp_config["spatial_upsamplers"]["persistence"]`; handlers must not expose a
-separate persistence control in their own config section. The registry retains
+separate persistence control in their own config section. *Auto* (the default
+of new installations) keeps models loaded with memory profile 0 and the VRAM
+Preload of the current model, applied through the `init_pipe` WanGP passes to
+handlers. The registry retains
 at most one spatial upsampler handler. When dispatch changes handlers, it fully
 releases the previous handler before loading the new one. A handler remains
 responsible for releasing incompatible variants that share that handler, such as

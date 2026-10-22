@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from postprocessing import spatial_upsamplers as spatial_api
 from postprocessing import temporal_upsamplers as api
-from .runtime import dlssg_capabilities, frame_generate, is_rtx_50_series, release_flow_model, unavailable_reason
+from .runtime import DLSSG_LINUX, dlssg_capabilities, frame_generate, is_rtx_50_series, release_flow_model, unavailable_reason
 from .spatial_upsampler import DLSS5SpatialUpsampler
 
 
@@ -29,7 +29,7 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
         capabilities = dlssg_capabilities() if not reason else {}
         worker_version = int(capabilities.get("worker_version", 0))
         maximum = int(capabilities.get("multi_frame_count_max", 1))
-        hardware_limit = 6 if is_rtx_50_series() else 4
+        hardware_limit = 2 if DLSSG_LINUX else (6 if is_rtx_50_series() else 4)
         multipliers = tuple(scale for scale in self.MULTIPLIERS if scale <= min(4, hardware_limit))
         if capabilities:
             multipliers = tuple(scale for scale in self.MULTIPLIERS if scale <= hardware_limit and scale - 1 <= maximum) if worker_version >= 2 else (2.0,)
@@ -46,7 +46,7 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             "methods": [(label, self.METHOD)],
             "multipliers": {self.METHOD: multipliers},
             "default_temporal_upsampling": "dlssg*2",
-            "description": "NVIDIA DLSS Frame Generation using video motion estimation. It provides x2-x4 interpolation and capability-gated x5/x6 on RTX 50 series. Requires Windows 11, HAGS, and GeForce RTX 40 or newer.",
+            "description": "NVIDIA DLSS Frame Generation using video motion estimation. Linux supports experimental x2 with the NVIDIA Vulkan driver and a compatible RTX GPU. Windows supports x2-x4 and capability-gated x5/x6 on RTX 50 series, and requires Windows 11, HAGS, and RTX 40 or newer.",
         }
 
     def validate_upsampling(self, temporal_upsampling, *, source_is_image=False):
@@ -55,6 +55,8 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             return f"Unknown DLSS Frame Generation mode: {temporal_upsampling}"
         if source_is_image:
             return "Temporal Upsampling can not be used with an Image"
+        if DLSSG_LINUX and split[1] != 2:
+            return "Linux DLSS Frame Generation currently supports x2 only."
         reason = unavailable_reason(temporal=True)
         if reason:
             return f"DLSS Frame Generation is unavailable: {reason}. See docs/DLSS5.md."

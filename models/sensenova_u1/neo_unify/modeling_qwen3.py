@@ -563,7 +563,13 @@ class Qwen3Attention(nn.Module):
             if tensor is not None:
                 attention_kit.rows_(tensor, lambda part, first, last: _norm_rope_rows(part, norm_t, norm_hw, cos[:, first:last], sin[:, first:last], partner))
 
-    def _forward_gen_kit(self, hidden_states_list, indexes, kv_prefix, rope):
+    def _o_proj_gen(self, attn_output_list, residual):
+        """o_proj_mot_gen of the handed-off attention output, or added into residual (returned) when given."""
+        if residual is None:
+            return _linear_disposable(self.o_proj_mot_gen, attn_output_list)
+        return ops.linear_residual_(self.o_proj_mot_gen, attn_output_list, residual)
+
+    def _forward_gen_kit(self, hidden_states_list, indexes, kv_prefix, rope, residual):
         """forward_gen without mask: the current tokens attend to the cached prefix kv_prefix and themselves through attention_kit;
         rope: the step's gen_rope_tables, computed here when not given."""
         if rope is None:
@@ -576,7 +582,7 @@ class Qwen3Attention(nn.Module):
                                                   kv_heads=self.config.num_key_value_heads, kv_prefix=kv_prefix)
         attn_output_list = [attn_output.flatten(2)]
         del attn_output, kv_prefix
-        return _linear_disposable(self.o_proj_mot_gen, attn_output_list)
+        return self._o_proj_gen(attn_output_list, residual)
 
     def forward_gen(
         self,
@@ -585,12 +591,14 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        residual: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """residual given: the output projection is added into it (returned in place of the attention output)."""
         update_cache = kwargs.get("update_cache", True)
         if attention_mask is None and (past_key_values is None or not update_cache):
             kv_prefix = kwargs["kv_prefix"] if "kv_prefix" in kwargs else _cached_prefix(past_key_values, self.layer_idx)
-            return self._forward_gen_kit(hidden_states_list, indexes, kv_prefix, kwargs.get("rope")), None
+            return self._forward_gen_kit(hidden_states_list, indexes, kv_prefix, kwargs.get("rope"), residual), None
         hidden_states = _take_tensor(hidden_states_list)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -678,8 +686,7 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output_list = [attn_output]
         del attn_output
-        attn_output = _linear_disposable(self.o_proj_mot_gen, attn_output_list)
-        return attn_output, attn_weights
+        return self._o_proj_gen(attn_output_list, residual), attn_weights
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -905,7 +912,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm_mot_gen(residual)
         hidden_states_list = [hidden_states]
         del hidden_states
-        # Self Attention
+        # Self Attention, its output projection added into the residual
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states_list,
             image_gen_indicators=image_gen_indicators,
@@ -917,18 +924,14 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            residual=residual,
             **kwargs,
         )
-        hidden_states = residual.add_(hidden_states)
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
-        hidden_states_list = [hidden_states]
-        del hidden_states
-        hidden_states = self.mlp_mot_gen(hidden_states_list)
-        hidden_states = residual.add_(hidden_states)
-        return hidden_states
+        # Fully Connected, by chunks of tokens added into the residual (hidden_act silu)
+        hidden_states_list = [self.post_attention_layernorm_mot_gen(hidden_states)]
+        mlp = self.mlp_mot_gen
+        return ops.mlp(hidden_states_list, mlp.gate_proj, mlp.down_proj, "swiglu", up=mlp.up_proj, residual=hidden_states)
 
     def forward_gen_branches(self, hidden_states, branches):
         outputs = []

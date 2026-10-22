@@ -18,8 +18,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoProcessor
 
 from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io, media_descriptor
-from shared.llm_engines.nanovllm.models.qwen3_5 import Qwen3_5DynamicCache
-from shared.llm_engines.nanovllm.utils.context import reset_context
+from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5DynamicCache
+from shared.llm_engines.lmgp.utils.context import reset_context
 from shared.qtypes.gguf import materialize_module_source_tensors
 from shared.utils import files_locator as fl
 from shared.utils.cancellation import cancellation_context, check_cancelled
@@ -885,7 +885,7 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
     engine = qwen35_text_mod._get_or_create_vllm_engine(text_model, usage_mode="text")
     for request in prepared:
         if request is not None:
-            engine.reserve_runtime(prompt_len=len(request[0]), max_tokens=request[4], cfg_scale=1.0)
+            engine.reserve_runtime(prompt_len=len(request[0]), max_tokens=request[4], cfg_scale=1.0, min_model_len=qwen35_text_mod.QWEN35_PROMPT_MIN_MODEL_LEN)
     for index, request in enumerate(prepared):
         check_cancelled()
         if request is None:

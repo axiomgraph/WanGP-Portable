@@ -21,10 +21,13 @@ transfer. Large outputs can reuse their warmup storage at the corresponding capt
 without that output plan. These plans add no replay-time mapping or synchronization, and do not participate in ordinary, non-graph
 allocation.
 
-Contract of a block call in a scope: the block reads only its weights, its tensor arguments (in lists, tuples, dicts and dataclasses)
-and tensors it creates; its effects are its outputs and in-place updates of its tensor arguments (Python side effects are not replayed,
-and the capture runs the Python of the block once more); no synchronization or CPU round trip. The capture checks the reads and raises
-an error naming any other tensor.
+Contract of a block call in a scope: the block reads only its weights, its tensor arguments (in lists, tuples, dicts and dataclasses),
+the state registered for its model (register_state) and tensors it creates; its effects are its outputs and in-place updates of its
+tensor arguments or of that state (Python side effects are not replayed, and the capture runs the Python of the block once more); no
+synchronization or CPU round trip. The capture checks the reads and raises an error naming any other tensor.
+
+A model's own loop over a tower (run_blocks) replays each run of consecutive blocks kept in VRAM as one graph, while the blocks streamed
+in between go through the hooks that transfer them.
 """
 import contextlib
 import dataclasses
@@ -34,6 +37,7 @@ import traceback
 import weakref
 
 import torch
+from tqdm import tqdm
 from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 from . import runtime
@@ -81,14 +85,15 @@ def _guard_triton_autotune():
 
 
 @contextlib.contextmanager
-def scope(enabled=True):
-    """Block calls in this scope use CUDA graphs when the mode is on for their model (a no-op otherwise)."""
+def scope(enabled=True, gated=True):
+    """Block calls in this scope use CUDA graphs when the mode is on for their model (a no-op otherwise). gated=False: the registered
+    gates do not apply (blocks that never use what they check, e.g. an LLM with its own attention kernels)."""
     global _depth, _blocked
     if enabled and _depth == 0:
-        _blocked = next((reason for reason in (gate() for gate in _gates) if reason), None)
+        _blocked = next((reason for reason in (gate() for gate in _gates) if reason), None) if gated else None
         if _blocked is not None and _blocked not in _reported:
             _reported.add(_blocked)
-            print(f"[MMGP] CUDA graphs are off: {_blocked}.")
+            tqdm.write(f"[MMGP] CUDA graphs are off: {_blocked}.")
     _depth += bool(enabled)
     try:
         yield
@@ -154,6 +159,89 @@ def pooled(owner, fn, *args, **kwargs):
     return graphs.pooled(fn, args, kwargs)
 
 
+def register_state(owner, name, tensors, holders=()):
+    """Tensors that the graphs of owner's model read or update in place besides its weights and arguments (caches, recurrent states,
+    buffers its loop fills before each call), at fixed addresses until release_state: never copied, whatever the allocator, and allowed
+    by the read check. holders: objects holding these tensors that blocks take as arguments (e.g. a transformers StaticCache passed to
+    every layer), keyed by their identity and passed as they are. A new registration under the same name replaces the previous one and
+    drops the model's graphs."""
+    graphs = _graphs(owner)
+    if graphs is None:
+        return
+    if _recording:
+        raise RuntimeError("CUDA graph state must be registered before its graphs are prepared or captured")
+    tensors = tuple(t for t in tensors if type(t) is torch.Tensor and t.is_cuda)  # plain tensors: subclasses (weights) are not state
+    holders = tuple(holders)
+    previous, previous_holders = graphs.state.get(name), graphs.holders.get(name, ())
+    if (previous is not None and len(previous) == len(tensors) and all(a is b for a, b in zip(previous, tensors))
+            and len(previous_holders) == len(holders) and all(a is b for a, b in zip(previous_holders, holders))):
+        return
+    if previous is not None:
+        graphs.clear()
+    graphs.state[name], graphs.holders[name] = tensors, holders
+    graphs.state_ids = {id(t) for state in graphs.state.values() for t in state}
+    graphs.holder_ids = {id(h) for state in graphs.holders.values() for h in state}
+
+
+def release_state(owner, name=None):
+    """Forgets the state registered under name (all of owner's when None) and drops the graphs of its model, which read it."""
+    graphs = _graphs(owner)
+    if graphs is None or not graphs.state:
+        return
+    if name is None:
+        graphs.state.clear()
+        graphs.holders.clear()
+    elif graphs.state.pop(name, None) is None:
+        return
+    graphs.holders.pop(name, None)
+    graphs.state_ids = {id(t) for state in graphs.state.values() for t in state}
+    graphs.holder_ids = {id(h) for state in graphs.holders.values() for h in state}
+    graphs.clear()
+
+
+def run_blocks(owner, blocks, step, carry, *shared):
+    """Runs the blocks of a tower of owner's model (a ModuleList) in order, carry = step(index, block, carry, *shared), and returns the last
+    carry: a list of tensors that each step takes over (it may empty it to free them early) and returns anew. Inside scope(), each run of
+    consecutive blocks kept in VRAM is one graph, the others go through MMGP's hooks (transfers, block graphs); the first block of a tower
+    whose automatic preload starts its cycles there runs through its hooks. The step of a run follows the contract of a block call (no
+    Python side effect)."""
+    graphs = _graphs(owner) if _depth and not _recording else None
+    if graphs is None or _blocked is not None or graphs.disabled is not None or not graphs.ready():
+        for index, block in enumerate(blocks):
+            carry = step(index, block, carry, *shared)
+        return carry
+    index, runs, current = 0, runtime.resident_runs(owner, blocks), True
+    while index < len(blocks):
+        _, stop, resident = next(run for run in runs if run[0] <= index < run[1])
+        if resident and stop - index > 1 and not current:
+            # The hooks of the blocks run since may have changed the preload plan or released blocks under memory pressure: a span is
+            # chosen from the residency after them, once per span rather than once per block
+            runs, current = runtime.resident_runs(owner, blocks), True
+            continue
+        if resident and stop - index > 1:
+            span = graphs.span(blocks, index, stop, step, runs)
+            carry = graphs.call(span, span.forward, (carry, shared), {})
+            index = stop
+        else:
+            carry = step(index, blocks[index], carry, *shared)
+            index, current = index + 1, False
+    return carry
+
+
+class _Span(torch.nn.Module):
+    """Consecutive blocks of a tower kept in VRAM: one graph stage of run_blocks, keyed and read-checked by their weights."""
+
+    def __init__(self, blocks, start, stop, step, max_keys):
+        super().__init__()
+        self.blocks, self.start, self._mm_graph_keys = torch.nn.ModuleList(list(blocks)[start:stop]), start, max_keys
+        self.__dict__["step"] = step  # a bound method of the model: not one of its modules
+
+    def forward(self, carry, shared):
+        for offset, block in enumerate(self.blocks):
+            carry = self.step(self.start + offset, block, carry, *shared)
+        return carry
+
+
 def register_key(provider):
     """provider() -> hashable: a global state that changes what blocks compute (attention mode, kernel options), part of every key."""
     if provider not in _key_providers:
@@ -202,10 +290,28 @@ def _capture_stream(device):
     stream = _capture_streams.get(device, None)
     if stream is None:
         stream = _capture_streams[device] = torch.cuda.Stream(device)
-    _prepare_blas_stream(stream)
     for setup in _capture_setups:
         setup(stream)
     return stream
+
+
+_BLAS_OPS = {getattr(torch.ops.aten, name) for name in ("mm", "addmm", "bmm", "baddbmm", "addbmm", "mv", "addmv", "dot", "vdot", "_addmm_activation", "_int_mm",
+                                                         "_scaled_mm", "_scaled_mm_v2", "_grouped_mm") if hasattr(torch.ops.aten, name)}
+
+
+class _BlasUse(TorchDispatchMode):
+    """The eager warmup of a graph: its first cuBLAS operation prepares the stream's cuBLAS workspaces outside the graph pool, and the capture
+    stream gets them only then. A model computing without cuBLAS (e.g. with its own kernels) keeps no workspace for the capture stream."""
+
+    def __init__(self):
+        super().__init__()
+        self.used = False
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if not self.used and func.overloadpacket in _BLAS_OPS:
+            self.used = True
+            _prepare_blas_stream(torch.cuda.current_stream())
+        return func(*args, **(kwargs or {}))
 
 
 def invalidate():
@@ -259,7 +365,7 @@ def _flatten(tree):
             _register_dataclass(cls)
 
 
-def _signature(leaves):
+def _signature(leaves, holders=frozenset()):
     signature = []
     for leaf in leaves:
         if isinstance(leaf, torch.Tensor):
@@ -268,6 +374,8 @@ def _signature(leaves):
             signature.append(leaf)
         elif isinstance(leaf, slice):
             signature.append(("slice", leaf.start, leaf.stop, leaf.step))
+        elif id(leaf) in holders:  # an object holding registered state (register_state): the same object, its tensors in place
+            signature.append(("state", id(leaf)))
         else:
             raise TypeError(f"CUDA graph block call: an argument of type {type(leaf).__name__} is not supported, pass its tensors as arguments")
     return tuple(signature)
@@ -402,13 +510,20 @@ def _execute_lifetimes(forward, args, kwargs, positions, leaves):
 class BlockGraphs:
     """CUDA graphs of the tower blocks of one model."""
 
-    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready):
+    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None):
         # extra_inputs(block) -> [(list, index)]: tensors read by the block that are neither weights nor arguments, read by its graphs from
-        # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move
+        # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move; forget(): the
+        # graphs are gone, so are the records that weights_key keeps on the blocks
         self.name, self.weights_key, self.weight_tensors, self.extra_inputs, self.ready = name, weights_key, weight_tensors, extra_inputs, ready
+        self.forget = forget
         self.disabled = None  # the reason why this model's blocks run eagerly (e.g. weights whose kernels cannot be captured), or None
         self.reported = False
         self.checked = set()  # (block, method, signature) whose capture checked the reads
+        self.blas = {}  # (block, method, signature) -> whether its eager warmup used cuBLAS (its capture stream then needs the workspaces)
+        self.state = {}  # name -> tensors that the graphs read besides weights and arguments (register_state): kept across clear()
+        self.state_ids = set()  # their ids
+        self.holders = {}  # name -> the objects holding these tensors that blocks take as arguments
+        self.holder_ids = set()  # their ids
         self.clear()
         _managers.append(self)
 
@@ -418,7 +533,27 @@ class BlockGraphs:
         self.static_by_buffer, self.static_by_base = {}, {}
         self.borrowed = set()
         self._tensor_refs = {}
+        self.spans, self.span_runs = {}, {}  # (tower, start, stop, step) -> _Span; (tower, step) -> the runs its spans were made for
+        self.memo = {}  # (module, its first argument) -> its last call replayed through the fast path of call()
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
+        if self.forget is not None:
+            self.forget()
+
+    def span(self, blocks, start, stop, step, runs):
+        # the stage of a run of blocks kept in VRAM; when the runs change, the stages of the runs gone leave with their graphs
+        func = getattr(step, "__func__", step)
+        if self.span_runs.get((id(blocks), func)) != runs:
+            self.span_runs[(id(blocks), func)] = runs
+            current = {(id(blocks), a, b, func) for a, b, resident in runs if resident and b - a > 1}
+            for key in [key for key in self.spans if key[0] == id(blocks) and key[3] is func and key not in current]:
+                for entry in list(self.keys.pop(id(self.spans.pop(key)), {})):
+                    self._forget(self.entries.pop(entry))
+            self._prune()
+        key = (id(blocks), start, stop, func)
+        span = self.spans.get(key)
+        if span is None:
+            span = self.spans[key] = _Span(blocks, start, stop, step, getattr(blocks[start], "_mm_graph_keys", MAX_KEYS))
+        return span
 
     def wrap(self, module, forward):
         def graphed_forward(*args, **kwargs):
@@ -432,8 +567,34 @@ class BlockGraphs:
         # A block called by a stage being prepared or captured (a stage spanning several blocks) runs inside that stage's graph.
         if _recording or _blocked is not None or self.disabled is not None or not self.ready():
             return forward(*args, **kwargs)
+        method = getattr(forward, "__func__", forward)
+        # The same call as the last one of this module on registered state only (an engine calling a stage on its persistent buffers): the
+        # same argument objects at the same addresses, a graph with no output buffer, no LoRA copy nor lifetime transfer. Only the keys that
+        # may change are read. Arguments that are not registered state are never kept (they would stay alive, and their moves rely on counts).
+        memo = self.memo.get((id(module), id(args[0]) if args else None)) if not kwargs else None
+        if (memo is not None and memo[0] is method and len(memo[1]) == len(args) and all(a is b for a, b in zip(args, memo[1]))
+                and all(p is None or a.data_ptr() == p for a, p in zip(args, memo[2]))):
+            weights, providers = self.weights_key(module), tuple(provider() for provider in _key_providers)
+            entry = memo[5]
+            # its weights key is the same tuple object while the weights stay where they are (_graph_weights_key); an evicted graph leaves memo
+            if weights[0] is memo[3][0] and weights[1:] == memo[3][1:] and providers == memo[4] and not self.extra_inputs(module):
+                copies, borrowed, mutated, result, streams = memo[6]
+                for static, leaf in copies:
+                    static.copy_(leaf)
+                entry.graph.replay()
+                stream = torch.cuda.current_stream()
+                if stream not in streams:  # recording a stream again on the same buffers would change nothing
+                    streams.append(stream)
+                    for static in borrowed:
+                        static.record_stream(stream)
+                for leaf, static in mutated:
+                    if _same_buffer(leaf, static):
+                        torch.autograd.graph.increment_version(leaf)
+                    else:
+                        leaf.copy_(static)
+                return result
         leaves, spec = _flatten((args, kwargs))
-        signature = _signature(leaves)
+        signature = _signature(leaves, self.holder_ids)
         extras = self.extra_inputs(module)
         extra_signature = _signature([holder[index] for holder, index in extras])
         positions = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
@@ -446,7 +607,6 @@ class BlockGraphs:
             raise ValueError(f"CUDA graph block call of '{self.name}' ({type(module).__name__}): argument {name} is a view whose elements share memory "
                              f"(shape {tuple(leaf.shape)}, stride {leaf.stride()}, e.g. from expand), which a graph's static buffer cannot hold. Pass the "
                              f"unexpanded tensor and expand it inside the block's forward (no cost), or make it contiguous before the call.") from None
-        method = getattr(forward, "__func__", forward)
         key = (id(module), spec, signature, extra_signature, self.weights_key(module), tuple(provider() for provider in _key_providers), tuple(static_key), method)
         keys = self.keys.setdefault(id(module), {})
         entry = self.entries.get(key, None)
@@ -464,7 +624,7 @@ class BlockGraphs:
         if entry is None:  # first call of this key: eager (it compiles and tunes the kernels, makes the caches of the weights), then captured
             if lifetimes is None:
                 lifetimes = self._consumable(args, kwargs, leaves, positions, buffers)
-            if len(keys) >= MAX_KEYS:
+            if len(keys) >= getattr(module, "_mm_graph_keys", MAX_KEYS):
                 self._evict(next(iter(keys)), static_key)
             for ordinal, index in enumerate(positions):  # before the warmup, which then runs on the moved arguments
                 if not _same_buffer(buffers[ordinal], leaves[index]) and _movable(leaves[index], buffers[ordinal]):
@@ -474,11 +634,19 @@ class BlockGraphs:
                 from . import allocator
                 if self.pool is None:
                     self.pool = torch.cuda.graph_pool_handle()
-                _prepare_blas_stream(torch.cuda.current_stream())
                 with allocator.graph_warmup(self.pool):
                     plan = allocator.OutputPlan(self.pool)
                     try:
-                        out, consumed = _execute_lifetimes(forward, args, kwargs, lifetimes, leaves)
+                        blas_key = (id(module), method, None if module.__dict__.get("_mm_graph_check_once", False) else signature)
+                        if blas_key in self.blas:  # decided at an earlier capture of the same call: its workspaces are kept
+                            if self.blas[blas_key]:
+                                _prepare_blas_stream(torch.cuda.current_stream())
+                            out, consumed = _execute_lifetimes(forward, args, kwargs, lifetimes, leaves)
+                        else:
+                            blas = _BlasUse()
+                            with blas:
+                                out, consumed = _execute_lifetimes(forward, args, kwargs, lifetimes, leaves)
+                            self.blas[blas_key] = blas.used
                         plan.pause()
                         if consumed:
                             # An escaped warmup result must not retain pages loaned by a static input: the preceding graph may
@@ -494,10 +662,10 @@ class BlockGraphs:
                             del flat
                         # Returned views keep execution storage alive: capture them with the ordinary owner's version counter.
                         self._capture_lifetimes, self._capture_output_plan = consumed, plan
-                        entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output)
+                        entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry is None:  # a different allocation trace must not replay the proposed aliases
                             self._capture_output_plan = None
-                            entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output)
+                            entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         self.entries[key] = entry
                     finally:
                         self.__dict__.pop('_capture_lifetimes', None)
@@ -509,6 +677,17 @@ class BlockGraphs:
             keys[key] = None
             return out
         keys[key] = keys.pop(key)  # most recently used
+        if (self.state_ids and not kwargs and not extras and not entry.lifetimes and not entry.emptied and len(entry.static_key) == len(entry.static)
+                and len(leaves) == len(args) and all(leaf is arg and (not isinstance(arg, torch.Tensor) or id(arg) in self.state_ids) for leaf, arg in zip(leaves, args))):
+            result = self._replay(entry, leaves, extras)
+            # the replay of these arguments, as _replay does it: the copies of the inputs that are not their static buffers, the static
+            # buffers to record on the stream, the arguments updated in place, and the outputs (arguments or constants: no output buffer)
+            copies = [(static, leaves[index]) for index, static in zip(entry.positions, entry.static) if not _same_buffer(static, leaves[index])]
+            borrowed = [self.static[k] for k in set(entry.static_key) if k in self.borrowed]
+            mutated = [(leaves[entry.positions[index]], entry.static[index]) for index in entry.mutated]
+            self.memo[(id(module), id(args[0]) if args else None)] = (method, args, tuple(arg.data_ptr() if isinstance(arg, torch.Tensor) else None for arg in args), key[4], key[5], entry,
+                                     (copies, borrowed, mutated, result, [torch.cuda.current_stream()]))
+            return result
         result = self._replay(entry, leaves, extras)
         if entry.emptied:
             handoffs = _handoffs(args, kwargs)
@@ -608,8 +787,14 @@ class BlockGraphs:
 
     def _evict(self, key, keep=()):
         del self.keys[key[0]][key]
-        del self.entries[key]
+        entry = self.entries.pop(key)
+        self._forget(entry)
         self._prune(keep)
+
+    def _forget(self, *entries):
+        # the fast path of call() replays only graphs still in entries
+        for memo_key in [memo_key for memo_key, memo in self.memo.items() if memo[5] in entries]:
+            del self.memo[memo_key]
 
     def _prune(self, keep=()):
         used = set(keep) | {k for entry in self.entries.values() for k in entry.static_key}
@@ -672,7 +857,8 @@ class BlockGraphs:
             buffers.append(self.static[key])
         return keys, buffers
 
-    def _capture(self, module, forward, leaves, spec, signature, extras, extra_signature, warm_output, static_key, buffers, adopt_outputs):
+    def _capture(self, module, forward, leaves, spec, signature, extras, extra_signature, warm_output, static_key, buffers, adopt_outputs, blas=False):
+        # blas: the call uses cuBLAS, whose workspaces the capture stream then needs before the capture (they cannot be made during it)
         from . import allocator
         entry = _Graph()
         outputs = self._outputs(leaves, warm_output)
@@ -698,11 +884,14 @@ class BlockGraphs:
             static_leaves[index] = static
         args, kwargs = pytree.tree_unflatten(static_leaves, spec)
         versions = [static._version for static in entry.static]
-        checked_key = (id(module), getattr(forward, "__func__", forward), signature)
+        # a module whose calls read the same tensors whatever their shapes (_mm_graph_check_once, e.g. an LLM's decoding passes of any length)
+        # has its reads checked at its first capture only
+        checked_key = (id(module), getattr(forward, "__func__", forward), None if module.__dict__.get("_mm_graph_check_once", False) else signature)
         if checked_key in self.checked:
             check = contextlib.nullcontext()
         else:  # costly (each operation goes through Python): once per code path, which other weights capture again
             allowed = {_storage(t) for t in buffers} | {_storage(t) for t in _constants}
+            allowed.update(_storage(t) for tensors in self.state.values() for t in tensors)
             allowed.update(_storage(t) for t in self.weight_tensors(module) if t.is_cuda)
             check = _ReadCheck(allowed)
         if self.pool is None:
@@ -716,7 +905,10 @@ class BlockGraphs:
         if not _autotune_guarded:
             _guard_triton_autotune()
         global _capturing
-        with torch.cuda.stream(_capture_stream(torch.cuda.current_device())):
+        stream = _capture_stream(torch.cuda.current_device())
+        if blas:
+            _prepare_blas_stream(stream)
+        with torch.cuda.stream(stream):
             entry.graph.capture_begin(self.pool, capture_error_mode="thread_local")
             _capturing = True
             if plan is not None:
@@ -766,7 +958,7 @@ class BlockGraphs:
             self.checked.add(checked_key)
         entry.mutated = [index for index, (static, version) in enumerate(zip(entry.static, versions)) if static._version != version]
         if not self.reported:
-            print(f"[MMGP] CUDA graphs of the blocks of '{self.name}' are being captured.")
+            tqdm.write(f"[MMGP] CUDA graphs of the blocks of '{self.name}' are being captured.")
             self.reported = True
         return entry
 

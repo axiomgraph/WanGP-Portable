@@ -4,6 +4,7 @@ import math
 from typing import Optional, Tuple
 
 import torch
+from mmgp import runtime
 from torch import nn
 from torch.nn import functional as F
 
@@ -207,12 +208,13 @@ class ExpandableKVCache(nn.Module):
             init_len = min(max_seq_len, expand_step)
         self.capacity = init_len
 
-        k_cache = torch.empty(
+        # zeros: a masked attention over the whole cache weights its unwritten slots by zero, and 0 * NaN is NaN
+        k_cache = torch.zeros(
             (batch_size, self.capacity, num_heads, head_dim),
             device=device,
             dtype=dtype,
         )
-        v_cache = torch.empty_like(k_cache)
+        v_cache = torch.zeros_like(k_cache)
         self.register_buffer("k_cache", k_cache, persistent=False)
         self.register_buffer("v_cache", v_cache, persistent=False)
 
@@ -254,24 +256,24 @@ class ExpandableKVCache(nn.Module):
             v_cpu = self.v_cache[:, : self._pos].detach().cpu()
             self._buffers.pop("k_cache", None)
             self._buffers.pop("v_cache", None)
-            k_new = torch.empty(
+            k_new = torch.zeros(
                 (bsz, new_capacity, self.num_heads, self.head_dim),
                 device=device,
                 dtype=dtype,
             )
-            v_new = torch.empty_like(k_new)
+            v_new = torch.zeros_like(k_new)
             if self._pos:
                 k_new[:, : self._pos] = k_cpu.to(device)
                 v_new[:, : self._pos] = v_cpu.to(device)
             k_cpu = None
             v_cpu = None
         else:
-            k_new = torch.empty(
+            k_new = torch.zeros(
                 (bsz, new_capacity, self.num_heads, self.head_dim),
                 device=device,
                 dtype=dtype,
             )
-            v_new = torch.empty_like(k_new)
+            v_new = torch.zeros_like(k_new)
             if self._pos:
                 k_new[:, : self._pos] = self.k_cache[:, : self._pos]
                 v_new[:, : self._pos] = self.v_cache[:, : self._pos]
@@ -290,24 +292,24 @@ class ExpandableKVCache(nn.Module):
             v_cpu = self.v_cache[:, : self._pos].detach().cpu()
             self._buffers.pop("k_cache", None)
             self._buffers.pop("v_cache", None)
-            k_new = torch.empty(
+            k_new = torch.zeros(
                 (bsz, self.capacity, self.num_heads, self.head_dim),
                 device=device,
                 dtype=target_dtype,
             )
-            v_new = torch.empty_like(k_new)
+            v_new = torch.zeros_like(k_new)
             if self._pos:
                 k_new[:, : self._pos] = k_cpu.to(device=device, dtype=target_dtype)
                 v_new[:, : self._pos] = v_cpu.to(device=device, dtype=target_dtype)
             k_cpu = None
             v_cpu = None
         else:
-            k_new = torch.empty(
+            k_new = torch.zeros(
                 (bsz, self.capacity, self.num_heads, self.head_dim),
                 device=device,
                 dtype=target_dtype,
             )
-            v_new = torch.empty_like(k_new)
+            v_new = torch.zeros_like(k_new)
             if self._pos:
                 k_new[:, : self._pos] = self.k_cache[:, : self._pos].to(
                     device=device, dtype=target_dtype
@@ -401,7 +403,7 @@ class MultiHeadAttention(nn.Module):
     ) -> None:
         if self.kv_cache is not None:
             return
-        device = self.q_proj.weight.device
+        device = runtime.execution_device(self)  # its weights may be on the CPU (streamed)
         self.kv_cache = ExpandableKVCache(
             batch_size=batch_size,
             max_seq_len=max_seq_len,
@@ -687,6 +689,10 @@ class TransformerSelfAttentionLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
+    # mmgp: the layers of a short stack (the 3 layers of the codebook decoder, run 8 times per frame) join the dynamic VRAM preload as a
+    # tower when this decoder is a managed model of its own; otherwise they would be streamed at each call
+    _cuda_graph_towers = ("layers",)
+
     def __init__(
         self,
         *,

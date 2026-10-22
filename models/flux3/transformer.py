@@ -87,7 +87,7 @@ class Block(nn.Module):
         self.attn_out = nn.Linear(hidden, hidden, bias=False)
         self.mlp_out = nn.Linear(mlp_hidden, hidden, bias=False)
         self.norm = QKNorm(self.head_dim)
-        self.mlp_expansion = 2 * mlp_ratio
+        self.pre_norm = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
 
     def forward(self, streams, frequencies, modulations):
         # CFG branches execute sequentially while this block's weights are loaded.
@@ -95,29 +95,21 @@ class Block(nn.Module):
             x = streams[branch]
             streams[branch] = None
             spans, freqs = modulations[branch], frequencies[branch]
-            # Keep expanded visual FFN intermediates roughly input-sized, while
-            # short text streams use one projection call.
-            chunk_size = math.ceil(x.shape[0] / self.mlp_expansion) if x.shape[0] > 1024 else x.shape[0]
-            x_mod = torch.empty_like(x)
-            for start, end, (shift, scale, gate) in spans:
-                for first in range(start, end, chunk_size):
-                    last = min(first + chunk_size, end)
-                    x_mod[first:last] = modulate(x[first:last], shift, scale)
+            # LayerNorm then each span's modulation row (one segment per span), in place of the normalized copy
+            shift, scale = (torch.cat([mod[i] for _, _, mod in spans]) for i in (0, 1))
+            x_mod = kernels.norm_modulate([x], self.pre_norm, shift, scale, [(start, end, row) for row, (start, end, _) in enumerate(spans)])
 
             def normalize(q, k, group):
                 for tensor, weight in ((q, self.norm.query_norm.scale), (k, self.norm.key_norm.scale)):
                     if tensor is not None:
                         attention_kit.rows_(tensor, lambda part, first, last: norm_rope(part, weight, freqs[:, first:last]))
 
-            attn = attention_kit.qkv_attention([x_mod], self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim, normalize).flatten(2)[0]
+            # staged Sage 2: q / k quantized from the projections with their norm and RoPE (freqs: (1, tokens, 1, pairs, 2, 2) matrices)
+            fused = lambda q, k, group, core, settings: kernels.split_half_norm_rope_quant_(q, k, freqs, (self.norm.query_norm.scale, 1e-6), (self.norm.key_norm.scale, 1e-6), core, settings, interleaved=True)
+            attn = attention_kit.qkv_attention([x_mod], self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim, normalize, fused_quant=fused).flatten(2)[0]
             for start, end, (shift, scale, gate) in spans:
-                for first in range(start, end, chunk_size):
-                    last = min(first + chunk_size, end)
-                    activated = kernels.swiglu([self.mlp_in(x_mod[first:last])])
-                    result = self.attn_out(attn[first:last]) + self.mlp_out(activated)
-                    del activated
-                    result_list, result = [result], None
-                    kernels.gated_residual_(x[first:last], result_list, gate)
+                kernels.gated_residual_(x[start:end], [self.attn_out(attn[start:end])], gate)
+                kernels.mlp([x_mod[start:end]], self.mlp_in, self.mlp_out, "swiglu", residual=x[start:end], gate=gate)
             streams[branch] = x
         return streams
 

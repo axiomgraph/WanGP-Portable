@@ -229,7 +229,6 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
         **kwargs,
     ):
         _require_medium_flash_attention(base_model_type)

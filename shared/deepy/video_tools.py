@@ -16,8 +16,8 @@ import ffmpeg
 from PIL import Image, ImageDraw, ImageFont
 
 from shared.ffmpeg_setup import download_ffmpeg
-from shared.utils.audio_video import get_video_audio_encode_args
-from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args
+from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
+from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args, validate_video_output_settings
 from shared.utils.utils import get_video_frame, get_video_info
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
 _THUMB_DATA_URL_CACHE: OrderedDict[str, str] = OrderedDict()
@@ -73,7 +73,11 @@ def get_audio_standalone_extension(codec_key: str | None) -> str:
 
 
 def _get_mp4_audio_encode_args(codec_key: str | None) -> list[str]:
-    return get_video_audio_encode_args(codec_key)
+    settings = get_mp4_audio_codec_settings(codec_key)
+    args = ["-c:a", settings["codec"], *get_video_audio_extra_args(codec_key)]
+    if settings.get("bitrate"):
+        args += ["-b:a", settings["bitrate"]]
+    return args
 
 
 def _get_standalone_audio_encode_args(codec_key: str | None) -> list[str]:
@@ -215,6 +219,8 @@ def overlay_frames(frames, video_path: str, output_path: str, fps: float, start_
     if first.size != (int(video["width"]), int(video["height"])):
         raise ValueError(f"The drawing renders at {first.width}x{first.height} over a {video['width']}x{video['height']} video: draw it in the video's aspect ratio, e.g. width=\"{video['width']}\" height=\"{video['height']}\" viewBox=\"0 0 {video['width']} {video['height']}\".")
     output_extension = os.path.splitext(output_path)[1].lower()
+    if os.path.splitext(video_path)[1].lower() != output_extension:
+        get_video_audio_extra_args(audio_codec, output_path)
     subtitle_args = [arg for index, stream in enumerate(stream for stream in streams if stream.get("codec_type") == "subtitle") for arg in _subtitle_codec_args(index, stream, output_extension)]
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     command = [_get_ffmpeg_path(), "-y", "-v", "error", "-i", video_path, "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{first.width}x{first.height}", "-framerate", f"{fps:g}", "-i", "pipe:0",
@@ -232,6 +238,9 @@ def merge_videos(videos: list[str], output_path: str, *, transitions: str | list
     """Join videos in order with a cut, crossfade or fade through black/white at each join (transitions: one per join, or one for all).
     Clips are fitted to the first one's size and frame rate; a transition overlaps the two clips by transition_s, and the soundtracks
     follow the picture (silence for a clip without sound)."""
+    error = validate_video_output_settings(video_codec, video_container, audio_codec)
+    if error is not None:
+        raise ValueError(error)
     videos = [os.path.normpath(str(path or "").strip()) for path in videos]
     if not 2 <= len(videos) <= 32:
         raise ValueError("Merge between 2 and 32 videos.")
@@ -320,6 +329,9 @@ def _side_by_side_legend_image(width: int, height: int, text: str) -> Image.Imag
 
 
 def side_by_side_media(source_paths: list[str], output_path: str, layout: str | None = None, legends: list[str] | None = None, *, video_codec: str | None = None, video_container: str | None = None, audio_codec: str | None = None) -> str:
+    error = validate_video_output_settings(video_codec, video_container, audio_codec)
+    if error is not None:
+        raise ValueError(error)
     source_paths = [os.path.normpath(str(path or "").strip()) for path in source_paths]
     if not source_paths:
         raise ValueError("media_ids must contain at least one image or video.")
@@ -424,6 +436,9 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
 
 
 def extract_video(source_path: str, output_path: str, start_time: float | int = 0, end_time: float | int | None = None, duration: float | int | None = None, *, video_codec: str | None = None, video_container: str | None = None, audio_codec: str | None = None) -> str:
+    error = validate_video_output_settings(video_codec, video_container, audio_codec)
+    if error is not None:
+        raise ValueError(error)
     source_path = os.path.normpath(str(source_path or "").strip())
     output_path = os.path.normpath(str(output_path or "").strip())
     if not os.path.isfile(source_path):
@@ -587,6 +602,7 @@ def mute_video(source_path: str, output_path: str) -> str:
 
 
 def replace_audio(video_path: str, audio_path: str, output_path: str, *, audio_codec: str | None = None) -> str:
+    get_video_audio_extra_args(audio_codec, output_path)
     video_path = os.path.normpath(str(video_path or "").strip())
     audio_path = os.path.normpath(str(audio_path or "").strip())
     output_path = os.path.normpath(str(output_path or "").strip())
@@ -877,6 +893,9 @@ def _graph_loudness(args: list[str]) -> float:
 
 
 def resize_crop_video(source_path: str, output_path: str, *, width: int | None = None, height: int | None = None, crop_left: float = 0, crop_top: float = 0, crop_right: float = 0, crop_bottom: float = 0, crop_unit: str = "pixels", preserve_aspect_ratio: bool = True, crop_anchor: str = "center", video_codec: str | None = None, video_container: str | None = None, audio_codec: str | None = None) -> str:
+    error = validate_video_output_settings(video_codec, video_container, audio_codec)
+    if error is not None:
+        raise ValueError(error)
     source_path = os.path.normpath(str(source_path or "").strip())
     output_path = os.path.normpath(str(output_path or "").strip())
     if not os.path.isfile(source_path):

@@ -3,7 +3,7 @@
 import math
 from mmgp import cuda_graphs, runtime
 from shared import attention_kit
-from shared.llm_engines.nanovllm.layerwise import cached_attention
+from shared.llm_engines.lmgp.layerwise import cached_attention
 from .backbone import GenerationCancelled
 from collections.abc import Iterable
 
@@ -119,7 +119,7 @@ class TowerAttention(nn.Module):
                 attention_kit.rows_(key, lambda part, first, last: self.rotate(self.k_norm(part[0]), positions[first:last]).unsqueeze(0))
         out = attention_kit.qkv_attention([x], self.wq, self.wk, self.wv, cfg.n_head, cfg.head_dim, normalize,
             kv_heads=cfg.n_local_heads,
-            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, kv_len, self.engine))
+            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, kv_len, self.features))
         return self.wo(out.reshape(x.shape[0], -1) * gate.sigmoid())
 
 

@@ -1804,8 +1804,8 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
     def get_decoder(self):
         return self.model
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self._cuda_graph_hooks.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool, graph_owner=None) -> None:
+        self._cuda_graph_hooks.set_cuda_graphs(enabled, graph_owner)
 
     def prepare_decode_cuda_graph(self, *, max_batch_size: int, max_talker_tokens: int, max_subtalker_tokens: int) -> None:
         self._cuda_graph_hooks.prepare(
@@ -2256,6 +2256,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
     config_class = Qwen3TTSConfig
+    # mmgp keeps the text projection (16 MB, its linear_fc1 / fc2 would be two streamed blocks used by the prefill only) with the model
+    # base: the talker's blocks then all stay in VRAM with the dynamic preload, and its decoding steps run as one CUDA graph each
+    _offload_base_modules = ("talker.text_projection",)
 
     def __init__(self, config: Qwen3TTSConfig):
         super().__init__(config)
@@ -2292,8 +2295,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     def load_generate_config(self, generate_config):
         self.generate_config = generate_config
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self.talker.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self.talker.set_cuda_graphs(enabled, graph_owner=self)  # this model is the one MMGP manages
 
     def prepare_decode_cuda_graph(self, *, max_batch_size: int, max_talker_tokens: int, max_subtalker_tokens: int) -> None:
         self.talker.prepare_decode_cuda_graph(

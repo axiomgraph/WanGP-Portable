@@ -423,6 +423,7 @@ class family_handler():
         flux2_klein = base_model_type in ["flux2_klein_4b", "flux2_klein_9b"]
 
         ui_defaults.update({
+            "image_mode": 1,
             "embedded_guidance_scale":  2.5,
         })
 

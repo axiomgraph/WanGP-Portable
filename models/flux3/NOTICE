@@ -3,6 +3,16 @@ https://github.com/black-forest-labs/flux-3-image-klein
 Revision: 45e57c9fb06f9751cdced29a65c5d2171003be05
 Copyright Black Forest Labs. Apache License 2.0; see LICENSE.
 
+Sampling shift updated from upstream revision:
+62e90b9278b73ecc52927770c6965dc6b1966498
+
+Enhancer instructions condensed and adapted from src/flux3/pup_prompts_external_vlm.json:
+https://github.com/black-forest-labs/flux-3-image-klein
+Revision: 458dcc00e4719f65be0d9a611d52d9cf86ba980d
+Copyright Black Forest Labs. Apache License 2.0; see LICENSE.
+Adaptations preserve the user's language, support requested display-copy authoring,
+and use WanGP's generation-context placeholders.
+
 Qwen3-VL components are reused from WanGP's local Transformers implementation.
 Copyright 2025 The Qwen Team and The HuggingFace Inc. team; Apache License 2.0.
 

@@ -46,7 +46,7 @@ def select_decode(input, raw, signs, bias, rows, grouped_shape, native):
                     fn()
                 graph = torch.cuda.CUDAGraph()
                 graphs[tile] = graph
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                     for _ in range(16):
                         outputs[tile] = fn()
                 graph.replay()

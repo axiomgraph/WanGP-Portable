@@ -43,6 +43,35 @@ def snake_beta_aa(x, alpha, beta, up_filter, down_filter):
     return out
 
 
+@triton.jit(do_not_specialize=['length', 'channels'], do_not_specialize_on_alignment=['length', 'channels'])
+def _snake(X, ALPHA, BETA, length, channels, LOG_SCALE: tl.constexpr, BLOCK: tl.constexpr):
+    """x += sin(a x)^2 / (b + 1e-9) in place, one row of (batch * channels) per program along axis 0: a and b per channel, stored in
+    log scale (exp taken here in FP32) or directly. FP32 arithmetic from the loaded values, one rounding at the store."""
+    row = tl.program_id(0)
+    n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid = n < length
+    channel = row % channels
+    alpha = tl.load(ALPHA + channel).to(tl.float32)
+    beta = tl.load(BETA + channel).to(tl.float32)
+    if LOG_SCALE:
+        alpha = libdevice.exp(alpha)
+        beta = libdevice.exp(beta)
+    inv_beta = tl.div_rn(1.0, beta + 1e-9)
+    ptr = X + row.to(tl.int64) * length + n
+    x = tl.load(ptr, mask=valid, other=0.0).to(tl.float32)
+    wave = libdevice.sin(alpha * x)
+    tl.store(ptr, (x + wave * wave * inv_beta).to(X.dtype.element_ty), mask=valid)
+
+
+def snake_(x, alpha, beta, log_scale=True):
+    """In place on x (batch, channels, length), contiguous; alpha, beta (1, channels, 1) or (channels,)."""
+    batch, channels, length = x.shape
+    _snake[(batch * channels, triton.cdiv(length, 1024))](x, alpha.reshape(-1), beta.reshape(-1), length, channels, LOG_SCALE=log_scale, BLOCK=1024,
+                                                           enable_fp_fusion=False)
+    torch.autograd.graph.increment_version(x)
+    return x
+
+
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger
 
 install_triton_compilation_logger()

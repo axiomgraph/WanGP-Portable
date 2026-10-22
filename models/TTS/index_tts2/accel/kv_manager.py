@@ -95,7 +95,8 @@ class KVCacheManager:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device)
         cache_dtype = dtype
-        self.kv_cache = torch.empty(
+        # zeros: an attention reading the unwritten slots of a last page with a zero weight gives NaN on NaN garbage
+        self.kv_cache = torch.zeros(
             2,
             num_layers,
             num_blocks,

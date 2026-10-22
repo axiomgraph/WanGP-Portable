@@ -189,7 +189,7 @@ Each materialized session keeps its canonical decoder context in `context.json` 
 --quantize-transformer BOOL   # Enable/disable transformer quantization (default: True)
 --compile                     # Enable PyTorch compilation (requires Triton)
 --attention MODE              # Force attention mode: sdpa, flash, sage, sage2
---profile NUMBER              # Performance profile 1-5 (default: 4)
+--profile NUMBER              # Performance profile 0-5 (default: 4)
 --preload NUMBER              # Preload N MB of diffusion model in VRAM (Manual VRAM Preload for every kind of output)
 --fp16                        # Force fp16 instead of bf16 models
 --save-quantized              # Save an INT8 Quanto checkpoint during model loading
@@ -198,21 +198,22 @@ Each materialized session keeps its canonical decoder context in `context.json` 
 ```
 
 ### Performance Profiles
+- **Profile 0**: like Profile 4, models are sent to the GPU part by part, but no model keeps Reserved RAM for good: the parts of the model running are kept in Reserved RAM while it runs, then the RAM goes to the next model. Close to the speed of the profiles that keep models in Reserved RAM, with much less RAM. By default it also keeps in VRAM as much of each model as the generation leaves free, like Profile 3 (*VRAM Preload* below; choose *Manual* to set a fixed amount instead). The language models of Deepy and the prompt enhancer always run this way, with *Dynamic* preload, whatever the memory profile of your model, and get the CPU's help when they write (see *Language Models CPU Compute*)
 - **Profile 1**: each model loaded whole in VRAM, all models kept in Reserved RAM. The fastest generations and model switches, needs the most RAM and VRAM
 - **Profile 2**: all models kept in Reserved RAM, sent to the GPU part by part. Runs models larger than your VRAM, leaves VRAM for long videos or large images and switches models fast, needs a lot of RAM
 - **Profile 3**: each model loaded whole in VRAM, only the main models kept in Reserved RAM. Fast generations with less RAM, needs enough VRAM for the whole model
-- **Profile 3+** (3.5, recommended for audio models): Profile 3 without any Reserved RAM. Audio models are usually small enough to fit whole in VRAM, where the language models many of them include run much faster and can use the faster CUDA Graph or vLLM engines; models load more slowly
+- **Profile 3+** (3.5, recommended for audio models): Profile 3 without any Reserved RAM. Audio models are usually small enough to fit whole in VRAM, where the language models many of them include run fastest (they use CUDA Graphs with every profile, also when sent to the GPU part by part); models load more slowly
 - **Profile 4** (recommended): only the main models kept in Reserved RAM, sent to the GPU part by part. The most versatile: runs models larger than your VRAM and leaves VRAM for long videos or large images
 - **Profile 4+** (4.5): Profile 4 sending one part at a time. Saves up to about 1 GB of VRAM, slightly slower
 - **Profile 5** (fail safe): almost no Reserved RAM, all models sent to the GPU part by part. For PCs short of RAM and VRAM, slower with short steps such as images
 
 ### Preloading Part of the Model in VRAM
-With profiles 2, 4 and 5, models are transferred to the GPU block by block at every denoising step. Image models such as Flux have short steps, so with profile 4 these transfers, rather than the GPU computation, can set the speed. In *Configuration / RAM/VRAM Management*, a *VRAM Preload* choice next to the default memory profile of each kind of output (video, image and audio) decides how much of each model stays in VRAM, so that less is transferred at each step:
-- *Default*: the memory profile's own choice.
+With profiles 0, 2, 4 and 5, models are transferred to the GPU block by block at every denoising step. Image models such as Flux have short steps, so with profile 4 these transfers, rather than the GPU computation, can set the speed. In *Configuration / RAM/VRAM Management*, a *VRAM Preload* choice next to the default memory profile of each kind of output (video, image and audio) decides how much of each model stays in VRAM, so that less is transferred at each step:
+- *Default*: the memory profile's own choice (*Dynamic* for profile 0, none for profiles 2, 4 and 5).
 - *Dynamic*: as much of each model as the generation leaves free, adapted as it goes (below).
-- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model.
+- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model. Some models keep more in VRAM on their own (for instance the language models of audio models, which stay whole): the larger of both applies. If the generation needs more VRAM than the preload leaves free, just enough of the preloaded parts leave the VRAM until the model is loaded again, instead of the generation spilling into RAM and slowing down several times.
 
-The choice is hidden for profiles 1, 3 and 3+, which load models entirely in VRAM. A memory profile chosen in the settings of a generation uses the VRAM Preload of its kind of output, and `--preload` sets a manual value for all three.
+The choice is hidden for profiles 1, 3 and 3+, which always keep as much of each model in VRAM as fits. A memory profile chosen in the settings of a generation uses the VRAM Preload of its kind of output, and `--preload` sets a manual value for all three.
 
 For Flux dev at 1024x1024, a manual 6000 MB shortened the profile 4 steps by about 22%, to within about 20% of profile 1, with about half of its peak VRAM. Preloading uses VRAM during denoising only: at this resolution it did not raise the peak VRAM, which the image decoding sets.
 
@@ -280,6 +281,7 @@ The option keeps this cache in a folder of its own: `ComputeCache` in the WanGP 
 
 - It helps most with Profile 5, with image models and other generations made of short steps (low resolutions, the first pass of distilled models), and on PCs with little RAM to reserve. With long steps (high resolutions, long videos), the difference is small.
 - Off: these models reach the GPU more slowly, and the 1-2 GB of Reserved RAM stay free for other programs.
+- Profile 0 always uses it, with a larger share: the parts of the model running that do not fit in VRAM use the *Reserved RAM for Pinning* left by the other models, released when you switch models or when your PC runs short of RAM.
 - Changing this option reloads the model.
 
 ## Lora Configuration
@@ -333,8 +335,11 @@ JSON entries take precedence over `--loras`. Unlisted keys use the root from `--
 --settings PATH              # Path to folder containing default settings for all models
 --config PATH                # Config folder for wgp_config.json and queue.zip
 --workspaces-dir FOLDER       # Workspace manifests/media; overrides Config / Outputs (default: ./workspaces)
+--offline                    # Never download: use only the files already on this computer
 --verbose LEVEL              # Information level 0-2 (default: 1)
 ```
+
+With `--offline`, WanGP and the libraries it uses never download anything: models, text encoders, LoRAs from links and processing tools must already be in your checkpoints folders. A missing file stops the job with an error naming it, instead of starting a download. Useful on a computer without internet access, on a metered connection, or to make sure a test or a batch runs only with the files you already have.
 
 ## Examples
 

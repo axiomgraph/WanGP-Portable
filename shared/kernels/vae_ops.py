@@ -18,9 +18,11 @@ try:
 except (ImportError, OSError, RuntimeError):
     _conv = _stream = None
 try:
-    from .audio_triton import snake_beta_aa as _snake
+    from .audio_triton import snake_beta_aa as _snake, snake_ as _snake_plain
 except (ImportError, OSError, RuntimeError):
-    _snake = None
+    _snake = _snake_plain = None
+
+_AUDIO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 _DTYPES = (torch.bfloat16, torch.float16)
 _STREAM_CONV_MIN_PIXELS = 8192  # smaller calls keep cuDNN's lower launch overhead
@@ -70,18 +72,24 @@ def rope_plan(x, dim_head, rotary):
     triton_rms = (_video is not None and rotary is not None and cuda_inference(x, dtypes=_DTYPES)
                   and _video.can_rms_rope(dim_head, rotary[0].shape[-1]))
     family = choose("Video RMSNorm + RoPE", owned_triton=triton_rms, kitchen=_kitchen.can_fuse_rms_rope(x, rotary))
-    cast = bool(choose(owned_triton=_video is not None and cuda_inference(x)))
+    cast = bool(choose(owned_triton=_video is not None and _video.CAST_ROPE_SUPPORTED and cuda_inference(x)))
     return family, cast
 
 
 def normalize_projection(x_list, norm, rotary, plan):
+    """Consume a (batch, tokens, heads, head_dim) projection, normalizing each row independently."""
     x = take(x_list)
     family, cast = plan
     if family is not None:
         return x
     dtype = x.dtype
+    if not cast:
+        from shared.attention_kit import rows_
+        # Keep FP32 norm arithmetic without full-projection FP32 temporaries.
+        rows_(x, lambda part, first, last: norm(part.float()).to(dtype))
+        return x
     x = norm(x.float())
-    return _video.cast_rope(x, rotary) if cast else x.to(dtype)
+    return _video.cast_rope(x, rotary)
 
 
 def finish_rope_(q, k, rotary, eps, plan):
@@ -122,7 +130,7 @@ def scaled_residual(x_list, scale, residual):
 
 def pixel_norm_silu(x_list, norm, act, *, channel_norm):
     x = take(x_list)
-    valid = (cuda_inference(x, dtypes=_DTYPES, sm120=False, approximate=True) and x.ndim == 5 and x.numel() > 0 and channel_norm
+    valid = (cuda_inference(x, dtypes=_DTYPES, approximate=True) and x.ndim == 5 and x.numel() > 0 and channel_norm
              and isinstance(act, torch.nn.SiLU))
     family = choose("PixelNorm + SiLU", wgpkernels=valid and native_ops.available(x.device),
                     triton=valid and _stream is not None and _conv.supported(x.device))
@@ -137,7 +145,7 @@ def temporal_conv(conv, parts):
     """Consume temporal parts without keeping their original tensors alive."""
     b, c, _, h, w = parts[0].shape
     t, x = sum(part.shape[2] for part in parts), parts[0]
-    valid = (cuda_inference(x, dtypes=_DTYPES, sm120=False, approximate=True) and c % 32 == 0 and conv.out_channels % 32 == 0
+    valid = (cuda_inference(x, dtypes=_DTYPES, approximate=True) and c % 32 == 0 and conv.out_channels % 32 == 0
              and conv.stride == (1, 1, 1) and b * (t - 2) * h * w >= _STREAM_CONV_MIN_PIXELS
              and conv.kernel_size == (3, 3, 3) and conv.dilation == (1, 1, 1)
              and conv.groups == 1 and conv.padding == (0, 1, 1) and conv.padding_mode in ("zeros", "reflect")
@@ -173,6 +181,22 @@ def snake_beta_aa(x_list, activation, upsample, downsample, *, fusable):
     if choose("SnakeBeta + Resampling", owned_triton=fusable and _snake is not None and x.is_cuda):
         return _snake(x, activation.alpha, activation.beta, upsample.filter, downsample.lowpass.filter)
     return downsample(activation(upsample(x)))
+
+
+def snake_(x, alpha, beta, *, log_scale=True):
+    """Snake activation in place on x (batch, channels, length): x += sin(a x)^2 / (b + 1e-9), a and b per channel from alpha and beta
+    (shape (1, channels, 1) or (channels,)), stored in log scale (a = exp(alpha), b = exp(beta)) or directly. The Triton kernel computes
+    in FP32 from the stored parameters and rounds once at the store, in place of PyTorch's five rounded kernels (exp, mul, sin,
+    square, scale, add: the Oobleck VAE of ACE-Step 1.5), so it is at least as precise in every dtype (checked against FP64 on random
+    and edge inputs, tests/test_snake_op.py); the PyTorch path reproduces the module's chain."""
+    if choose("Snake", owned_triton=_snake_plain is not None and cuda_inference(x, dtypes=_AUDIO_DTYPES) and x.is_contiguous()
+              and alpha.device == x.device and beta.device == x.device):
+        return _snake_plain(x, alpha, beta, log_scale)
+    a = torch.exp(alpha) if log_scale else alpha
+    b = torch.exp(beta) if log_scale else beta
+    wave = torch.mul(x, a.reshape(1, -1, 1))
+    wave.sin_().mul_(wave).mul_((b.reshape(1, -1, 1) + 1e-9).reciprocal())
+    return x.add_(wave)
 
 
 def neighborhood_status():

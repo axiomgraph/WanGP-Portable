@@ -58,9 +58,12 @@ _NVFP4_LAYOUT_TENSORCORE = "tensorcore"
 _NVFP4_BACKEND_AUTO = "auto"
 _NVFP4_BACKEND_COMFY = "comfy"
 _NVFP4_BACKEND_LIGHTX2V = "lightx2v"
+_NVFP4_BACKEND_TRITON = "triton"  # weight-only Triton kernels for every product (GPUs without FP4 tensor cores)
 
 _NVFP4_KERNEL_LOGGED = False
 _NVFP4_FALLBACK_LOGGED = False
+_NVFP4_TRITON_LOGGED = False
+_TRITON_W4A16 = None
 _NVFP4_LOAD_LOGGED = False
 _NVFP4_KERNEL_AVAILABLE = False
 _NVFP4_KERNEL_CHECKED = False
@@ -95,7 +98,9 @@ def _normalize_nvfp4_backend(name):
         return _NVFP4_BACKEND_COMFY
     if norm in ("lightx2v", "lightx2v_kernel", "lightx2v-kernel", "lx"):
         return _NVFP4_BACKEND_LIGHTX2V
-    if norm in ("off", "none", "fallback", "disable", "disabled"):
+    if norm in ("triton", "w4a16"):
+        return _NVFP4_BACKEND_TRITON
+    if norm in ("off", "none", "fallback", "disable", "disabled", "pytorch"):
         return "fallback"
     return norm
 
@@ -505,15 +510,53 @@ def _nvfp4_linear_cuda(input, weight, bias=None):
     return _nvfp4_linear_cuda_comfy(input, weight, bias=bias)
 
 
+def _triton_w4a16():
+    """The weight-only Triton kernels (GPUs without FP4 tensor cores), None when Triton is unavailable or the backend disables them."""
+    global _TRITON_W4A16
+    if _TRITON_W4A16 is None:
+        _TRITON_W4A16 = False
+        if _NVFP4_BACKEND not in ("pytorch", "fallback"):
+            try:
+                from shared.kernels import nvfp4_w4a16_triton
+                _TRITON_W4A16 = nvfp4_w4a16_triton
+            except ImportError:
+                pass
+    return _TRITON_W4A16 or None
+
+
+def _nvfp4_note_triton():
+    global _NVFP4_TRITON_LOGGED
+    if not _NVFP4_TRITON_LOGGED:
+        _NVFP4_TRITON_LOGGED = True
+        print("NVFP4: Triton W4A16 kernels (weight-only, no FP4 tensor cores on this GPU)")
+
+
+_TRITON_W4A16_MAX_ROWS = 256  # measured crossover on an RTX 4090: above it, Kitchen's CUDA dequantization + cuBLAS BF16 is faster
+
+
+def _prefer_triton_w4a16(input, weight):
+    """The weight-only Triton kernel beats dequantize + matmul when the product is memory-bound (few rows), when Kitchen's CUDA
+    dequantization is unavailable (the PyTorch expansion is slow) or for the legacy layout it does not expand."""
+    if _NVFP4_BACKEND == _NVFP4_BACKEND_TRITON:
+        return True
+    rows = input.numel() // input.shape[-1]
+    return rows <= _TRITON_W4A16_MAX_ROWS or not _ck_cuda_available or weight._layout != _NVFP4_LAYOUT_TENSORCORE
+
+
 @torch.compiler.disable()
 def _nvfp4_linear(input, weight, bias=None, op=None):
     if _nvfp4_can_use_kernel(input, weight):
         if _is_fake_tensor(input):
             return input.new_empty((*input.shape[:-1], weight.size(0)))
         return _nvfp4_linear_cuda(input, weight, bias=bias)
-    _nvfp4_note_fallback()
     if _is_fake_tensor(input):
         return input.new_empty((*input.shape[:-1], weight.size(0)))
+    triton_w4a16 = _triton_w4a16() if torch.is_tensor(input) and weight._pre_quant_scale is None else None
+    if (triton_w4a16 is not None and triton_w4a16.supported(weight, input) and weight._data.device == input.device
+            and _prefer_triton_w4a16(input, weight)):
+        _nvfp4_note_triton()
+        return triton_w4a16.linear(input, weight, bias)
+    _nvfp4_note_fallback()
 
     if torch.is_tensor(input):
         qweight = weight.dequantize(dtype=input.dtype, device=input.device)
@@ -710,6 +753,12 @@ def convert_nvfp4_to_quanto(state_dict, default_dtype=None, verboseLevel=1):
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, NVFP4WeightTensor) and cpu_linear.supported(tensor)
+
+
 def detect(state_dict, verboseLevel=1):
     matched = detect_nvfp4_state_dict(state_dict)
     details = describe_nvfp4_state_dict(state_dict) if matched else {}
@@ -767,8 +816,14 @@ class _NVFP4RowProjection:
         bias = None if module.bias is None else module.bias[first:last]
         backend = _NVFP4RowProjection.key(module)[1]
         if backend is None:
-            dense = _dequantize_nvfp4_weight(data, scales, weight._input_global_scale, weight._alpha, prepared.dtype, prepared.device, layout=weight._layout)
-            out = torch.nn.functional.linear(prepared, dense, bias)
+            triton_w4a16 = _triton_w4a16() if weight._pre_quant_scale is None else None
+            if (triton_w4a16 is not None and triton_w4a16.supported(weight, prepared) and (last - first) % 128 == 0
+                    and _prefer_triton_w4a16(prepared, weight)):
+                _nvfp4_note_triton()
+                out = triton_w4a16.linear(prepared, triton_w4a16.RowSlice(weight, first, last), bias)
+            else:
+                dense = _dequantize_nvfp4_weight(data, scales, weight._input_global_scale, weight._alpha, prepared.dtype, prepared.device, layout=weight._layout)
+                out = torch.nn.functional.linear(prepared, dense, bias)
         else:
             q, qs, rows, dtype = prepared
             input_scale, alpha = weight._input_global_scale, weight._alpha
@@ -1188,7 +1243,11 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         pre_quant_scale = getattr(self.qweight, "_pre_quant_scale", None)
         if pre_quant_scale is not None:
             input = input * pre_quant_scale.to(device=input.device, dtype=input.dtype)
-        return torch.nn.functional.linear(input, self.qweight, bias=self.bias)
+        qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
+        return torch.nn.functional.linear(input, qweight, bias=self.bias)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs

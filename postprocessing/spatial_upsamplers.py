@@ -115,7 +115,8 @@ UPSAMPLER_CONFIG_KEY = "spatial_upsamplers"
 PERSISTENCE_CONFIG_KEY = "persistence"
 PERSIST_UNLOAD = 1
 PERSIST_RAM = 2
-PERSISTENCE_CHOICES = [("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
+PERSIST_AUTO = 3 # stays loaded with memory profile 0 (its RAM pinned only while it runs, shared with the other models) and the current model's VRAM Preload
+PERSISTENCE_CHOICES = [("Auto", PERSIST_AUTO), ("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
 _SHARED_PERSISTENCE_BINDING_KEY = "__shared_persistence__"
 MULTIPLIER_SEPARATOR = "*"
 
@@ -204,7 +205,7 @@ def _config_key_from_handler_def(handler_def: dict[str, Any], fallback_name: str
 
 
 def default_config_sections(handler_modules: list[str] | None = None) -> dict[str, Any]:
-    sections = {PERSISTENCE_CONFIG_KEY: PERSIST_UNLOAD}
+    sections = {PERSISTENCE_CONFIG_KEY: PERSIST_AUTO}
     for path in spatial_upsampler_handlers if handler_modules is None else handler_modules:
         handler_cls = _load_upsampler_class(str(path or "").strip())
         if not hasattr(handler_cls, "default_config"):
@@ -1002,18 +1003,23 @@ def normalize_persistence(value) -> int:
         value = int(value)
     except (TypeError, ValueError):
         value = PERSIST_UNLOAD
-    return value if value in (PERSIST_UNLOAD, PERSIST_RAM) else PERSIST_UNLOAD
+    return value if value in (PERSIST_UNLOAD, PERSIST_RAM, PERSIST_AUTO) else PERSIST_UNLOAD
 
 
 def persistence(server_config: dict[str, Any] | None = None) -> int:
     config = _upsampler_server_config if server_config is None else server_config
     if config is None:
         raise RuntimeError("Spatial upsamplers are not registered")
-    return normalize_persistence(_nested_configs(config).get(PERSISTENCE_CONFIG_KEY, PERSIST_UNLOAD))
+    return normalize_persistence(_nested_configs(config).get(PERSISTENCE_CONFIG_KEY, PERSIST_AUTO))
 
 
 def persistent_models(server_config: dict[str, Any] | None = None) -> bool:
-    return persistence(server_config) == PERSIST_RAM
+    return persistence(server_config) in (PERSIST_RAM, PERSIST_AUTO)
+
+
+def automatic_memory(server_config: dict[str, Any] | None = None) -> bool:
+    """Auto: the models stay loaded and use memory profile 0 with the current model's VRAM Preload mode."""
+    return persistence(server_config) == PERSIST_AUTO
 
 
 def write_persistence(server_config: dict[str, Any], value) -> int:

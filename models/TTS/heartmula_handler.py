@@ -30,7 +30,7 @@ def _get_heartmula_model_def():
             "placeholder": "piano,happy,wedding",
             "lines": 2,
         },
-        "lm_engines": ["cg"],
+        "lm_decoder": True,
         "text_prompt_enhancer_instructions": HEARTMULA_LYRIC_PROMPT,
         "prompt_enhancer_button_label": "Compose Lyrics",
         "duration_slider": {
@@ -115,7 +115,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         from .HeartMula.pipeline import HeartMuLaPipeline
@@ -146,10 +146,9 @@ class family_handler:
             codec_steps=model_def.get("heartmula_codec_steps", 10),
             codec_guidance_scale=model_def.get("heartmula_codec_guidance_scale", 1.25),
             codec_version=model_def.get("heartmula_codec_version", ""),
-            lm_decoder_engine=lm_decoder_engine,
+            cuda_graphs=lm_features.graphs,
+            flash_attention=lm_features.flash,
         )
-        if lm_decoder_engine=="cg":
-            pipeline.mula._budget = 0
 
         pipeline.mula.decoder[0].layers._compile_me = False
         pipeline.mula.backbone.layers._compile_me = False
@@ -164,9 +163,11 @@ class family_handler:
                 "transformer": ["transformer2"],
                 "transformer2": ["transformer"],
             },
+            # their decoding steps are MMGP graphs: the backbone may stream its layers (memory profile, VRAM preload)
+            "cudaGraphs": ["transformer", "transformer2"] if lm_features.graphs else False,
         }
 
-        if int(profile) in (2, 4, 5):
+        if int(profile) in (0, 2, 4, 5):
             pipe["budgets"] = {"transformer2": 200}
 
         return pipeline, pipe

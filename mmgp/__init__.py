@@ -3,7 +3,9 @@ import enum
 class profile_type(int, enum.Enum): 
     @staticmethod
     def tostr(v):
-        if v == 1:
+        if v == 0:
+            s = "AutoRAM_AutoVRAM"
+        elif v == 1:
             s= "HighRAM_HighVRAM" 
         elif v == 2:
             s ="HighRAM_LowVRAM"
@@ -15,6 +17,7 @@ class profile_type(int, enum.Enum):
             s = "VerylowRAM_LowVRAM"
         return s
     
+    AutoRAM_AutoVRAM  = 0
     HighRAM_HighVRAM  = 1
     HighRAM_LowVRAM  = 2
     LowRAM_HighVRAM  = 3

@@ -220,7 +220,7 @@ def validate_audio_copy_container(ffprobe_path: str, source_path: str, video_con
     video_container = normalize_container_name(video_container)
     if video_container not in {"mp4", "mov"}:
         return
-    supported_codecs = {"aac", "ac3", "alac", "eac3", "mp3", "opus"} if video_container == "mp4" else {"aac", "ac3", "alac", "eac3", "mp3", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
+    supported_codecs = {"aac", "ac3", "alac", "eac3", "flac", "mp3", "opus"} if video_container == "mp4" else {"aac", "ac3", "alac", "eac3", "mp3", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
     audio_codecs = _probe_audio_stream_codecs(ffprobe_path, source_path)
     if audio_track_no is None:
         selected_codecs = [codec for codec in audio_codecs if len(codec) > 0]
@@ -310,6 +310,8 @@ def start_av_mux_process(ffmpeg_path: str, output_path: str, width: int, height:
     else:
         command += ["-map", f"1:a:{max(0, int(audio_track_no) - 1)}?"]
     command += get_video_encode_args(video_codec, video_container) + ["-c:a", "copy", "-shortest"]
+    if normalize_container_name(video_container) == "mp4":
+        command += ["-strict", "-2"]
     command += _get_live_mux_output_args(video_container)
     command += [output_path]
     return subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)

@@ -8,7 +8,7 @@ import torch
 from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype
 
-from . import safetensors2
+from . import row_views, safetensors2
 
 
 _QTYPE_QMODULE_CACHE = None
@@ -272,6 +272,11 @@ def expert_formats():
     """Routed-expert storage formats (mmgp.expert_compute.ExpertFormat) of the registered handlers: their optional EXPERT_FORMATS."""
     return [format for handler in _load_handlers() for format in getattr(handler, "EXPERT_FORMATS", ())]
 
+def cpu_compute_supported(tensor):
+    """Whether a registered handler computes linears with this weight on the CPU, in its storage (its optional cpu_compute_supported(tensor)):
+    the blocks that MMGP leaves on the CPU then compute it there (cpuCompute)."""
+    return any(getattr(handler, "cpu_compute_supported", None) is not None and handler.cpu_compute_supported(tensor) for handler in _load_handlers())
+
 _FILE_EXTENSION_HANDLERS = {}
 
 
@@ -394,9 +399,16 @@ def _get_split_handler(info, field, default_handlers):
         handler = handlers.get(field)
         if handler is not None:
             return handler
+    if info.get("interleaved") and field in ("weight", "bias"):
+        return _split_interleaved
     if default_handlers:
         return default_handlers.get(field)
     return None
+
+
+def _split_interleaved(src, dim, split_sizes, context):
+    # rows interleaved head by head, (heads, projections, head_dim): each projection's rows gathered into a copy
+    return [row_views.gather(src, slot, len(split_sizes), context["info"]["attention_head_dim"]) for slot in range(len(split_sizes))]
 
 
 def _get_split_base_fields(info, split_fields):
@@ -1124,7 +1136,9 @@ def _remap_quantization_entries(quantization_map, base, targets):
             quantization_map[target + suffix] = cfg
 
 
-def split_fused_weights(state_dict, quantization_map, fused_split_map, default_dtype=None, verboseLevel=1):
+def split_fused_weights(state_dict, quantization_map, fused_split_map, default_dtype=None, verboseLevel=1, row_view_bases=None):
+    """Splits the fused weights of fused_split_map. Unquantized weights whose entry declares "interleaved" rows are kept fused when the
+    registered row view kernel computes their projections (appended to row_view_bases as (base, entry), see row_views.install)."""
     if not fused_split_map or not state_dict:
         return state_dict, quantization_map
 
@@ -1163,6 +1177,8 @@ def split_fused_weights(state_dict, quantization_map, fused_split_map, default_d
         qtype_name = info["qtype"]
         if not qtype_name:
             continue
+        if (fused_split_map.get(info["suffix"]) or {}).get("interleaved"):
+            raise ValueError(f"'{base}': quantized weights with rows interleaved head by head are not supported; store them grouped")
         handler = handler_map.get(qtype_name)
         if handler is None:
             continue
@@ -1194,6 +1210,12 @@ def split_fused_weights(state_dict, quantization_map, fused_split_map, default_d
         base for base, info in bases_info.items()
         if not info["qtype"] and base not in handled_bases
     ]
+    if row_view_bases is not None:
+        for base in list(default_bases):
+            info = fused_split_map[bases_info[base]["suffix"]]
+            if info.get("interleaved") and row_views.available(state_dict[base + ".weight"].dtype, info["attention_head_dim"]):
+                row_view_bases.append((base, info))
+                default_bases.remove(base)
     if default_bases:
         state_dict, split_bases = sd_split_linear(
             state_dict,

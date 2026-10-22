@@ -14,6 +14,7 @@ class family_handler():
             return qwen21.query_model_def(base_model_type, model_def)
         extra_model_def = {
             "image_outputs" : True,
+            "sage_v_scaling": True,  # v overflows the fp16 P.V sums of the SageAttention Triton kernels: NaN without scaling
             "device_explicit": base_model_type in ("qwen_image_20B", "qwen_image_edit_20B", "qwen_image_edit_plus_20B", "qwen_image_edit_plus2_20B", "qwen_image_layered_20B"),
             "cuda_graphs": ["transformer"],
             "sample_solvers":[

@@ -5,6 +5,7 @@ activations on the tensor cores (fp32 accumulation). The weight matrix is never 
 up to the order of the sums.
 
 GPUs before sm89 cannot convert float8 in Triton: their weights are read as bytes and decoded with integer operations (same values).
+Before sm80, BF16 and FP32 products use IEEE FP32 arithmetic, preserving BF16's range without requiring BF16 or TF32 tensor cores.
 
 Tile sizes, as the INT8 Triton tuner does: the calls are grouped in slots (a range of tokens: tiny <= 16, small <= 128, large, for a
 layer shape N x K and kernel variant). A slot starts with a static configuration and is tuned once, outside CUDA graph recording and
@@ -23,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-_CACHE_VERSION = 4  # bump when the kernel, the slots or the benchmark change: tuned configurations of other versions are ignored
+_CACHE_VERSION = 6  # bump when the kernel, the slots or the benchmark change: tuned configurations of other versions are ignored
 _CACHE_PATH = Path(os.environ.get("WAN2GP_FP8_TRITON_CACHE", Path.home() / ".triton" / "autotune" / "wan2gp_fp8_w8a16_cache.json")).expanduser()
 _DECODE = {"native": 0, torch.float8_e4m3fn: 1, torch.float8_e5m2: 2}
 # (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages); the first one of each slot is its static configuration (the most frequent winner on
@@ -61,10 +62,23 @@ def _decode_e5m2(bits):
     return (bits.to(tl.uint16) << 8).to(tl.float16, bitcast=True).to(tl.float32)
 
 
+@triton.jit
+def _decode_bf16(bits):
+    return (bits.to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _encode_bf16(value):
+    # Round to nearest even without BF16 instructions (unavailable before sm80).
+    bits = value.to(tl.uint32, bitcast=True)
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    return tl.where(value != value, 0x7FC0, rounded).to(tl.uint16)
+
+
 @triton.jit(do_not_specialize=["M"])  # one binary per configuration whatever the number of tokens
 def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
                   SCALE_PER_N: tl.constexpr, HAS_BIAS: tl.constexpr, DECODE: tl.constexpr, EVEN_K: tl.constexpr,
-                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr):
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr, BF16_SIMT: tl.constexpr, IEEE: tl.constexpr):
     pid = tl.program_id(0)
     tiles_m, tiles_n = tl.cdiv(M, BM), tl.cdiv(N, BN)
     group = GROUP_M * tiles_n
@@ -77,9 +91,13 @@ def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
     rk = tl.arange(0, BK)
     dtype = out.dtype.element_ty
     if SCALE_PER_N:
-        s = tl.load(scale + rn, mask=rn < N, other=0).to(tl.float32)[None, :]
+        s = tl.load(scale + rn, mask=rn < N, other=0)[None, :]
     else:
-        s = tl.load(scale).to(tl.float32)
+        s = tl.load(scale)
+    if BF16_SIMT:
+        s = _decode_bf16(s)
+    else:
+        s = s.to(tl.float32)
     a_ptr = x + rm[:, None] * sxm + rk[None, :] * sxk
     b_ptr = w + rn[None, :] * swn + rk[:, None] * swk
     acc = tl.zeros((BM, BN), dtype=tl.float32)
@@ -98,12 +116,27 @@ def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
             b = b.to(tl.float32)
         if not EVEN_K:  # rows beyond K would multiply undefined values into the sums
             b = tl.where(k_mask[:, None], b, 0.0)
-        acc = tl.dot(a, (b * s).to(dtype), acc)  # the weight as quanto dequantizes it: its value times its scale, in the compute dtype
+        # Round dequantized weights to the compute dtype before multiplying, as Quanto does.
+        if BF16_SIMT:
+            acc = tl.dot(_decode_bf16(a), _decode_bf16(_encode_bf16(b * s)), acc, input_precision="ieee")
+        else:
+            acc = tl.dot(a, (b * s).to(dtype), acc, input_precision="ieee" if IEEE else "tf32")
         a_ptr += BK * sxk
         b_ptr += BK * swk
-    result = acc.to(dtype)
-    if HAS_BIAS:  # quanto adds the bias to the rounded output
-        result = (result.to(tl.float32) + tl.load(bias + rn, mask=rn < N, other=0).to(tl.float32)[None, :]).to(dtype)
+    if HAS_BIAS:
+        bias_value = tl.load(bias + rn, mask=rn < N, other=0)[None, :]
+        if bias.dtype.element_ty == tl.uint16:
+            bias_value = _decode_bf16(bias_value)
+        else:
+            bias_value = bias_value.to(tl.float32)
+    if BF16_SIMT:
+        result = _encode_bf16(acc)
+        if HAS_BIAS:
+            result = _encode_bf16(_decode_bf16(result) + bias_value)
+    else:
+        result = acc.to(dtype)
+        if HAS_BIAS:  # quanto adds the bias to the rounded output
+            result = (result.to(tl.float32) + bias_value).to(dtype)
     tl.store(out + rm[:, None] * som + rn[None, :] * son, result, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
@@ -117,9 +150,16 @@ def _launch(x, weight, scale, bias, out, decode, config):
     m, k = x.shape
     n = weight.shape[0]
     w = weight if decode == 0 else weight.view(torch.uint8)
+    pre_sm80 = torch.cuda.get_device_capability(x.device) < (8, 0)
+    bf16_simt = out.dtype == torch.bfloat16 and pre_sm80
+    if bf16_simt:
+        x, scale, out = x.view(torch.uint16), scale.view(torch.uint16), out.view(torch.uint16)
+    if pre_sm80 and bias is not None and bias.dtype == torch.bfloat16:
+        bias = bias.view(torch.uint16)
     _w8a16_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
         x, w, scale, bias, out, m, n, k, x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
-        scale.numel() > 1, bias is not None, decode, k % bk == 0, bm, bn, bk, 8, num_warps=warps, num_stages=stages)
+        scale.numel() > 1, bias is not None, decode, k % bk == 0, bm, bn, bk, 8,
+        BF16_SIMT=bf16_simt, IEEE=pre_sm80, num_warps=warps, num_stages=stages)
 
 
 def _load_cache():
@@ -157,13 +197,12 @@ def _time(x, weight, scale, bias, out, decode, config, reps):
     return start.elapsed_time(end) / reps
 
 
-def _tune(key, slot, x, weight, scale, bias, out, decode):
+def _tune(key, slot, x, weight, scale, bias, out, decode, candidates):
     """The slot's configuration: candidates checked on a small slice against the static one, timed on representative rows of the call
     (its own input and output), kept when at least 2% faster than the static one."""
     global _tuned_slots
     started = time.time()
     _tuned_slots += 1
-    candidates = _CANDIDATES[slot]
     rows = min(x.shape[0], _LARGE_TUNE_TOKENS)
     bench_x, bench_out = x[:rows], out[:rows]
     probe_rows, probe_cols = min(rows, 256), min(weight.shape[0], 256)
@@ -209,7 +248,10 @@ def linear(x, weight, scale, bias, out):
     key = f"{device}|{slot}|{n}|{k}|{decode}|{str(weight.dtype)[6:]}|{str(out.dtype)[6:]}|{int(scale.numel() > 1)}|{int(bias is not None)}"
     config = _load_cache().get(key)
     if config is None:
-        config = _tune(key, slot, x, weight, scale, bias, out, decode) if _can_tune(slot, m) else _CANDIDATES[slot][0]
+        candidates = _CANDIDATES[slot]
+        if slot == "tiny" and x.dtype in (torch.bfloat16, torch.float32) and torch.cuda.get_device_capability(x.device) < (8, 0):
+            candidates = candidates[1:]  # the first tile's FP32 operands need 72 KiB; Turing has 64 KiB
+        config = _tune(key, slot, x, weight, scale, bias, out, decode, candidates) if _can_tune(slot, m) else candidates[0]
     _launch(x, weight, scale, bias, out, decode, tuple(config))
     return out
 

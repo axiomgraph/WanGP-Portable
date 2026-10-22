@@ -117,7 +117,7 @@ def norm_rope_(x, weight, rope, eps):
     """RMSNorm (FP32 weight) then RoPE ((cos, sin) of shape (tokens, 1, head_dim / 2), FP32) of x (batch, tokens, heads, head_dim) BF16 in
     place; x may be a view of a group of heads."""
     batch, tokens, heads, dim = x.shape
-    cos, sin = (None, None) if rope is None else rope
+    cos, sin = (None, None) if rope is None else rope[:2]
 
     def launch(target, config):
         block_heads, warps = config

@@ -234,7 +234,7 @@ def get_qwen3_model_def(base_model_type: str) -> dict:
         "prompt_enhancer_button_label": "Write",
         "compile": False,
         "parent_model_type": "qwen3_tts_base",
-        "lm_engines": ["cg"],
+        "lm_decoder": True,
             "prompt_enhancer_def": {
                 "selection": ["T", "T1"] if base_model_type == "qwen3_tts_base" else ["T"],
                 "labels": {
@@ -379,7 +379,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         from .qwen3.pipeline import Qwen3TTSPipeline
@@ -402,17 +402,8 @@ class family_handler:
             base_model_type=base_model_type,
             ckpt_root=ckpt_root,
             device=mps_device_or(torch.device("cpu")),
-            lm_decoder_engine=lm_decoder_engine,
+            cuda_graphs=lm_features.graphs,
         )
-        if str(lm_decoder_engine).strip().lower() in ("cg", "cudagraph"):
-            pipeline.model._budget = 0
-            talker = getattr(pipeline.model, "talker", None)
-            if talker is not None:
-                talker._budget = 0
-                code_predictor = getattr(talker, "code_predictor", None)
-                if code_predictor is not None:
-                    code_predictor._budget = 0
-
         pipe = {"transformer": pipeline.model}
         if getattr(pipeline, "speech_tokenizer", None) is not None:
             pipe["speech_tokenizer"] = pipeline.speech_tokenizer.model
@@ -424,7 +415,8 @@ class family_handler:
                 config_candidate = os.path.join("qwen3", "configs", f"{base_model_type}.json")
                 config_path = fl.locate_file(config_candidate, error_if_none=False) or config_candidate
             save_quantized_model(pipeline.model, model_type, weights_path, dtype or torch.bfloat16, config_path)
-        return pipeline, pipe
+        # its decoding steps are MMGP graphs: the talker and the code predictor may stream their layers (memory profile, VRAM preload)
+        return pipeline, {"pipe": pipe, "cudaGraphs": ["transformer"] if lm_features.graphs else False}
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):

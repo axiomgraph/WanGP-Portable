@@ -7,6 +7,13 @@ from ..common.normalization import PixelNorm
 from ..transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 from .convolution import make_conv_nd, make_linear_nd
 from .enums import NormLayerType, PaddingModeType
+from shared.kernels import vae_ops
+
+
+def _norm_act(norm, act, x):
+    """act(norm(x)) through the shared PixelNorm + SiLU (x handed off by the caller)."""
+    x_list, x = [x], None
+    return vae_ops.pixel_norm_silu(x_list, norm, act, channel_norm=isinstance(norm, PixelNorm) and norm.dim == 1)
 
 
 class ResnetBlock3D(nn.Module):
@@ -126,7 +133,6 @@ class ResnetBlock3D(nn.Module):
         hidden_states = input_tensor
         batch_size = hidden_states.shape[0]
 
-        hidden_states = self.norm1(hidden_states)
         if self.timestep_conditioning:
             if timestep is None:
                 raise ValueError("'timestep' parameter must be provided when 'timestep_conditioning' is True")
@@ -142,9 +148,9 @@ class ResnetBlock3D(nn.Module):
             )
             shift1, scale1, shift2, scale2 = ada_values.unbind(dim=1)
 
-            hidden_states = hidden_states * (1 + scale1) + shift1
-
-        hidden_states = self.non_linearity(hidden_states)
+            hidden_states = self.non_linearity(self.norm1(hidden_states) * (1 + scale1) + shift1)
+        else:
+            hidden_states = _norm_act(self.norm1, self.non_linearity, hidden_states)
 
         hidden_states = self.conv1(hidden_states, causal=causal)
 
@@ -155,12 +161,10 @@ class ResnetBlock3D(nn.Module):
                 generator=generator,
             )
 
-        hidden_states = self.norm2(hidden_states)
-
         if self.timestep_conditioning:
-            hidden_states = hidden_states * (1 + scale2) + shift2
-
-        hidden_states = self.non_linearity(hidden_states)
+            hidden_states = self.non_linearity(self.norm2(hidden_states) * (1 + scale2) + shift2)
+        else:
+            hidden_states = _norm_act(self.norm2, self.non_linearity, hidden_states)
 
         hidden_states = self.dropout(hidden_states)
 

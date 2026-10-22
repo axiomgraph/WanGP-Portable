@@ -53,7 +53,7 @@ _HIGH_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 4)
 _HIGH_SHARED_MEMORY_CONFIG_BYTES = 102400
 _LOW_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 3)
 
-# Tuned decode-time configs reused from nanovllm int8 kernels.
+# Tuned decode-time configs reused from the LM engine's int8 kernels.
 _TRITON_SMALL_M_CONFIGS = {
     (2048, 4096): (2, 32, 256, 8, 5),
     (2048, 2048): (1, 32, 64, 2, 4),
@@ -811,7 +811,7 @@ def _benchmark_config_ms(kind: str, cfg: tuple[int, int, int, int, int], tensors
             end = torch.cuda.Event(enable_timing=True)
             if _use_cg_autotune(_device_index(device)):
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                     for _ in range(iters):
                         _launch_candidate(kind, cfg, tensors, m, n, k)
                 graph.replay()

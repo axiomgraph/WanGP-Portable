@@ -333,7 +333,8 @@ def mark_peak(device=None):
 
 
 def room(device=None):
-    """VRAM the allocator may still take, in bytes: the driver's free memory, or NVML's free memory of the whole GPU if smaller."""
+    """VRAM the allocator may still take, in bytes: this process' free budget (DXGI on Windows, the driver's free memory elsewhere), or NVML's
+    free memory of the whole GPU if smaller."""
     return _lib.vmm_room(_device_index(device))
 
 
@@ -359,6 +360,11 @@ def _redirect_torch_memory_functions():
         return {"allocated_bytes.all.current": s["allocated"], "allocated_bytes.all.peak": s["peak_allocated"],
                 "reserved_bytes.all.current": s["reserved"], "reserved_bytes.all.peak": s["peak_reserved"], "num_alloc_retries": 0}
 
+    driver_mem_get_info = torch.cuda.memory.mem_get_info
+
+    def mem_get_info(device=None):  # free: the room of this allocator (the driver's figure misses VRAM on Windows, see room_now), total: the driver's
+        return room(device), driver_mem_get_info(device)[1]
+
     for module in (torch.cuda, torch.cuda.memory):
-        for fn in (memory_allocated, memory_reserved, max_memory_allocated, max_memory_reserved, reset_peak_memory_stats, memory_stats):
+        for fn in (memory_allocated, memory_reserved, max_memory_allocated, max_memory_reserved, reset_peak_memory_stats, memory_stats, mem_get_info):
             setattr(module, fn.__name__, fn)

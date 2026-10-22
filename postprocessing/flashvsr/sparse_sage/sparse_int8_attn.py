@@ -14,16 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import torch, math
 import triton
 import triton.language as tl
 import torch.nn.functional as F
 
+from shared.kernels.dispatch import triton_dtype_supported
+
+
+@functools.cache
+def _no_int8_dot(device):
+    # Triton has no INT8 tensor-core product below sm_80 on NVIDIA GPUs (Turing)
+    return torch.version.hip is None and torch.cuda.get_device_capability(device) < (8, 0)
+
+
 @triton.jit
 def _attn_fwd_inner(acc, l_i, old_m, q, q_scale, kv_len,
                     K_ptrs, K_bid_ptr, K_scale_ptr, V_ptrs, stride_kn, stride_vn, start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr, FP16_DOT: tl.constexpr,
                     ):
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -41,7 +51,10 @@ def _attn_fwd_inner(acc, l_i, old_m, q, q_scale, kv_len,
             k_mask = offs_n[None, :] < (kv_len - start_n)   
             k = tl.load(K_ptrs, mask = k_mask)
             k_scale = tl.load(K_scale_ptr)
-            qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
+            if FP16_DOT:  # the INT8 values on FP16 tensor cores: exact (products below 2^14, sums of HEAD_DIM of them below 2^24 in FP32)
+                qk = tl.dot(q, k.to(tl.float16), out_dtype=tl.float32) * q_scale * k_scale
+            else:
+                qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
             if STAGE == 2:
                 mask = offs_m[:, None] >= (start_n + offs_n[None, :])
                 qk = qk + tl.where(mask, 0, -1.0e6)
@@ -77,8 +90,10 @@ def _attn_fwd(Q, K, K_blkid, V, Q_scale, K_scale, Out,
               qo_len, kv_len, H:tl.constexpr, num_kv_groups:tl.constexpr, 
               HEAD_DIM: tl.constexpr,  
               BLOCK_M: tl.constexpr,  
-              BLOCK_N: tl.constexpr,  
-              STAGE: tl.constexpr
+              BLOCK_N: tl.constexpr,
+              STAGE: tl.constexpr,
+              BF16_BITS: tl.constexpr,
+              FP16_DOT: tl.constexpr
               ):
     start_m = tl.program_id(0)
     off_z = tl.program_id(2).to(tl.int64)
@@ -100,27 +115,36 @@ def _attn_fwd(Q, K, K_blkid, V, Q_scale, K_scale, Out,
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
+    if FP16_DOT:
+        q = q.to(tl.float16)
     q_scale = tl.load(Q_scale_ptr)
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_bid_ptr, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                    start_m,  
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
+                                    start_m,
+                                    BLOCK_M, HEAD_DIM, BLOCK_N,
+                                    4 - STAGE, offs_m, offs_n, FP16_DOT
                                     )
     if STAGE != 1:
         acc, l_i, _ = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_bid_ptr, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                        start_m,  
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                        2, offs_m, offs_n 
+                                        start_m,
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,
+                                        2, offs_m, offs_n, FP16_DOT
                                         )
     acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+    if BF16_BITS:  # written as the bits of BF16, rounded to nearest even as the conversion instruction (NaN: 0x7FC0)
+        bits = acc.to(tl.uint32, bitcast=True)
+        out = tl.where(acc != acc, 0x7FC0, (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).to(tl.uint16).to(tl.int16, bitcast=True)
+        tl.store(O_block_ptr, out, mask = (offs_m[:, None] < qo_len))
+    else:
+        tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
 
 def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layout="HND", output_dtype=torch.float16):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 3 if is_causal else 1
-    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    bits = output_dtype == torch.bfloat16 and not triton_dtype_supported(q.device, output_dtype)  # Turing: the BF16 output written as its bits
+    fp16_dot = _no_int8_dot(q.device)
+    o = torch.empty(q.shape, dtype=torch.int16 if bits else output_dtype, device=q.device)
 
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
@@ -156,7 +180,7 @@ def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layou
         qo_len, kv_len,
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
-        STAGE=stage,  
+        STAGE=stage, BF16_BITS=bits, FP16_DOT=fp16_dot,
         num_warps=4 if head_dim == 64 else 8,
         num_stages=4)
-    return o
+    return o.view(torch.bfloat16) if bits else o

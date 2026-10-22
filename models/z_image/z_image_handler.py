@@ -13,6 +13,7 @@ class family_handler:
         extra_model_def = {
             "image_outputs": True,
             "dtype": "bf16",  # in FP16 the activations overflow from the first refiner block: black or prompt-less images
+            "sage_v_scaling": z_image_base,  # v overflows the fp16 P.V sums of the SageAttention Triton kernels
             "device_explicit": base_model_type != "z_image_control",
             "cuda_graphs": [] if base_model_type in ("z_image_control", "z_image_control2", "z_image_control2_1") else ["transformer"],  # control blocks run control layers inside them
             "guidance_max_phases": guidance_max_phases,

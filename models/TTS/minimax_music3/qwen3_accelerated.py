@@ -1,11 +1,11 @@
-"""Qwen3 decode model adapted from WanGP's nano-vLLM implementation."""
+"""Qwen3 decode model adapted from WanGP's LM engine (shared/llm_engines/lmgp, derived from nano-vLLM)."""
 
 import torch
 import torch.nn as nn
 
-from shared.llm_engines.nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from shared.llm_engines.nanovllm.layers.layernorm import RMSNorm
-from shared.llm_engines.nanovllm.models.qwen3 import Qwen3DecoderLayer
+from shared.llm_engines.lmgp.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from shared.llm_engines.lmgp.layers.layernorm import RMSNorm
+from shared.llm_engines.lmgp.models.qwen3 import Qwen3DecoderLayer
 
 
 class MiniMaxMusic3Qwen3Model(nn.Module):

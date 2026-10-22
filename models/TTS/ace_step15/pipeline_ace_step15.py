@@ -113,7 +113,7 @@ class ACEStep15Pipeline:
         transformer_model_class=AceStepConditionGenerationModel,
         enable_lm: bool = True,
         ignore_lm_cache_seed: bool = False,
-        lm_decoder_engine: str = "legacy",
+        lm_features=None,
         device=None,
         dtype=torch.bfloat16,
     ):
@@ -139,9 +139,7 @@ class ACEStep15Pipeline:
         self.silence_latent_path = silence_latent_path
         self.transformer_model_class = transformer_model_class
         self.ignore_lm_cache_seed = bool(ignore_lm_cache_seed)
-        self.lm_engine = str(lm_decoder_engine or "legacy").strip().lower()
-        if self.lm_engine not in {"legacy", "vllm"}:
-            raise ValueError(f"Unsupported LM engine '{lm_decoder_engine}'. Expected one of: legacy, vllm.")
+        self.lm_features = lm_features  # the LM decoder's optimizations (shared.llm_engines.lmgp.vllm_support.LMFeatures)
 
         self._interrupt = False
         self._early_stop = False
@@ -329,13 +327,12 @@ class ACEStep15Pipeline:
                 state_dict["lm_head.weight"] = state_dict[embed_key]
             return state_dict, quantization_map, tied_weights_map
 
-        if self.lm_engine == "vllm":
-            from shared.llm_engines.nanovllm.models.qwen3 import Qwen3ForCausalLM as NanoQwen3ForCausalLM
-            model_class = NanoQwen3ForCausalLM
-            unlimited_budget = True
+        engine_model = self.lm_features.graphs  # the LM engine (CUDA graphs, Triton and FlashAttention 2 where supported), else HF Qwen3
+        if engine_model:
+            from shared.llm_engines.lmgp.models.qwen3 import Qwen3ForCausalLM as EngineQwen3ForCausalLM
+            model_class = EngineQwen3ForCausalLM
         else:
             model_class = HfQwen3ForCausalLM
-            unlimited_budget = False
 
         self.lm_model = offload.fast_load_transformers_model(
             self.lm_weights_path,
@@ -346,23 +343,20 @@ class ACEStep15Pipeline:
             writable_tensors=False,
             ignore_unused_weights=True,
         )
+        self.lm_model._mm_pinned_pool = True  # registered as text_encoder but decodes token by token: its blocks enter MMGP's pinned pool
         from shared.kernels.int8_backend import require_int8_residual
         require_int8_residual(self.lm_model, "ACE-Step LM Activation Outliers")
-        if unlimited_budget: self.lm_model._budget = 0
+        if engine_model:
+            from shared.llm_engines.lmgp.vllm_support import configure_engine_kernels
+            configure_engine_kernels(self.lm_model, self.lm_features)
+            self.lm_model._lm_engine_mmgp_graphs = True  # the engine's decoding passes are MMGP graphs: the LM may stream its layers
         self.lm_model.eval()
 
     def _init_lm_engine(self):
         if self.lm_model is None or self.lm_tokenizer is None:
-            raise RuntimeError(f"LM engine '{self.lm_engine}' requires loaded LM model and tokenizer.")
+            raise RuntimeError("The LM engine requires a loaded LM model and tokenizer.")
         common_kwargs = {"model": self.lm_model, "tokenizer": self.lm_tokenizer, "device": self.device}
-        engine_builders = {
-            "legacy": lambda: Qwen3LegacyEngine(**common_kwargs),
-            "vllm": lambda: Qwen3VllmEngine(lm_weights_path=self.lm_weights_path, **common_kwargs),
-        }
-        build_engine = engine_builders.get(self.lm_engine, None)
-        if build_engine is None:
-            raise RuntimeError(f"Unsupported LM engine '{self.lm_engine}'.")
-        self._lm_engine_impl = build_engine()
+        self._lm_engine_impl = Qwen3VllmEngine(lm_weights_path=self.lm_weights_path, **common_kwargs) if self.lm_features.graphs else Qwen3LegacyEngine(**common_kwargs)
 
     def _load_silence_latent(self):
         if not self.silence_latent_path or not os.path.isfile(self.silence_latent_path):
@@ -639,7 +633,7 @@ class ACEStep15Pipeline:
         ignore_eos: bool = False,
     ):
         if self._lm_engine_impl is None:
-            raise RuntimeError(f"LM engine '{self.lm_engine}' is not initialized for text generation.")
+            raise RuntimeError("The LM engine is not initialized for text generation.")
         output = self._lm_engine_impl.generate_text(
             prompt=prompt,
             prompt_negative=prompt_negative,
@@ -911,7 +905,7 @@ class ACEStep15Pipeline:
             os.path.abspath(self.lm_weights_path) if self.lm_weights_path else "",
             os.path.abspath(self.lm_tokenizer_dir) if self.lm_tokenizer_dir else "",
             _DEFAULT_LM_INSTRUCTION,
-            self.lm_engine,
+            self.lm_features[:3],  # graphs, Triton, FlashAttention 2: each rounds differently
             str(tags or ""),
             str(lyrics or ""),
             int(bpm),
@@ -1005,7 +999,7 @@ class ACEStep15Pipeline:
         prompt_negative = self._build_lm_prompt_with_cot(tags, lyrics, cot_text, is_negative_prompt=True, negative_prompt=negative_prompt)
 
         if self._lm_engine_impl is None:
-            raise RuntimeError(f"LM engine '{self.lm_engine}' is not initialized.")
+            raise RuntimeError("The LM engine is not initialized.")
         audio_codes, failure_reason = generate_audio_codes_with_engine_sampling(
             engine=self._lm_engine_impl,
             tokenizer=self.lm_tokenizer,
@@ -1709,6 +1703,7 @@ class ACEStep15Pipeline:
 
         return xt
 
+    @torch.inference_mode()
     def generate(
         self,
         input_prompt: str,
@@ -2031,7 +2026,7 @@ class ACEStep15Pipeline:
                     extra = f" last_failure={failure_reason}" if failure_reason else ""
                     raise RuntimeError(
                         "Audio code generation returned 0 usable codes "
-                        f"(engine={self.lm_engine}, tokenizer_dir='{self.lm_tokenizer_dir}', "
+                        f"({self.lm_features.describe()}, tokenizer_dir='{self.lm_tokenizer_dir}', "
                         f"audio_code_vocab={len(getattr(self, '_audio_code_token_ids', []))}).{extra}"
                     )
                 max_code = getattr(self, "_audio_code_max", None)

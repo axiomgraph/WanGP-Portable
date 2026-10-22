@@ -1,15 +1,8 @@
 .*
 *.py[cod]
-# *.jpg
-*.jpeg
-# *.png
-*.gif
-*.bmp
-*.mp4
-*.webm
+!/shared/triton_runtime/cuda_utils.cp311-win_amd64.pyd
+!/shared/triton_runtime/hip_utils.cp312-win_amd64.pyd
 *.npy
-*.mov
-*.mkv
 *.log
 *.zip
 *.pt
@@ -20,9 +13,6 @@
 # *.txt
 *.backup
 *.pkl
-*.html
-!shared/deepy/web/app.html
-!plugins/motion_designer/assets/motion_designer_iframe_template.html
 *.pdf
 *.whl
 *.exe
@@ -39,18 +29,25 @@ samples/
 *DS_Store
 google/
 finetunes/
+# Keep source web, image and video assets visible; ignore generated media by location.
 outputs/
 outputs2/
 gradio_outputs/
+/mask_outputs/
+/masked_frames.mp4
+/masked_frames2.mp4
+/masks.mp4
 ckpts/
 loras/
 loras_i2v/
 tmp/
 deepy_sessions/
 /ComputeCache/
-dlss5/
+/dlss5/
 /settings/
 /user_skills/
+/envs.json
+/workspaces/
 
 # Local engineering specifications and tests must never be committed.
 /specs/

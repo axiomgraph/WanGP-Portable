@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from shared.llm_engines.nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
+from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
 from shared.prompt_enhancer.qwen35_vl import _prepare_multimodal_vllm_prompt
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 
@@ -38,6 +38,10 @@ def can_keep_text_resident(runtime, manager) -> bool:
         return False
     if manager.models.get(_TEXT_MODEL_ID) is not runtime.model or _TEXT_MODEL_ID not in manager.active_models_ids:
         return False
+    from mmgp import runtime as mmgp_runtime
+    if mmgp_runtime.dynamic_preload(runtime.model):
+        # its dynamic preload releases only the blocks the vision tower needs beyond the lent cache, and keeps them again afterwards
+        return runtime._get_live_llm() is not None
     prefix = _TEXT_MODEL_ID + "/"
     preloaded = manager.preloaded_blocks_per_model[_TEXT_MODEL_ID]
     if not all(name[len(prefix):] in preloaded for name in manager.blocks_of_modules if name.startswith(prefix)) or not all(parameter.is_cuda for parameter in runtime.model.parameters()):
@@ -89,7 +93,7 @@ def resident_inspection(runtime, caption_model, manager):
         manager.cotenants_map = {**cotenants, _TEXT_MODEL_ID: [*cotenants.get(_TEXT_MODEL_ID, []), _VISION_MODEL_ID], _VISION_MODEL_ID: [*cotenants.get(_VISION_MODEL_ID, []), _TEXT_MODEL_ID]}
         # The enhancer's separate MMGP embedding alias would load a second copy.
         object.__setattr__(adapter, "_input_embedding_model", model.token_embd)
-        runtime._log("Inspection: keeping Qwen weights resident; lending assistant cache memory to vision.")
+        runtime._log("Inspection: keeping Qwen weights resident; lending assistant cache memory to vision (and Qwen blocks if it needs more).")
         yield unload_vision
     finally:
         unload_vision()

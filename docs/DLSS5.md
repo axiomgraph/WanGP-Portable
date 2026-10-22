@@ -1,7 +1,7 @@
 # DLSS 5 optional runtime installation
 
 > [!CAUTION]
-> **Copyright, license, and security warning:** this optional integration executes native Windows binaries with access to your GPU and files; several required runtime components are closed source. WanGP does not audit, authenticate, endorse, or redistribute NVIDIA, ReShade, RenoDX, or other third-party runtime binaries. The WanGP, Merserk, and DLSS5-Feeder MIT licenses do **not** grant rights to copy or redistribute those third-party components. Download only from sources you trust, verify signatures and hashes where available, scan every archive before use, and run it entirely at your own risk. You are responsible for complying with every component's license.
+> **Copyright, license, and security warning:** this optional integration executes native worker binaries with access to your GPU and files; several required runtime components are closed source. WanGP does not audit, authenticate, endorse, or redistribute NVIDIA, ReShade, RenoDX, or other third-party runtime binaries. The WanGP, Merserk, and DLSS5-Feeder MIT licenses do **not** grant rights to copy or redistribute those third-party components. Download only from sources you trust, verify signatures and hashes where available, scan every archive before use, and run it entirely at your own risk. You are responsible for complying with every component's license.
 
 DLSS 5 support is optional and is not installed by the normal WanGP installer. It uses:
 
@@ -10,7 +10,65 @@ DLSS 5 support is optional and is not installed by the normal WanGP installer. I
 - the optional legacy no-depth worker from the MIT-licensed Merserk [dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer);
 - separately obtained NVIDIA DLSS runtimes, ReShade with full add-on support, and the RenoDX DLSS 5 add-on.
 
-## Automatic installation
+## WSL Neural Rendering through the Windows worker
+
+WanGP running in WSL can use **DLSS 5 Neural Rendering** through the existing Windows worker. Python preprocessing runs in WSL, while the Windows worker performs Neural Rendering on the NVIDIA GPU using the Windows driver.
+
+> [!IMPORTANT]
+> **WSL users do not need the Linux DLSSG worker or its Linux NVIDIA runtime for Neural Rendering.** Use the Windows installer below. There is no Linux worker to build or install for this WSL workflow, and no NVIDIA Vulkan driver is needed inside WSL. The Linux package in the next section is for the separate experimental native Linux Frame Generation x2 feature.
+
+Keep the WanGP checkout and its `dlss5` runtime folder on a Windows drive accessible from WSL, for example under `/mnt/e/`. Install the Windows runtime with `scripts\install_dlss5.bat` from Windows, as described below, then restart WanGP in WSL. Windows executable interoperability must be enabled in WSL, and the Windows NVIDIA driver and GPU must meet the normal Neural Rendering requirements. The same x1 refinement, upscaling modes, intensity, depth, and motion controls are available.
+
+If the mode is disabled, check the reported missing runtime file, WSL interoperability, and `/usr/lib/wsl/lib/nvidia-smi`. Diagnostics from the Windows worker are still written to `dlss5/host/ReShade.log`. Native Linux without WSL cannot use this Windows-worker path.
+
+On systems with integrated graphics plus an NVIDIA GPU, open **Windows Settings > System > Display > Graphics**, add `dlss5\host\nr-depth-worker.exe`, and select **High performance** with the NVIDIA GPU. Otherwise the worker may select integrated graphics and fail NGX initialization even though CUDA sees the NVIDIA GPU. The same Windows preference applies to `dlss5\dlssg\dlssg-worker.exe` when using that Windows executable.
+
+## Native Linux Frame Generation x2 (experimental)
+
+Linux has an experimental **DLSS Frame Generation x2** path for NVIDIA RTX GPUs with a compatible NVIDIA driver and Vulkan support. It doubles the video frame rate using the same `Original` or `RAFT` motion estimation choices as Windows. Higher multipliers and native Linux DLSS 5 Neural Rendering are not available; the WSL Windows-worker option above is separate.
+
+**This Linux package is not needed for WSL Neural Rendering; use the Windows installation above for that workflow.** This path has passed compilation, protocol failure checks, and software Vulkan transfer checks. **Actual DLSS generation and visual quality still require validation on native Linux with a supported NVIDIA GPU.** CUDA working in WSL is not sufficient: the worker must see the NVIDIA GPU through Vulkan, not a software renderer such as llvmpipe.
+
+### Install the compiled Linux worker
+
+Download [WanGP-DLSSG-linux-x86_64-v0.1.0.tar.gz](https://github.com/DeepBeepMeep/dlss5-visual-enhancer/releases/download/wangp-linux-v0.1.0/WanGP-DLSSG-linux-x86_64-v0.1.0.tar.gz) and `SHA256SUMS.txt` from the [experimental Linux release](https://github.com/DeepBeepMeep/dlss5-visual-enhancer/releases/tag/wangp-linux-v0.1.0). The compiled worker requires Linux x86_64, glibc 2.34 or newer, `libstdc++.so.6` with `GLIBCXX_3.4.32` or newer, and the Vulkan loader (`libvulkan.so.1`). Ubuntu 24.04 is an example of a compatible userspace; the NVIDIA driver and GPU must also support Vulkan Frame Generation.
+
+With both downloads in the WanGP root, verify the archive and extract it into `dlss5`:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+mkdir -p dlss5
+tar -xzf WanGP-DLSSG-linux-x86_64-v0.1.0.tar.gz -C dlss5
+```
+
+The archive supplies `dlssg/dlssg-worker`, license notices, and installation information. **It does not contain NVIDIA's runtime shared library.** Obtain that file from the pinned official NVIDIA SDK and review its `LICENSE.txt`:
+
+```bash
+git clone --filter=blob:none --no-checkout https://github.com/NVIDIA/DLSS.git NVIDIA-DLSS
+git -C NVIDIA-DLSS sparse-checkout set include lib/Linux_x86_64
+git -C NVIDIA-DLSS checkout 9981c6350dc58c0ce21f024fd65e31e851c31689
+cp NVIDIA-DLSS/lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.310.9.16 dlss5/dlssg/
+cp NVIDIA-DLSS/LICENSE.txt dlss5/dlssg/LICENSE-NVIDIA-DLSS-Linux.txt
+./dlss5/dlssg/dlssg-worker --probe
+```
+
+Restart WanGP after installation, then select **DLSS Frame Generation x2** in temporal postprocessing. A failed capability probe keeps the option disabled and reports the missing requirement. This package does not install Windows Neural Rendering dependencies.
+
+### Build the Linux worker yourself
+
+Use a C++17 compiler and Vulkan development headers with `VK_NV_optical_flow` support (1.3.239 or newer). On Ubuntu 24.04, install build dependencies with `sudo apt install g++ libvulkan-dev git`. After obtaining the NVIDIA SDK above, clone the worker release and build directly into your WanGP runtime directory:
+
+```bash
+git clone --branch wangp-linux-v0.1.0 --depth 1 https://github.com/DeepBeepMeep/dlss5-visual-enhancer.git
+bash dlss5-visual-enhancer/native/WanGP-Adapter/build_linux.sh /path/to/NVIDIA-DLSS /path/to/WanGP/dlss5/dlssg
+./dlss5/dlssg/dlssg-worker --probe
+```
+
+The build installs the worker, NVIDIA runtime, and license notices together. See the [worker build instructions](https://github.com/DeepBeepMeep/dlss5-visual-enhancer/blob/wangp-linux-v0.1.0/native/WanGP-Adapter/README.md) for more details.
+
+For a transfer-only diagnostic, run `./dlss5/dlssg/dlssg-worker --self-test`. This checks Vulkan uploads and readbacks; a pass does **not** establish DLSS support or quality. On supported NVIDIA hardware, check a short clip with motion and scene cuts before processing longer videos. Frame Generation uses estimated motion and a constant depth guide, so fast motion, occlusions and fine details can produce artifacts.
+
+## Automatic installation (Windows)
 
 Close WanGP, then double-click `scripts\install_dlss5.bat`. From a command prompt, the equivalent command is:
 
@@ -139,4 +197,4 @@ Because these guides are estimated from the video, results can differ from DLSS 
 
 ---
 
-> Applies to: Installation and diagnostics for the optional DLSS 5 runtime on supported Windows hardware. Available processors and generation options depend on the installed runtime.
+> Applies to: Installation and diagnostics for optional DLSS 5 on Windows, Neural Rendering from WSL using the Windows worker, and experimental DLSS Frame Generation x2 on Linux. Available processors and generation options depend on the installed runtime and compatible NVIDIA hardware.

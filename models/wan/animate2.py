@@ -3,6 +3,8 @@ import math
 import torch
 
 from shared.attention import pay_attention
+from shared.kernels import ops as kernels
+from .modules import model as wan_model  # partially initialized here when model.py imports this module: used at call time only
 from .modules.posemb_layers import apply_rotary_emb, apply_rotary_emb_single
 
 
@@ -59,24 +61,10 @@ def _generation_attention(qkv_list, ref_kv_list, frames, tokens_per_frame, log_s
     return output
 
 
-def _reshape_frames(x, frames):
-    return x.reshape(x.shape[0], frames, -1, x.shape[-1])
-
-
-def _restore_tokens(x):
-    return x.reshape(x.shape[0], -1, x.shape[-1])
-
-
 def _modulated_self_attention_input(block, x, e):
-    e = e.to(x)
     dtype = x.dtype
-    attention_dtype = block.self_attn.q.weight.dtype
-    frames = e.shape[0]
-    e = (block.modulation.weight + e).chunk(6, dim=1)
-    x_mod = _reshape_frames(block.norm1(x), frames)
-    x_mod *= 1 + e[1]
-    x_mod += e[0]
-    x_mod = _restore_tokens(x_mod).to(attention_dtype)
+    e = wan_model.frame_modulation(block.modulation.weight, e.to(x))
+    x_mod = wan_model.modulate_frames(x, block.norm1, e[0], e[1]).to(block.self_attn.q.weight.dtype)
     return x_mod, e, dtype
 
 
@@ -113,13 +101,8 @@ def _post_attention_block(block, x_handoff, attention_handoff, e, context, grid_
     x_handoff.clear()
     attention_output = attention_handoff[0]
     attention_handoff.clear()
-    y = block.self_attn.o(attention_output.flatten(2)).to(dtype)
+    x = block.self_attn._project(attention_output.flatten(2), x, e[2][0])
     attention_output = None
-    frames = e[0].shape[0]
-    x = _reshape_frames(x, frames)
-    y = _reshape_frames(y, frames)
-    x.addcmul_(y, e[2])
-    x = _restore_tokens(x)
 
     if context is not None:
         context = context.to(x.device)
@@ -128,22 +111,8 @@ def _post_attention_block(block, x_handoff, attention_handoff, e, context, grid_
         y = None
         x += block.cross_attn(y_list, context, grid_sizes, audio_proj=None, audio_scale=None, audio_context_lens=None).to(dtype)
 
-    y = _reshape_frames(block.norm2(x), frames)
-    y *= 1 + e[4]
-    y += e[3]
-    y = _restore_tokens(y).to(block.ffn[0].weight.dtype)
-    y_shape = y.shape
-    y = y.view(-1, y_shape[-1])
-    chunk_size = int(y.shape[0] / 2.7)
-    for y_chunk in torch.split(y, chunk_size):
-        mlp_chunk = block.ffn[1](block.ffn[0](y_chunk))
-        y_chunk[...] = block.ffn[2](mlp_chunk)
-        mlp_chunk = None
-    y = y.view(y_shape).to(dtype)
-    x = _reshape_frames(x, frames)
-    y = _reshape_frames(y, frames)
-    x.addcmul_(y, e[5])
-    return _restore_tokens(x)
+    y_list = [wan_model.modulate_frames(x, block.norm2, e[3], e[4]).to(block.ffn[0].weight.dtype)]
+    return kernels.mlp(y_list, block.ffn[0], block.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(e[5], x.shape[0], x.shape[1]))
 
 
 def animate2_reference_block(block, x_handoff, e, context, grid_sizes, freqs):

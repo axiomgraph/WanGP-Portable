@@ -4,6 +4,7 @@ import re
 from collections.abc import Sequence
 import torch
 from tokenizers import Tokenizer
+from shared.utils.speech_dialogue import SPEAKER_LINE_PATTERN
 from .config import FishOmniConfig
 
 DRAMA3_TTS_INSTRUCTION = "convert the provided text to speech"
@@ -55,10 +56,6 @@ def validate_drama3_text(text: str, location: str) -> None:
                 f"{location}: speaker tags must be <|speaker:0|> to "
                 f"<|speaker:{MAX_SPEAKER_ID}|>; got {text!r}"
             )
-
-
-# WanGP's dialogue convention, shared with its other speech models: "Speaker N:" (1..16) at the start of a line.
-SPEAKER_LINE_PATTERN = re.compile(r"^([ \t]*)Speaker[ \t]*(\d+)[ \t]*:[ \t]*", re.IGNORECASE | re.MULTILINE)
 
 
 # Drama 3's paired tags apply to the words between them; an unclosed one spoils the speech that follows.

@@ -1,0 +1,23 @@
+{
+    "model": {
+        "name": "TTS MOSS-TTS Local Transformer v1.5 4B",
+        "architecture": "moss_tts_local_v1_5",
+        "description": "Multilingual speech and up to three cloned dialogue voices, generated turn by turn. Native 48 kHz stereo audio.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/MOSS_TTS_Local_v1_5_4B_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/MOSS_TTS_Local_v1_5_4B_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Hello! The morning light is coming through the window, and it is a wonderful time to begin something new.",
+    "alt_prompt": "English",
+    "audio_prompt_type": "",
+    "model_mode": 0,
+    "duration_seconds": 30,
+    "pause_seconds": 0.2,
+    "temperature": 1.7,
+    "top_k": 25,
+    "top_p": 0.8,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 1,
+    "prompt_enhancer": ""
+}

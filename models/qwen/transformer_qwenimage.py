@@ -402,8 +402,13 @@ class QwenDoubleStreamAttnProcessor2_0:
         streams = [([encoder_hidden_states], (attn.add_q_proj, attn.add_k_proj, attn.add_v_proj)), ([hidden_states], (attn.to_q, attn.to_k, attn.to_v))]
         del hidden_states, encoder_hidden_states
         segments = ((0, seq_txt, attn.norm_added_q, attn.norm_added_k, txt_freqs), (seq_txt, seq_txt + seq_img, attn.norm_q, attn.norm_k, img_freqs))
+        # the fused norm + RoPE + Sage quantization: the norms of both streams by segments of the joined tokens, one (1, tokens, 1, pairs, 2)
+        # cos / sin table of the joined tokens (interleaved pairs, as apply_rotary_emb_qwen_inplace)
+        q_segments, k_segments = ([(start, stop, segment[index]) for start, stop, *segment in segments] for index in (0, 1))
+        table = None if image_rotary_emb is None else torch.cat((txt_freqs[:seq_txt], img_freqs[:seq_img]), dim=0)[None, :, None]
         joint_hidden_states = attention_kit.joint_qkv_attention(streams, attn.heads, attn.to_q.out_features // attn.heads,
-                                                                lambda query, key, group: _norm_rope_(query, key, segments)).flatten(2, 3)
+                                                                lambda query, key, group: _norm_rope_(query, key, segments),
+                                                                fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, q_segments, k_segments, core, settings, interleaved=True)).flatten(2, 3)
 
         # Apply output projections
         img_attn_output = attn.to_out[0](joint_hidden_states[:, seq_txt:])
@@ -461,45 +466,30 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        # FFN expansion factor for chunking (diffusers FeedForward default is 4x)
-        self.ffn_mult = 4
         self.zero_cond_t = zero_cond_t
 
-    def _apply_ffn_chunked(self, ffn_in: torch.Tensor, mlp: nn.Module) -> None:
-        _, seq_len, dim = ffn_in.shape
-        ffn_in_flat = ffn_in.reshape(-1, dim)
-        chunk_size = max(seq_len // self.ffn_mult, 1)
-        for ffn_chunk in torch.split(ffn_in_flat, chunk_size):
-            ffn_chunk[...] = mlp(ffn_chunk)
-        # ffn_in is already modified in-place via ffn_in_flat view
+    @staticmethod
+    def _apply_ffn_chunked(ffn_in: torch.Tensor, mlp: nn.Module, residual=None, segments=None) -> None:
+        """ffn_in <- mlp(ffn_in) in place through the shared chunked FFN, or residual += gate * mlp(ffn_in) with the gates of segments."""
+        ops.mlp([ffn_in], mlp.net[0].proj, mlp.net[2], "gelu", residual=residual, segments=segments)
 
-    def _modulate(self, x_list, mod_params, index=None):
-        """Apply modulation to input tensor"""
-        shift, scale, gate = mod_params.chunk(3, dim=-1)
+    @staticmethod
+    def _norm_modulate(x, norm, shift, scale, split=None):
+        """norm(x) * (1 + scale) + shift through the shared segmented modulation, x (batch, tokens, dim) borrowed, shift / scale (rows,
+        dim). Without split one row per batch item; with split (zero_cond_t) the tokens before it (the generated image) take the rows of
+        the real timestep, the others (conditioning images) those of timestep 0, rows batch + b. Returns the modulated tensor and its
+        segments (start, stop, row) over the flattened tokens."""
+        batch, tokens = x.shape[:2]
+        regions = ((0, tokens, 0),) if split is None else ((0, split, 0), (split, tokens, batch))
+        segments = [(b * tokens + start, b * tokens + stop, b + offset) for b in range(batch) for start, stop, offset in regions]
+        return ops.norm_modulate([x.view(-1, x.shape[-1])], norm, shift, scale, segments).view(x.shape), segments
 
-        if index is not None:
-            actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]
-            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
-            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
-
-            index_expanded = index.unsqueeze(-1)
-            shift_0_exp = shift_0.unsqueeze(1)
-            shift_1_exp = shift_1.unsqueeze(1)
-            scale_0_exp = scale_0.unsqueeze(1)
-            scale_1_exp = scale_1.unsqueeze(1)
-            gate_0_exp = gate_0.unsqueeze(1)
-            gate_1_exp = gate_1.unsqueeze(1)
-
-            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
-            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
-            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
-        else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
-
-        return ops.scale_shift(x_list, scale_result, shift_result, in_place=False), gate_result
+    @staticmethod
+    def _gated_residual_segments_(residual, x_list, segments):
+        """residual += gate * x per segment (start, stop, gate) of the flattened tokens; x handed off in x_list."""
+        x, rows = ops.take(x_list).flatten(0, 1), residual.view(-1, residual.shape[-1])
+        for start, stop, gate in segments:
+            ops.gated_residual_(rows[start:stop], [x[start:stop]], gate, fused=True)
 
     def forward(
         self,
@@ -509,7 +499,7 @@ class QwenImageTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        modulate_index: Optional[torch.Tensor] = None,
+        modulate_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         if self.zero_cond_t:
@@ -524,11 +514,11 @@ class QwenImageTransformerBlock(nn.Module):
             txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = txt_mod_params.chunk(6, dim=-1)
 
             # Process image stream - norm1 + modulation (in-place)
-            img_normed = ops.norm_scale_shift([hidden_states], self.img_norm1, img_scale1.unsqueeze(1), img_shift1.unsqueeze(1))
+            img_normed, _ = self._norm_modulate(hidden_states, self.img_norm1, img_shift1, img_scale1)
             img_gate1 = img_gate1.unsqueeze(1)
 
             # Process text stream - norm1 + modulation (in-place)
-            txt_normed = ops.norm_scale_shift([encoder_hidden_states], self.txt_norm1, txt_scale1.unsqueeze(1), txt_shift1.unsqueeze(1))
+            txt_normed, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm1, txt_shift1, txt_scale1)
             txt_gate1 = txt_gate1.unsqueeze(1)
 
             hidden_states_list = [img_normed, txt_normed]
@@ -548,28 +538,19 @@ class QwenImageTransformerBlock(nn.Module):
             output_list, txt_attn_output = [txt_attn_output], None
             ops.gated_residual_(encoder_hidden_states, output_list, txt_gate1, fused=True)
 
-            img_normed2 = ops.norm_scale_shift([hidden_states], self.img_norm2, img_scale2.unsqueeze(1), img_shift2.unsqueeze(1))
-            img_gate2 = img_gate2.unsqueeze(1)
-            self._apply_ffn_chunked(img_normed2, self.img_mlp)
-            output_list, img_normed2 = [img_normed2], None
-            ops.gated_residual_(hidden_states, output_list, img_gate2, fused=True)
+            img_normed2, _ = self._norm_modulate(hidden_states, self.img_norm2, img_shift2, img_scale2)
+            self._apply_ffn_chunked(img_normed2, self.img_mlp, hidden_states, ops.gate_segments(img_gate2.unsqueeze(1), *hidden_states.shape[:2]))
+            img_normed2 = None
 
-            txt_normed2 = ops.norm_scale_shift([encoder_hidden_states], self.txt_norm2, txt_scale2.unsqueeze(1), txt_shift2.unsqueeze(1))
-            txt_gate2 = txt_gate2.unsqueeze(1)
-            txt_normed2 = self.txt_mlp(txt_normed2)
-            output_list, txt_normed2 = [txt_normed2], None
-            ops.gated_residual_(encoder_hidden_states, output_list, txt_gate2, fused=True)
+            txt_normed2, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm2, txt_shift2, txt_scale2)
+            self._apply_ffn_chunked(txt_normed2, self.txt_mlp, encoder_hidden_states, ops.gate_segments(txt_gate2.unsqueeze(1), *encoder_hidden_states.shape[:2]))
+            txt_normed2 = None
         else:
-            img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
-            txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+            img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = img_mod_params.chunk(6, dim=-1)
+            txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = txt_mod_params.chunk(6, dim=-1)
 
-            img_normed = self.img_norm1(hidden_states)
-            normed_list, img_normed = [img_normed], None
-            img_modulated, img_gate1 = self._modulate(normed_list, img_mod1, modulate_index)
-
-            txt_normed = self.txt_norm1(encoder_hidden_states)
-            normed_list, txt_normed = [txt_normed], None
-            txt_modulated, txt_gate1 = self._modulate(normed_list, txt_mod1)
+            img_modulated, img_segments1 = self._norm_modulate(hidden_states, self.img_norm1, img_shift1, img_scale1, modulate_index)
+            txt_modulated, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm1, txt_shift1, txt_scale1)
 
             hidden_states_list = [img_modulated, txt_modulated]
             del img_modulated, txt_modulated
@@ -583,23 +564,17 @@ class QwenImageTransformerBlock(nn.Module):
             )
 
             output_list, img_attn_output = [img_attn_output], None
-            ops.gated_residual_(hidden_states, output_list, img_gate1, fused=True)
+            self._gated_residual_segments_(hidden_states, output_list, [(start, stop, img_gate1[row]) for start, stop, row in img_segments1])
             output_list, txt_attn_output = [txt_attn_output], None
-            ops.gated_residual_(encoder_hidden_states, output_list, txt_gate1, fused=True)
+            ops.gated_residual_(encoder_hidden_states, output_list, txt_gate1.unsqueeze(1), fused=True)
 
-            img_normed2 = self.img_norm2(hidden_states)
-            normed_list, img_normed2 = [img_normed2], None
-            img_modulated2, img_gate2 = self._modulate(normed_list, img_mod2, modulate_index)
-            self._apply_ffn_chunked(img_modulated2, self.img_mlp)
-            output_list, img_modulated2 = [img_modulated2], None
-            ops.gated_residual_(hidden_states, output_list, img_gate2, fused=True)
+            img_modulated2, segments = self._norm_modulate(hidden_states, self.img_norm2, img_shift2, img_scale2, modulate_index)
+            self._apply_ffn_chunked(img_modulated2, self.img_mlp, hidden_states, [(start, stop, img_gate2[row]) for start, stop, row in segments])
+            img_modulated2 = None
 
-            txt_normed2 = self.txt_norm2(encoder_hidden_states)
-            normed_list, txt_normed2 = [txt_normed2], None
-            txt_modulated2, txt_gate2 = self._modulate(normed_list, txt_mod2)
-            txt_modulated2 = self.txt_mlp(txt_modulated2)
-            output_list, txt_modulated2 = [txt_modulated2], None
-            ops.gated_residual_(encoder_hidden_states, output_list, txt_gate2, fused=True)
+            txt_normed2, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm2, txt_shift2, txt_scale2)
+            self._apply_ffn_chunked(txt_normed2, self.txt_mlp, encoder_hidden_states, ops.gate_segments(txt_gate2.unsqueeze(1), *encoder_hidden_states.shape[:2]))
+            txt_normed2 = None
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -727,10 +702,8 @@ class QwenImageTransformer2DModel(nn.Module):
             base_shapes = img_shapes
             if isinstance(img_shapes, list) and len(img_shapes) > 0 and isinstance(img_shapes[0], list):
                 base_shapes = img_shapes[0]
-            seq_counts = [f * h * w for f, h, w in base_shapes]
-            base_index = [0] * seq_counts[0] + [1] * sum(seq_counts[1:])
-            # (1, tokens): broadcast over the batch by _modulate; an expanded view would alias rows in CUDA graph static buffers
-            modulate_index = torch.tensor(base_index, device=timestep.device, dtype=torch.int).unsqueeze(0)
+            # tokens of the generated image, modulated with the real timestep; the conditioning images after them take timestep 0
+            modulate_index = math.prod(base_shapes[0])
         hidden_states_list = [hidden_states if i == 0 else hidden_states.clone() for i, _ in enumerate(encoder_hidden_states_list)]
         
         new_encoder_hidden_states_list = []
@@ -777,8 +750,9 @@ class QwenImageTransformer2DModel(nn.Module):
             temb_out = temb.chunk(2, dim=0)[0]
         output_list = []
         for i in range(len(hidden_states_list)):
-            hidden_states = self.norm_out(hidden_states_list[i], temb_out)
-            hidden_states_list[i] = None
+            scale, shift = self.norm_out.linear(self.norm_out.silu(temb_out).to(hidden_states_list[i].dtype)).chunk(2, dim=1)
+            normed_list, hidden_states_list[i] = [hidden_states_list[i]], None
+            hidden_states = ops.norm_scale_shift(normed_list, self.norm_out.norm, scale[:, None], shift[:, None])
             output_list.append(self.proj_out(hidden_states))
 
         return output_list

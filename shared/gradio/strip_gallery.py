@@ -113,6 +113,15 @@ if (!SG.init) {
     if (c) SG.galleryState(id).prevScroll = c.scrollLeft;  // snapshot BEFORE backend updates
     window.selectStripThumbnail(id, thumb.getAttribute('data-index'));
   });
+  document.addEventListener('dragstart', function (e) {
+    const thumb = e.target.closest('.audio-thumbnail[data-wangp-media-url]');
+    if (!thumb) return;
+    const source = new URL(thumb.dataset.wangpMediaUrl, location.href).href;
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-wangp-gallery-media', source);
+    e.dataTransfer.setData('text/uri-list', source);
+    e.dataTransfer.setData('text/plain', source);
+  });
   SG.init = true;
 }
 
@@ -367,8 +376,9 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
 
     def _create_thumbnail_html(self, info, index, is_selected):
         selected_class = "selected" if is_selected else ""
+        drag_attrs = f' draggable="true" data-wangp-media-url="{html.escape(gradio_file_url(info["path"]))}"' if self.source == AUDIO and not info["deleted"] else ""
         return f"""
-        <div class="strip-thumbnail {self.source.id}-thumbnail {selected_class}" data-gallery="{self.source.id}" data-index="{index}" data-path="{html.escape(info['path'])}" title="{html.escape(info['basename'])}">
+        <div class="strip-thumbnail {self.source.id}-thumbnail {selected_class}" data-gallery="{self.source.id}" data-index="{index}" data-path="{html.escape(info['path'])}" title="{html.escape(info['basename'])}"{drag_attrs}>
             {self._thumbnail_body(info)}
         </div>
         """
