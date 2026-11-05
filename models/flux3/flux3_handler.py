@@ -4,6 +4,7 @@ from shared.utils.hf import build_hf_url
 from .prompts import CLASSIC, EDIT, STRUCTURED, STRUCTURED_EDIT
 
 REPO = 'DeepBeepMeep/Flux3'
+ENCODER_REPO = 'DeepBeepMeep/Fibo2'  # the Qwen3-VL-4B encoder is shared with Fibo 2 and Krea 2
 TEXT_FOLDER = 'Qwen3-VL-4B-Instruct'
 
 
@@ -56,7 +57,7 @@ class family_handler:
             'vae_block_size': 16, 'resolution_budget': '4096x4096', 'max_width': 4096, 'max_height': 4096,
             'tiny_vae_architecture': 'flux2_klein_4b',
             'text_encoder_folder': TEXT_FOLDER,
-            'text_encoder_URLs': [build_hf_url(REPO, TEXT_FOLDER, f'qwen3vl_4b_{fmt}.safetensors') for fmt in ('bf16', 'int8_convrot')],
+            'text_encoder_URLs': [build_hf_url(ENCODER_REPO, TEXT_FOLDER, f'Qwen3-VL-4B-Instruct_{fmt}.safetensors') for fmt in ('bf16', 'int8_convrot')],
             'image_ref_choices': {
                 'choices': [('None', ''),
                             ('Main Image Ref - First Reference Sets Output Dimensions (up to 10 Images)', 'KI'),

@@ -60,13 +60,15 @@ def target_probabilities(logits, top_k, top_p, min_p, temperature):
     return probabilities, unsafe
 
 
-def apply_rules(logits, drafts, history, bias, suppressed, thinking_stops, thinking, penalty):
+def apply_rules(logits, drafts, history, bias, suppressed, thinking_stops, thinking, penalty, exempt=None):
     rows, vocab = logits.shape
     scores = logits.clone()
     if penalty != 1:
         seen = history.unsqueeze(0).expand(rows, -1).clone()
         for i in range(drafts.numel()):
             seen[i + 1:].scatter_(1, drafts[i:i + 1].expand(rows - i - 1, 1), True)
+        if exempt is not None:
+            seen &= ~exempt  # drafted tokens the sequence never penalizes (Sequence.repetition_exempt_ids)
         scores = torch.where(seen, torch.where(scores < 0, scores * penalty, scores / penalty), scores)
     scores.add_(bias)
     scores.masked_fill_(suppressed.unsqueeze(0), -torch.inf)
@@ -81,26 +83,40 @@ def apply_rules(logits, drafts, history, bias, suppressed, thinking_stops, think
 
 
 def accept_block(probabilities, unsafe, drafts, draft_probs, valid_length, uniforms, noise, stops, greedy=False):
+    """Accepted prefix and replacement token of a drafted block from the target rows (probabilities[i]: after i accepted drafts) and
+    the draft rows (draft_probs[i]). Sampling uses block verification (Sun et al., "Block Verification Accelerates Speculative
+    Decoding", 2024): the weights p_0 = 1, p_i = min(p_{i-1} P_i(X_i) / Q_i(X_i), 1) are formed along the whole block, the block ends after
+    the largest i whose draw eta_i falls under h_i = S_i / (S_i + 1 - p_i), S_i the mass of max(p_i P - Q, 0) after i drafts (h = p at the
+    last draft), and the replacement is drawn from that residual (or from the bonus row after a complete block). The output keeps the
+    target distribution exactly and accepts at least as many drafts in expectation as the token-by-token rule, which it equals for a
+    single draft. Greedy verification accepts the drafts that are the target's argmax."""
     n = drafts.numel()
     positions = torch.arange(n, device=drafts.device)
     if greedy:
         targets = probabilities.argmax(dim=-1)
-        accepted = targets[:-1] == drafts
+        accepted = (targets[:-1] == drafts) & (positions < valid_length)
+        first = torch.where(accepted, n, positions).amin()
     else:
-        p = probabilities[:-1].gather(1, drafts[:, None])[:, 0]
-        q = draft_probs.gather(1, drafts[:, None])[:, 0]
-        accepted = uniforms < (p / q).clamp(max=1)
-    accepted = accepted & (positions < valid_length)
-    first = torch.where(accepted, n, positions).amin()
+        ratios = probabilities[:-1].gather(1, drafts[:, None])[:, 0] / draft_probs.gather(1, drafts[:, None])[:, 0]
+        weights = [torch.ones((), dtype=ratios.dtype, device=drafts.device)]
+        for i in range(n):   # p_0 .. p_n (a fixed-length block: the loop unrolls under graph capture)
+            weights.append((weights[-1] * ratios[i]).clamp(max=1.0))
+        weights = torch.stack(weights)
+        residuals = (weights[:n, None] * probabilities[:n] - draft_probs).clamp_min(0)   # row i: the residual after i accepted drafts
+        masses = residuals.sum(dim=1)
+        inner = masses[1:] / (masses[1:] + 1 - weights[1:n]).clamp_min(1e-30)   # h_1 .. h_{n-1} (0 when the residual is empty)
+        h = torch.cat((inner, weights[n:]))                                       # h_n = p_n
+        h = torch.where(positions + 1 == valid_length, weights[1:], h)            # a block cut at valid_length ends there
+        ok = (uniforms < h) & (positions < valid_length)
+        first = torch.where(ok, positions + 1, 0).amax()                           # accepted drafts
     stop_at = torch.where(stops[drafts] & (positions < first), positions, n).amin()
     accepted_count = torch.minimum(first, stop_at + 1)
     if greedy:
         replacement = targets.gather(0, first.reshape(1))[0]
     else:
-        p = probabilities.index_select(0, first.reshape(1))[0]
-        q = draft_probs.index_select(0, first.clamp(max=n - 1).reshape(1))[0]
-        residual = torch.where(first < valid_length, (p - q).clamp_min(0), p)
-        replacement = (residual / noise).argmax()
+        residual = residuals.index_select(0, first.clamp(max=n - 1).reshape(1))[0]
+        distribution = torch.where(first < valid_length, residual, probabilities.index_select(0, first.reshape(1))[0])
+        replacement = (distribution / noise).argmax()
     tokens = torch.cat((drafts, replacement.reshape(1)))
     tokens.scatter_(0, first.reshape(1), replacement.reshape(1))
     count = torch.minimum(first + 1, stop_at + 1)

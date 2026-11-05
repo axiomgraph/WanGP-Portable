@@ -8,8 +8,12 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
+
+# Inline media need a type the browser displays or plays; the OS tables (Windows registry) can lack or misname these.
+for _mime_type, _extension in (("image/webp", ".webp"), ("audio/aac", ".aac"), ("audio/flac", ".flac"), ("model/gltf-binary", ".glb")):
+    mimetypes.add_type(_mime_type, _extension)
 
 _download_jobs = {}
 _file_downloads = {}
@@ -141,6 +145,16 @@ def _get_gallery_download(media_id):
         return _gallery_downloads.get(str(media_id or "").strip().casefold())
 
 
+def registered_download_path(url):
+    """Local file behind a registered download or Gallery media URL, None when the URL is not registered here."""
+    url = unquote(str(url or ""))
+    for prefix, lookup in (("/wangp_api/download/", _get_file_download), ("/wangp_api/gallery/media/", _get_gallery_download)):
+        if url.startswith(prefix):
+            entry = lookup(url[len(prefix):])
+            return None if entry is None else entry["path"]
+    return None
+
+
 def _install_routes_on_app(fastapi_app):
     from shared.utils.http_disconnect import install_http_disconnect_patch
     install_http_disconnect_patch()
@@ -202,4 +216,4 @@ def install_routes():
     _download_routes_installed = True
 
 
-__all__ = ["install_routes", "register_download", "register_file_download", "register_gallery_download", "stream_bytes", "stream_writer"]
+__all__ = ["install_routes", "register_download", "register_file_download", "register_gallery_download", "registered_download_path", "stream_bytes", "stream_writer"]

@@ -6,5 +6,9 @@
   "image_mode": 1,
   "spatial_upsampling_method": "lanczos",
   "target_ratio": "lanczos*2",
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "Lanczos resize on the CPU: very fast with negligible VRAM, but recovers no lost detail."
+  }
 }

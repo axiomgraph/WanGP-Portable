@@ -10,5 +10,34 @@ implementation and its preserved upstream license notices. The unused
 vision tower is omitted. Q/gate projection rows are stored in separate
 contiguous groups in the WanGP encoder checkpoint.
 
-The FLUX.2 small VAE decoder reuses WanGP's FLUX autoencoder implementation.
-The unused image encoder is omitted from the prepared decoder checkpoint.
+The FLUX.2 small VAE reuses WanGP's FLUX autoencoder implementation. Text-to-image
+uses the decoder-only checkpoint; reference editing uses the full encoder and
+decoder checkpoint with the original normalization statistics.
+
+MOSS Image Edit adapter by chinoll:
+https://huggingface.co/chinoll/Moss-Image-Edit
+Adapter revision: 3be9c40037e1b89b17aa85ff6f8ee805872aa558
+The adapter is trained against MOSS Image SFT. Its rank/alpha configuration
+and tensor values are preserved in the packaged adapter. The adapter repository
+does not declare a license; the base model's Apache-2.0 notice does not establish
+the license of this separately released adapter.
+
+Reference-conditioning contract inspected in Chenkin-x/Moss-Image-Edit
+(d735569c936ebbfaf274bee5cbff4297c533d133) and its ComfyUI integration
+(b3377be990c0fa296459a20a4503dda40c045b4b). The WanGP implementation extends
+its existing MOSS transformer and shared attention operations.
+
+MOSS-Image-Edit-HQ v4 adapter by akhaliq:
+https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ
+Revision: e67d778c32f20756dd9bd1fc2c1d0f06c3c34b42
+Released file: armV4-moss-edit-lora.safetensors
+The repository declares Apache-2.0. This is an unofficial community fine-tune
+of MOSS Image SFT, not an official OpenMOSS release. The packaged adapter
+preserves its BF16 tensors, with explicit alpha=rank (192 for q/k/v and 64
+for output/FFN projections), matching the released training configuration.
+HQ uses the ai-toolkit inference contract at revision 14f8f95:
+https://github.com/ostris/ai-toolkit/tree/14f8f95/extensions_built_in/diffusion_models/moss_image
+Clean references use timestep zero, indexed reference positions and the
+current prompt length on the text axis. They attend only to references.
+The negative branch skips layer 22, including its reference state, and
+has its own reference KV cache. The original Edit SFT workflow is unchanged.

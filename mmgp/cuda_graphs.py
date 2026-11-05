@@ -44,6 +44,8 @@ from . import runtime
 
 MAX_KEYS = 8  # graphs kept per block, the least recently used dropped first: weight locations, CFG branches of other lengths, resolutions
 MOVE_BYTES = 32 << 20  # arguments from this size move into their static buffer when only their caller holds them
+ESCAPE_WARMUP = True  # comparison switch: the result of a key's first call leaves the graph pool (_escape)
+RECAPTURE_HELD = True  # comparison switch: a graph whose replay may overwrite a buffer held since a later capture is captured again
 _SCALARS = (bool, int, float, str, type(None), torch.dtype, torch.device)
 _depth = 0
 _recording = 0
@@ -278,29 +280,50 @@ def _prepare_blas_stream(stream):
     # PyTorch owns these workspaces per handle/stream, beyond the life of a model's graphs. Initialize both cuBLAS and cuBLASLt
     # before warmup/capture can put them in graph scratch (which would also pin that entire pool after the model is released).
     from . import allocator
-    with allocator.normal_allocations(), torch.cuda.stream(stream), torch.inference_mode():
+    with allocator.normal_allocations(), allocator.long_lived_allocations(), torch.cuda.stream(stream), torch.inference_mode():
         key = (torch.cuda.current_blas_handle(), stream.cuda_stream)
         if key not in _blas_workspaces:
             matrix = torch.zeros((16, 16), dtype=torch.float16, device=stream.device)
             torch.addmm(matrix[0], matrix, matrix)
+            stream.synchronize()  # what this allocated on another stream's behalf is free with nothing in flight
             _blas_workspaces.add(key)
 
 
-def _capture_stream(device):
+def capture_stream(device, blas=True):
+    """The one stream of a device's graph captures, with what libraries allocate per stream on first use (which a capture cannot do) ready:
+    the cuBLAS workspaces for a capture that uses cuBLAS. Taking a new stream from PyTorch's pool for each capture would leave these
+    workspaces on all its streams."""
     stream = _capture_streams.get(device, None)
     if stream is None:
         stream = _capture_streams[device] = torch.cuda.Stream(device)
+    if blas:
+        _prepare_blas_stream(stream)
     for setup in _capture_setups:
         setup(stream)
     return stream
 
 
-_BLAS_OPS = {getattr(torch.ops.aten, name) for name in ("mm", "addmm", "bmm", "baddbmm", "addbmm", "mv", "addmv", "dot", "vdot", "_addmm_activation", "_int_mm",
-                                                         "_scaled_mm", "_scaled_mm_v2", "_grouped_mm") if hasattr(torch.ops.aten, name)}
+def release_blas_workspaces():
+    """Frees the cuBLAS workspaces of every thread and stream when a runtime that used them closes: PyTorch would keep them for the whole
+    process, each holding a chunk of VRAM. A graph keeps the address of the workspace it captured: with a graph alive, they all stay."""
+    from . import allocator
+    if not allocator.no_graphs():
+        return False
+    torch.cuda.synchronize()
+    torch._C._cuda_clearCublasWorkspaces()
+    _blas_workspaces.clear()
+    return True
+
+
+# With their composite operations, which reach a dispatch mode whole and call cuBLAS inside. An operation missing here costs a capture again, not
+# a wrong result: the workspace then appears during the capture, and the allocator's guard (_leave_shared_chunks) moves what shares its chunk.
+_BLAS_OPS = {getattr(torch.ops.aten, name) for name in ("mm", "addmm", "bmm", "baddbmm", "addbmm", "mv", "addmv", "dot", "vdot", "_addmm_activation", "_scaled_mm", "_scaled_mm_v2", "_grouped_mm",
+                                                         "linear", "bilinear", "matmul", "einsum", "tensordot", "inner", "cdist", "scaled_dot_product_attention", "linalg_multi_dot", "linalg_inv",
+                                                         "linalg_pinv", "linalg_matrix_power", "linalg_matrix_exp", "linalg_lstsq", "linalg_solve_triangular") if hasattr(torch.ops.aten, name)}
 
 
 class _BlasUse(TorchDispatchMode):
-    """The eager warmup of a graph: its first cuBLAS operation prepares the stream's cuBLAS workspaces outside the graph pool, and the capture
+    """An eager stage before captures: its first cuBLAS operation prepares the stream's cuBLAS workspaces outside the graph pool, and the capture
     stream gets them only then. A model computing without cuBLAS (e.g. with its own kernels) keeps no workspace for the capture stream."""
 
     def __init__(self):
@@ -363,6 +386,16 @@ def _flatten(tree):
             return leaves, spec
         for cls in new:
             _register_dataclass(cls)
+
+
+def _spec_hashable():
+    try:
+        return hash(pytree.tree_flatten(((), {}))[1]) is not None
+    except TypeError:  # PyTorch 2.7: the hash generated for TreeSpec fails on its lists; a graph's key then holds its repr, the same structure
+        return False
+
+
+_SPEC_HASHABLE = _spec_hashable()
 
 
 def _signature(leaves, holders=frozenset()):
@@ -439,7 +472,7 @@ class _ReadCheck(TorchDispatchMode):
 
 
 class _Graph:
-    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied")
+    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied", "seq")
 
 
 def _handoffs(args, kwargs):
@@ -535,6 +568,9 @@ class BlockGraphs:
         self._tensor_refs = {}
         self.spans, self.span_runs = {}, {}  # (tower, start, stop, step) -> _Span; (tower, step) -> the runs its spans were made for
         self.memo = {}  # (module, its first argument) -> its last call replayed through the fast path of call()
+        # output buffers that a capture put in the pool, by the order of that capture: the scratch of the graphs captured before may lie
+        # over them (the pool shares it in the order of the captures), which their replays overwrite (_held_later)
+        self.captures, self.later = 0, {}
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
         if self.forget is not None:
             self.forget()
@@ -577,7 +613,8 @@ class BlockGraphs:
             weights, providers = self.weights_key(module), tuple(provider() for provider in _key_providers)
             entry = memo[5]
             # its weights key is the same tuple object while the weights stay where they are (_graph_weights_key); an evicted graph leaves memo
-            if weights[0] is memo[3][0] and weights[1:] == memo[3][1:] and providers == memo[4] and not self.extra_inputs(module):
+            if (weights[0] is memo[3][0] and weights[1:] == memo[3][1:] and providers == memo[4] and not self.extra_inputs(module)
+                    and not self._held_later(entry)):
                 copies, borrowed, mutated, result, streams = memo[6]
                 for static, leaf in copies:
                     static.copy_(leaf)
@@ -607,7 +644,7 @@ class BlockGraphs:
             raise ValueError(f"CUDA graph block call of '{self.name}' ({type(module).__name__}): argument {name} is a view whose elements share memory "
                              f"(shape {tuple(leaf.shape)}, stride {leaf.stride()}, e.g. from expand), which a graph's static buffer cannot hold. Pass the "
                              f"unexpanded tensor and expand it inside the block's forward (no cost), or make it contiguous before the call.") from None
-        key = (id(module), spec, signature, extra_signature, self.weights_key(module), tuple(provider() for provider in _key_providers), tuple(static_key), method)
+        key = (id(module), spec if _SPEC_HASHABLE else repr(spec), signature, extra_signature, self.weights_key(module), tuple(provider() for provider in _key_providers), tuple(static_key), method)
         keys = self.keys.setdefault(id(module), {})
         entry = self.entries.get(key, None)
         lifetimes = None
@@ -618,7 +655,7 @@ class BlockGraphs:
                 entry = self.entries.get(key)
                 lifetimes = ()
         retained_output = entry is not None and any(k in self.borrowed and not _unshared(self.static[k]) for k in entry.static_key[len(buffers):])
-        if retained_output:
+        if retained_output or entry is not None and self._held_later(entry):  # its replay would overwrite a buffer the caller holds
             self._evict(key, static_key)
             entry = None
         if entry is None:  # first call of this key: eager (it compiles and tunes the kernels, makes the caches of the weights), then captured
@@ -638,7 +675,7 @@ class BlockGraphs:
                     plan = allocator.OutputPlan(self.pool)
                     try:
                         blas_key = (id(module), method, None if module.__dict__.get("_mm_graph_check_once", False) else signature)
-                        if blas_key in self.blas:  # decided at an earlier capture of the same call: its workspaces are kept
+                        if blas_key in self.blas:  # decided at an earlier capture of the same call
                             if self.blas[blas_key]:
                                 _prepare_blas_stream(torch.cuda.current_stream())
                             out, consumed = _execute_lifetimes(forward, args, kwargs, lifetimes, leaves)
@@ -662,11 +699,13 @@ class BlockGraphs:
                             del flat
                         # Returned views keep execution storage alive: capture them with the ordinary owner's version counter.
                         self._capture_lifetimes, self._capture_output_plan = consumed, plan
-                        entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
+                        shared = [leaves[index] for index in consumed if allocator.storage_shared(leaves[index])]
+                        entry = self._leave_shared_chunks(shared) if shared else self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry is None:  # a different allocation trace must not replay the proposed aliases
                             self._capture_output_plan = None
                             entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
-                        self.entries[key] = entry
+                        if entry:
+                            self.entries[key] = entry
                     finally:
                         self.__dict__.pop('_capture_lifetimes', None)
                         self.__dict__.pop('_capture_output_plan', None)
@@ -675,7 +714,7 @@ class BlockGraphs:
                 _recording -= 1
                 self._prune()
             keys[key] = None
-            return out
+            return self._escape(out)
         keys[key] = keys.pop(key)  # most recently used
         if (self.state_ids and not kwargs and not extras and not entry.lifetimes and not entry.emptied and len(entry.static_key) == len(entry.static)
                 and len(leaves) == len(args) and all(leaf is arg and (not isinstance(arg, torch.Tensor) or id(arg) in self.state_ids) for leaf, arg in zip(leaves, args))):
@@ -717,7 +756,7 @@ class BlockGraphs:
         if self.pool is None:  # a stage before the first captures: its temporaries give the pool its first memory, which they would keep from it
             self.pool = torch.cuda.graph_pool_handle()
         live = allocator.pool_live(self.pool)
-        with allocator.graph_warmup(self.pool):
+        with allocator.graph_warmup(self.pool), _BlasUse():
             out = fn(*args, **kwargs)
         holders = {}
         for leaf in _flatten(out)[0]:
@@ -796,10 +835,39 @@ class BlockGraphs:
         for memo_key in [memo_key for memo_key, memo in self.memo.items() if memo[5] in entries]:
             del self.memo[memo_key]
 
+    def _escape(self, out):
+        """The result of a key's first call (eager, in the graph pool) leaves the pool: the scratch of the graphs captured before may lie
+        there, which their replays overwrite while the caller still holds it (the output of a block kept while the block runs for another
+        guidance branch). Its tensors in the pool that are no static buffer are copied to ordinary memory, once per capture."""
+        from . import allocator
+        if self.pool is None or allocator.active != "vmm" or not ESCAPE_WARMUP:
+            return out
+        flat, spec = _flatten(out)
+        escaped = [leaf.clone() if isinstance(leaf, torch.Tensor) and leaf.is_cuda and _static_storages.get(_storage(leaf)) is None and allocator.in_pool(leaf, self.pool)
+                   else leaf for leaf in flat]
+        return pytree.tree_unflatten(escaped, spec)
+
+    def _held_later(self, entry):
+        """Whether a caller still holds an output buffer that a capture after this graph's put in the pool: its replay writes its scratch,
+        which may lie over it (the output of a block kept by the caller while the block runs for another guidance branch, whose graph an
+        earlier pass captured). The graph is then captured again, its scratch avoiding the buffers alive (no copy of them)."""
+        return RECAPTURE_HELD and bool(self.later) and any(seq > entry.seq and not _unshared(self.static[key]) for key, seq in self.later.items())
+
+    def forget_storage(self, tensors):
+        """The graphs whose static buffers adopted these tensors' storage go, with those buffers: their owner drops them (a cache leaving the
+        VRAM) and gets the memory back. The blocks capture their graphs again at their next calls."""
+        pointers = {tensor.untyped_storage().data_ptr() for tensor in tensors}
+        keys = {key for key, buffer in self.static.items() if buffer.untyped_storage().data_ptr() in pointers}
+        if keys:
+            for key in [key for key, entry in self.entries.items() if not keys.isdisjoint(entry.static_key)]:
+                self._evict(key)
+            self._prune()
+
     def _prune(self, keep=()):
         used = set(keep) | {k for entry in self.entries.values() for k in entry.static_key}
         if any(k not in used for k in self.static):
             self.static = {k: buffer for k, buffer in self.static.items() if k in used}
+            self.later = {k: seq for k, seq in self.later.items() if k in used}
             self.static_by_buffer, self.static_by_base = {}, {}
             for key, buffer in self.static.items():
                 self._index_buffer(key, buffer)
@@ -857,10 +925,32 @@ class BlockGraphs:
             buffers.append(self.static[key])
         return keys, buffers
 
+    def _leave_shared_chunks(self, tensors):
+        """Memory allocated during this warmup or capture stayed (a library's cache): it lies on a chunk that one of these tensors had lent for
+        the call, and each would overwrite the other. The tensors move to memory of their own, with their content (a capture runs nothing,
+        and a consumed input has none left to lose). The graphs go, as they may use these buffers at their old addresses; this call's is
+        captured at its next one, and finds the cache already there."""
+        from . import allocator
+        if ("shared chunk", self.name) not in _reported:
+            _reported.add(("shared chunk", self.name))
+            tqdm.write(f"[MMGP] A library kept memory it allocated during a CUDA graph capture of '{self.name}': its graphs are captured again.")
+        self.clear()
+        moved = {}
+        for tensor in tensors:
+            storage = tensor.untyped_storage()
+            copy = moved.get(storage.data_ptr())
+            if copy is None:
+                with allocator.normal_allocations():
+                    copy = moved[storage.data_ptr()] = torch.UntypedStorage(storage.nbytes(), device=tensor.device)
+                copy.copy_(storage)
+            tensor.set_(copy, tensor.storage_offset(), tensor.shape, tensor.stride())
+        return False
+
     def _capture(self, module, forward, leaves, spec, signature, extras, extra_signature, warm_output, static_key, buffers, adopt_outputs, blas=False):
-        # blas: the call uses cuBLAS, whose workspaces the capture stream then needs before the capture (they cannot be made during it)
         from . import allocator
         entry = _Graph()
+        self.captures += 1
+        entry.seq = self.captures
         outputs = self._outputs(leaves, warm_output)
         entry.positions = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
         out_signatures = [output for output in outputs if output is not None and output[0] != "argument"]
@@ -868,7 +958,11 @@ class BlockGraphs:
         for sig in [signature[index] for index in entry.positions] + list(extra_signature):
             counts[sig] = counts.get(sig, 0) + 1
         out_sources = [leaf if adopt_outputs else None for leaf, output in zip(_flatten(warm_output)[0], outputs) if output is not None and output[0] != "argument"]
+        known = set(self.static)
         output_keys, output_buffers = self._buffers(out_signatures, out_sources, counts)
+        for key in output_keys:
+            if key not in known and self.pool is not None and allocator.active == "vmm" and allocator.in_pool(self.static[key], self.pool):
+                self.later[key] = entry.seq
         plan = self._capture_output_plan
         if plan is not None:
             for source, buffer in zip(out_sources, output_buffers):
@@ -905,9 +999,7 @@ class BlockGraphs:
         if not _autotune_guarded:
             _guard_triton_autotune()
         global _capturing
-        stream = _capture_stream(torch.cuda.current_device())
-        if blas:
-            _prepare_blas_stream(stream)
+        stream = capture_stream(torch.cuda.current_device(), blas)
         with torch.cuda.stream(stream):
             entry.graph.capture_begin(self.pool, capture_error_mode="thread_local")
             _capturing = True
@@ -949,6 +1041,10 @@ class BlockGraphs:
                 entry.graph.capture_end()
             except Exception as error:
                 raise RuntimeError(f"{failed}: {error}") from error
+        lent = [source for source in out_sources if source is not None] if plan is not None else []
+        shared = [tensor for tensor in (*lent, *(leaves[index] for index in entry.lifetimes)) if allocator.storage_shared(tensor)]
+        if shared:
+            return self._leave_shared_chunks(shared)
         if not plan_valid:
             return None
         if isinstance(check, _ReadCheck):

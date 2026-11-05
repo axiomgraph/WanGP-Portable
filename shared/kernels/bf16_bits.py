@@ -25,6 +25,12 @@ def eligible() -> bool:
     return triton is not None and torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() == (7, 5)
 
 
+def applies(x) -> bool:
+    """Whether a kernel reading x takes these kernels in place of a native Triton one: a BF16 CUDA tensor on a GPU where they are
+    validated (eligible), whose Triton has no BF16 conversions."""
+    return x.dtype == torch.bfloat16 and x.is_cuda and eligible()
+
+
 if triton is not None:
     @triton.jit
     def bf16_bits_to_fp32(bits):

@@ -16,12 +16,14 @@ MODEL_STATUS_PREFIXES = {
     MODEL_FILE_STATUS_PARTIAL: "\U0001F7E8",
 }
 MODEL_OUTPUT_FILTER_CONFIG_KEY = "model_output_filter"
+SHOW_ALL_MODEL_FILTER_CONFIG_KEY = "show_all_model_filter"
 MODEL_OUTPUT_FILTER_ALL = "all"
 MODEL_OUTPUT_FILTER_VIDEO = "video"
 MODEL_OUTPUT_FILTER_IMAGE = "image"
 MODEL_OUTPUT_FILTER_AUDIO = "audio"
 MODEL_OUTPUT_FILTER_3D = "3d"
-MODEL_OUTPUT_FILTERS = {MODEL_OUTPUT_FILTER_ALL, MODEL_OUTPUT_FILTER_VIDEO, MODEL_OUTPUT_FILTER_IMAGE, MODEL_OUTPUT_FILTER_AUDIO, MODEL_OUTPUT_FILTER_3D}
+MODEL_OUTPUT_FILTER_WORLD = "world"
+MODEL_OUTPUT_FILTERS = {MODEL_OUTPUT_FILTER_ALL, MODEL_OUTPUT_FILTER_VIDEO, MODEL_OUTPUT_FILTER_IMAGE, MODEL_OUTPUT_FILTER_AUDIO, MODEL_OUTPUT_FILTER_3D, MODEL_OUTPUT_FILTER_WORLD}
 LAST_MODEL_PER_OUTPUT_FILTER_CONFIG_KEY = "last_model_per_output_filter"
 MODEL_SELECTOR_DEBUG = False
 _model_selector_debug_seq = 0
@@ -46,7 +48,6 @@ class DropdownDeps:
     transformer_types: list
     displayed_model_types: list
     transformer_type: str
-    three_levels_hierarchy: bool
     families_infos: dict
     server_config: dict
     transformer_quantization: str
@@ -59,7 +60,6 @@ class DropdownDeps:
     get_lora_dir: callable
     get_lora_local_path: callable
     get_parent_model_type: callable
-    get_base_model_type: callable
     get_model_family: callable
     get_model_name: callable
     get_transformer_dtype: callable
@@ -67,8 +67,8 @@ class DropdownDeps:
 
 
 def compact_name(family_name, model_name):
-    if model_name.startswith(family_name):
-        suffix = model_name[len(family_name):]
+    suffix = model_name[len(family_name):]
+    if model_name.startswith(family_name) and not suffix[:1].isalpha():  # a whole word: "Animate" leaves "AnimateAnyMesh" whole
         version = family_name.rsplit(" ", 1)[-1]
         if suffix.startswith(".") and version.isdigit():
             return version + suffix
@@ -113,24 +113,45 @@ def decorate_finetune_dropdown_choices(deps, choices):
     return decorated
 
 
+# Selectable model entries: "1:<family>" a whole family, "2:<parent_model_type>" a model with all its finetunes, a bare model type that model alone.
+# Family and model entries are expanded when read, so they include finetunes added after the selection was saved.
+def parse_model_selection(entry):
+    level, sep, key = entry.partition(":")
+    return (int(level), key) if sep and level in ("1", "2") else (3, entry)
+
+
+def expand_model_selection(selection, model_types, get_parent_model_type, get_model_family):
+    expanded = []
+    for entry in selection:
+        level, key = parse_model_selection(entry)
+        if level == 3:
+            expanded.append(key)
+        else:
+            # a family: its group in the selector, or the handler's family (3D models are grouped by goal since 2026-10-29)
+            expanded += [model_type for model_type in model_types if (key in (get_model_family(model_type, for_ui=True), get_model_family(model_type)) if level == 1 else get_parent_model_type(model_type) == key)]
+    return list(dict.fromkeys(expanded))
+
+
 def get_dropdown_model_types(deps):
-    dropdown_types = list(deps.transformer_types) if len(deps.transformer_types) > 0 else list(deps.displayed_model_types)
+    dropdown_types = expand_model_selection(deps.transformer_types, deps.displayed_model_types, deps.get_parent_model_type, deps.get_model_family) if len(deps.transformer_types) > 0 else list(deps.displayed_model_types)
     if deps.transformer_type not in dropdown_types:
         dropdown_types.append(deps.transformer_type)
     return list(dict.fromkeys(dropdown_types))
 
 
 def normalize_model_output_filter(model_filter):
-    model_filter = str(model_filter or MODEL_OUTPUT_FILTER_ALL).strip().casefold()
-    return model_filter if model_filter in MODEL_OUTPUT_FILTERS else MODEL_OUTPUT_FILTER_ALL
+    model_filter = str(model_filter or MODEL_OUTPUT_FILTER_VIDEO).strip().casefold()
+    return model_filter if model_filter in MODEL_OUTPUT_FILTERS else MODEL_OUTPUT_FILTER_VIDEO
 
 
 def get_model_output_filter(deps=None, state=None):
     if isinstance(state, dict) and MODEL_OUTPUT_FILTER_CONFIG_KEY in state:
-        return normalize_model_output_filter(state[MODEL_OUTPUT_FILTER_CONFIG_KEY])
-    if deps is not None:
-        return normalize_model_output_filter(deps.server_config.get(MODEL_OUTPUT_FILTER_CONFIG_KEY, MODEL_OUTPUT_FILTER_ALL))
-    return MODEL_OUTPUT_FILTER_ALL
+        selected_filter = normalize_model_output_filter(state[MODEL_OUTPUT_FILTER_CONFIG_KEY])
+    else:
+        selected_filter = normalize_model_output_filter(deps.server_config.get(MODEL_OUTPUT_FILTER_CONFIG_KEY) if deps is not None else None)
+    if selected_filter == MODEL_OUTPUT_FILTER_ALL and deps is not None and not deps.server_config.get(SHOW_ALL_MODEL_FILTER_CONFIG_KEY, False):
+        return MODEL_OUTPUT_FILTER_VIDEO
+    return selected_filter
 
 
 def store_model_output_filter(server_config, state, model_type=None):
@@ -176,8 +197,11 @@ def _get_model_types_for_output_filter(deps, model_filter, dropdown_types=None):
     allowed_families = set()
     for family, model_types in family_model_types.items():
         family_outputs = [_record_main_outputs(records_by_type[model_type]) for model_type in model_types]
-        if model_filter == MODEL_OUTPUT_FILTER_VIDEO:
-            if any(MODEL_OUTPUT_FILTER_VIDEO in outputs for outputs in family_outputs):
+        if model_filter == MODEL_OUTPUT_FILTER_VIDEO:  # world models render videos but have their own filter
+            if any(MODEL_OUTPUT_FILTER_VIDEO in outputs and MODEL_OUTPUT_FILTER_WORLD not in outputs for outputs in family_outputs):
+                allowed_families.add(family)
+        elif model_filter == MODEL_OUTPUT_FILTER_WORLD:
+            if any(MODEL_OUTPUT_FILTER_WORLD in outputs for outputs in family_outputs):
                 allowed_families.add(family)
         elif all(outputs == [model_filter] for outputs in family_outputs):
             allowed_families.add(family)
@@ -185,10 +209,15 @@ def _get_model_types_for_output_filter(deps, model_filter, dropdown_types=None):
 
 
 def available_output_filters(deps):
-    """Output filters offered in the model selector: the 3D filter only once a 3D model is available."""
-    filters = [MODEL_OUTPUT_FILTER_ALL, MODEL_OUTPUT_FILTER_VIDEO, MODEL_OUTPUT_FILTER_IMAGE, MODEL_OUTPUT_FILTER_AUDIO]
-    if any(_record_main_outputs(record) == [MODEL_OUTPUT_FILTER_3D] for record in _get_model_defs_by_type(deps, get_dropdown_model_types(deps)).values()):
+    """Output filters offered in the model selector: the 3D and World filters only once such a model is available."""
+    filters = [MODEL_OUTPUT_FILTER_VIDEO, MODEL_OUTPUT_FILTER_IMAGE, MODEL_OUTPUT_FILTER_AUDIO]
+    if deps.server_config.get(SHOW_ALL_MODEL_FILTER_CONFIG_KEY, False):
+        filters.insert(0, MODEL_OUTPUT_FILTER_ALL)
+    outputs = [_record_main_outputs(record) for record in _get_model_defs_by_type(deps, get_dropdown_model_types(deps)).values()]
+    if any(output == [MODEL_OUTPUT_FILTER_3D] for output in outputs):
         filters.append(MODEL_OUTPUT_FILTER_3D)
+    if any(MODEL_OUTPUT_FILTER_WORLD in output for output in outputs):
+        filters.append(MODEL_OUTPUT_FILTER_WORLD)
     return filters
 
 
@@ -211,6 +240,8 @@ def _main_outputs_for_model_type(deps, model_type):
 
 
 def _model_output_filter_from_outputs(outputs):
+    if MODEL_OUTPUT_FILTER_WORLD in outputs:
+        return MODEL_OUTPUT_FILTER_WORLD
     if MODEL_OUTPUT_FILTER_VIDEO in outputs:
         return MODEL_OUTPUT_FILTER_VIDEO
     if outputs == [MODEL_OUTPUT_FILTER_AUDIO]:
@@ -230,12 +261,11 @@ def get_model_output_filter_for_model_type(deps, model_type):
 
 def reconcile_model_output_filter_for_model_type(deps, state, model_type):
     current_filter = get_model_output_filter(deps, state)
-    if current_filter == MODEL_OUTPUT_FILTER_ALL or model_type_matches_output_filter(deps, model_type, current_filter):
-        return current_filter, False
-    selected_filter = get_model_output_filter_for_model_type(deps, model_type)
+    selected_filter = current_filter if current_filter == MODEL_OUTPUT_FILTER_ALL or model_type_matches_output_filter(deps, model_type, current_filter) else get_model_output_filter_for_model_type(deps, model_type)
+    previous_filter = normalize_model_output_filter(state.get(MODEL_OUTPUT_FILTER_CONFIG_KEY, current_filter)) if isinstance(state, dict) else current_filter
     if isinstance(state, dict):
         state[MODEL_OUTPUT_FILTER_CONFIG_KEY] = selected_filter
-    return selected_filter, selected_filter != current_filter
+    return selected_filter, selected_filter != previous_filter
 
 
 def _first_model_type_for_filter(deps, state, model_filter, dropdown_types):
@@ -586,7 +616,8 @@ def create_models_hierarchy(rows):
         if L == 0 and len(prefix_non) > 1:
             L = n
 
-        shares_last = any(mid != pid and mid not in outliers and lt and lt[-1] == p_last for _, mid, _, lt, _ in kids)
+        # a size shared as last word joins the header ("Wan2.1 Text2Video 14B"); a shared word stays in the variants ("INT8 Experts" / "Q4 Experts")
+        shares_last = any(c.isdigit() for c in p_last) and any(mid != pid and mid not in outliers and lt and lt[-1] == p_last for _, mid, _, lt, _ in kids)
         header_tokens_disp = p_tok[:L] + ([p_tok[-1]] if shares_last and L < n else [])
         header = " ".join(header_tokens_disp)
         header_has_last = (L == n) or (shares_last and L < n)
@@ -686,10 +717,10 @@ def create_models_selector_hierarchy(deps, dropdown_types=None):
         ]
         rows.sort(key=lambda row: row[0].casefold())
         parent_choices, children_by_parent = create_models_hierarchy(rows)
-        family_folder = {"name": family_name, "path": family_name, "folders": [], "items": []}
+        family_folder = {"name": family_name, "path": family_name, "value": f"1:{family}", "folders": [], "items": []}
         for parent_name, parent_model_type in parent_choices:
             parent_path = f"{family_name}/{parent_name}"
-            parent_folder = {"name": parent_name, "path": parent_path, "folders": [], "items": []}
+            parent_folder = {"name": parent_name, "path": parent_path, "value": f"2:{parent_model_type}", "folders": [], "items": []}
             for child_name, child_model_type in children_by_parent.get(parent_model_type, []):
                 if is_finetune_model(deps, child_model_type) and not child_name.rstrip().endswith("*"):
                     child_name = child_name.rstrip() + " *"
@@ -699,7 +730,7 @@ def create_models_selector_hierarchy(deps, dropdown_types=None):
     return tree
 
 
-def get_sorted_dropdown(deps, dropdown_types, current_model_family, current_model_type, three_levels=True):
+def get_sorted_dropdown(deps, dropdown_types, current_model_family, current_model_type):
     models_families = [deps.get_model_family(t, for_ui=True) for t in dropdown_types]
     families = {}
     for family in models_families:
@@ -714,13 +745,9 @@ def get_sorted_dropdown(deps, dropdown_types, current_model_family, current_mode
     else:
         dropdown_choices = [(deps.families_infos[family][0], compact_name(deps.families_infos[family][1], deps.get_model_name(model_type)), model_type) for model_type, family in zip(dropdown_types, models_families) if family == current_model_family]
     dropdown_choices = sorted(dropdown_choices, key=lambda c: (c[0], c[1]))
-    if three_levels:
-        dropdown_choices = [(*model[1:], deps.get_parent_model_type(model[2])) for model in dropdown_choices]
-        sorted_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
-        return sorted_familes, sorted_choices, finetunes_dict[deps.get_parent_model_type(current_model_type)]
-    dropdown_types_list = list({deps.get_base_model_type(model[2]) for model in dropdown_choices})
-    dropdown_choices = [model[1:] for model in dropdown_choices]
-    return sorted_familes, dropdown_types_list, dropdown_choices
+    dropdown_choices = [(*model[1:], deps.get_parent_model_type(model[2])) for model in dropdown_choices]
+    sorted_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
+    return sorted_familes, sorted_choices, finetunes_dict[deps.get_parent_model_type(current_model_type)]
 
 
 def generate_dropdown_model_list(deps, current_model_type, state=None):
@@ -730,19 +757,18 @@ def generate_dropdown_model_list(deps, current_model_type, state=None):
     if current_model_type not in dropdown_types:
         dropdown_types.append(current_model_type)
     current_model_family = deps.get_model_family(current_model_type, for_ui=True)
-    sorted_familes, sorted_models, sorted_finetunes = get_sorted_dropdown(deps, dropdown_types, current_model_family, current_model_type, three_levels=deps.three_levels_hierarchy)
+    sorted_familes, sorted_models, sorted_finetunes = get_sorted_dropdown(deps, dropdown_types, current_model_family, current_model_type)
     status_model_types = get_family_dropdown_model_types(deps, current_model_family, dropdown_types)
     if current_model_type not in status_model_types:
         status_model_types.append(current_model_type)
     direct_status_map, aggregated_parent_status_map = get_model_download_status_maps(deps, status_model_types)
     sorted_models = decorate_dropdown_choices_with_status(sorted_models, aggregated_parent_status_map)
-    if deps.three_levels_hierarchy:
-        sorted_finetunes = decorate_finetune_dropdown_choices(deps, sorted_finetunes)
+    sorted_finetunes = decorate_finetune_dropdown_choices(deps, sorted_finetunes)
     sorted_finetunes = decorate_dropdown_choices_with_status(sorted_finetunes, direct_status_map)
 
-    dropdown_families = gr.Dropdown(choices=sorted_familes, value=current_model_family, show_label=False, scale=2 if deps.three_levels_hierarchy else 1, elem_id="family_list", min_width=50, interactive=True)
-    dropdown_models = gr.Dropdown(choices=sorted_models, value=deps.get_parent_model_type(current_model_type) if deps.three_levels_hierarchy else deps.get_base_model_type(current_model_type), show_label=False, scale=3 if len(sorted_finetunes) > 1 else 6, elem_id="model_base_types_list", visible=deps.three_levels_hierarchy, interactive=True)
-    dropdown_finetunes = gr.Dropdown(choices=sorted_finetunes, value=current_model_type, show_label=False, scale=3, visible=len(sorted_finetunes) > 1 or not deps.three_levels_hierarchy, elem_id="model_list", interactive=True)
+    dropdown_families = gr.Dropdown(choices=sorted_familes, value=current_model_family, show_label=False, scale=2, elem_id="family_list", min_width=50, interactive=True)
+    dropdown_models = gr.Dropdown(choices=sorted_models, value=deps.get_parent_model_type(current_model_type), show_label=False, scale=3 if len(sorted_finetunes) > 1 else 6, elem_id="model_base_types_list", interactive=True)
+    dropdown_finetunes = gr.Dropdown(choices=sorted_finetunes, value=current_model_type, show_label=False, scale=3, visible=len(sorted_finetunes) > 1, elem_id="model_list", interactive=True)
     return dropdown_families, dropdown_models, dropdown_finetunes
 
 
@@ -759,26 +785,18 @@ def change_model_family(deps, state, current_model_family):
     if len(model_type) == "" or model_type not in [choice[1] for choice in dropdown_choices]:
         model_type = dropdown_choices[0][1]
 
-    if deps.three_levels_hierarchy:
-        parent_model_type = deps.get_parent_model_type(model_type)
-        dropdown_choices = [(*tup, deps.get_parent_model_type(tup[1])) for tup in dropdown_choices]
-        dropdown_base_types_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
-        finetunes_dict[parent_model_type] = decorate_finetune_dropdown_choices(deps, finetunes_dict[parent_model_type])
-        dropdown_choices = decorate_dropdown_choices_with_status(finetunes_dict[parent_model_type], direct_status_map)
-        dropdown_base_types_choices = decorate_dropdown_choices_with_status(dropdown_base_types_choices, aggregated_parent_status_map)
-        model_finetunes_visible = len(dropdown_choices) > 1
-    else:
-        parent_model_type = deps.get_base_model_type(model_type)
-        model_finetunes_visible = True
-        dropdown_base_types_choices = list({deps.get_base_model_type(model[1]) for model in dropdown_choices})
-        dropdown_choices = decorate_dropdown_choices_with_status(dropdown_choices, direct_status_map)
+    parent_model_type = deps.get_parent_model_type(model_type)
+    dropdown_choices = [(*tup, deps.get_parent_model_type(tup[1])) for tup in dropdown_choices]
+    dropdown_base_types_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
+    dropdown_choices = decorate_finetune_dropdown_choices(deps, finetunes_dict[parent_model_type])
+    dropdown_choices = decorate_dropdown_choices_with_status(dropdown_choices, direct_status_map)
+    dropdown_base_types_choices = decorate_dropdown_choices_with_status(dropdown_base_types_choices, aggregated_parent_status_map)
+    model_finetunes_visible = len(dropdown_choices) > 1
 
     return gr.Dropdown(choices=dropdown_base_types_choices, value=parent_model_type, scale=3 if model_finetunes_visible else 6), gr.Dropdown(choices=dropdown_choices, value=model_type, visible=model_finetunes_visible)
 
 
 def change_model_base_types(deps, state, current_model_family, model_base_type_choice):
-    if not deps.three_levels_hierarchy:
-        return gr.update()
     dropdown_types = get_filtered_dropdown_model_types(deps, get_model_output_filter(deps, state))
     current_family_name = deps.families_infos[current_model_family][1]
     dropdown_choices = [(compact_name(current_family_name, deps.get_model_name(model_type)), model_type, model_base_type_choice) for model_type in dropdown_types if deps.get_parent_model_type(model_type) == model_base_type_choice and deps.get_model_family(model_type, for_ui=True) == current_model_family]

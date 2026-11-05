@@ -21,5 +21,9 @@
   "video_guide_outpainting": "0 0 0 0",
   "custom_settings": {
     "h3_mask_mode": "grouped_rows"
+  },
+  "process": {
+    "task": "outpaint",
+    "summary": "MiniMax H3 with the 4-step LightX2V turbo LoRA v1.2."
   }
 }

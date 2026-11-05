@@ -4,9 +4,13 @@
 	export let depth = 0;
 	export let expanded;
 	export let value;
+	export let covered = false;
+	export let checkboxes = false;
 	export let toggleItem;
 	export let toggleFolder;
+	export let toggleFolderSelection;
 	export let valueForItem;
+	export let valueForFolder;
 	export let labelForItem;
 
 	function folderLabel(folder) {
@@ -20,8 +24,12 @@
 
 {#each folders as folder (folderPath(folder))}
 	{@const path = folderPath(folder)}
+	{@const folderValue = valueForFolder(folder)}
+	{@const selected = folderValue !== "" && value.includes(folderValue)}
 	<div
 		class="hierarchy-row hierarchy-folder"
+		class:hierarchy-row-check={checkboxes}
+		class:hierarchy-folder-selected={selected}
 		style:padding-left={`${depth * 18 + 6}px`}
 		role="button"
 		tabindex="0"
@@ -37,6 +45,24 @@
 		<svg class="hierarchy-twist" class:hierarchy-twist-open={expanded.has(path)} viewBox="0 0 16 16" aria-hidden="true">
 			<path d="M6 4.5L10 8l-4 3.5" />
 		</svg>
+		{#if checkboxes && folderValue === ""}
+			<span></span>
+		{:else if checkboxes}
+			<button
+				type="button"
+				class="hierarchy-check"
+				class:hierarchy-check-on={selected}
+				class:hierarchy-check-covered={covered && !selected}
+				aria-pressed={selected}
+				aria-disabled={covered && !selected}
+				aria-label={`Select all of ${folderLabel(folder)}`}
+				title={covered && !selected ? "Included by a selected folder" : `Select all of ${folderLabel(folder)}`}
+				on:click|stopPropagation={() => toggleFolderSelection(folder, covered)}
+				on:keydown|stopPropagation={() => {}}
+			>
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.3l3 3 6-6.6" /></svg>
+			</button>
+		{/if}
 		<svg class="hierarchy-icon hierarchy-folder-icon" viewBox="0 0 20 20" aria-hidden="true">
 			<path d="M2.75 6.25h5.4l1.55 1.7h7.55c.55 0 1 .45 1 1v6.3c0 .55-.45 1-1 1H2.75c-.55 0-1-.45-1-1v-8c0-.55.45-1 1-1Z" />
 			<path d="M2.25 7.95V5.6c0-.55.45-1 1-1h4.5l1.35 1.65" />
@@ -50,9 +76,13 @@
 			depth={depth + 1}
 			{expanded}
 			{value}
+			covered={covered || selected}
+			{checkboxes}
 			{toggleItem}
 			{toggleFolder}
+			{toggleFolderSelection}
 			{valueForItem}
+			{valueForFolder}
 			{labelForItem}
 		/>
 	{/if}
@@ -62,21 +92,28 @@
 	{@const selected = value.includes(valueForItem(item))}
 	<div
 		class="hierarchy-row hierarchy-item"
+		class:hierarchy-row-check={checkboxes}
 		class:hierarchy-item-selected={selected}
+		class:hierarchy-item-covered={covered && !selected}
 		style:padding-left={`${depth * 18 + 6}px`}
-		title={labelForItem(item)}
+		title={covered && !selected ? "Included by a selected folder" : labelForItem(item)}
 		role="button"
 		tabindex="0"
 		aria-pressed={selected}
-		on:click={() => toggleItem(item)}
+		on:click={() => toggleItem(item, covered)}
 		on:keydown={(event) => {
 			if (event.key === "Enter" || event.key === " ") {
 				event.preventDefault();
-				toggleItem(item);
+				toggleItem(item, covered);
 			}
 		}}
 	>
 		<span class="hierarchy-twist-spacer"></span>
+		{#if checkboxes}
+			<span class="hierarchy-check" class:hierarchy-check-on={selected} class:hierarchy-check-covered={covered && !selected} aria-hidden="true">
+				<svg viewBox="0 0 16 16"><path d="M3.5 8.3l3 3 6-6.6" /></svg>
+			</span>
+		{/if}
 		<svg class="hierarchy-icon hierarchy-item-icon" viewBox="0 0 20 20" aria-hidden="true">
 			<path d="M5.25 2.75h6.05L15.75 7.2v10.05H5.25V2.75Z" />
 			<path d="M11.25 2.95V7.3h4.3" />
@@ -100,6 +137,10 @@
 		user-select: none;
 		padding-right: 4px;
 		transition: background-color 120ms ease, color 120ms ease, opacity 120ms ease;
+	}
+
+	.hierarchy-row-check {
+		grid-template-columns: 16px 16px 20px minmax(0, 1fr);
 	}
 
 	.hierarchy-row:hover {
@@ -160,11 +201,16 @@
 		cursor: pointer;
 	}
 
+	.hierarchy-item-covered {
+		cursor: default;
+	}
+
 	.hierarchy-item-selected {
 		color: var(--body-text-color);
 	}
 
-	.hierarchy-item-selected .hierarchy-name {
+	.hierarchy-item-selected .hierarchy-name,
+	.hierarchy-folder-selected .hierarchy-name {
 		font-weight: 700;
 	}
 </style>

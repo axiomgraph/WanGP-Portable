@@ -6,5 +6,9 @@
   "image_mode": 1,
   "spatial_upsampling_method": "flux_pid*4",
   "target_ratio": "flux_pid*4",
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "Flux PiD x4 diffusion upsampler: strong detail recovery."
+  }
 }

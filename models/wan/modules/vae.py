@@ -2,7 +2,7 @@
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import logging
 import os
-from mmgp import offload
+from mmgp import offload, transfer
 import torch
 from shared.utils.utils import guide_to_dtype
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort, set_phase_status
@@ -10,7 +10,7 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from shared.kernels import kernel_policy
+from shared.kernels import kernel_policy, vae_ops
 from shared.cuda_memory import mmgp_vram_allocator
 
 try:
@@ -325,6 +325,38 @@ def _exact_tiled(net, chunks, segments, size, sink):
         inputs, size = store, out_size
 
 
+class ExactStream:
+    """_exact_tiled one temporal chunk at a time, with the same result: each tile keeps its causal caches between the calls, so that a video
+    processed by windows runs as one (net: Encoder3d / Decoder3d, fast path; size: frames at its input)."""
+
+    def __init__(self, net, segments, size):
+        self.net, self.work = net, []
+        for start, stop, tiles in segments:
+            stages = net._stages()[start:stop]
+            out_size = _sizes(stages, size)[-1]
+            work = [(tuple((0, s) for s in out_size), None, tuple((0, s) for s in size))] if tiles is None else [(region, *_plan(stages, size, region)) for region in tiles]
+            work = sorted(work, key=lambda item: -(item[2][0][1] - item[2][0][0]) * (item[2][1][1] - item[2][1][0]))  # largest first: the allocator reuses their blocks
+            self.work.append((start, stop, out_size, [(*item, [None] * sum(isinstance(m, nn.Conv3d) for m in net.modules())) for item in work]))
+            size = out_size
+
+    def run(self, x, first, sink):
+        """The next chunk x, delivered tile after tile to sink(region, output)."""
+        device = x.device
+        for number, (start, stop, out_size, tiles) in enumerate(self.work):
+            store = None
+            for region, plan, need, cache in tiles:
+                (a, b), (c, d) = need
+                y = self.net(x[..., a:b, c:d].to(device).contiguous(memory_format=torch.channels_last_3d), feat_cache=cache, feat_idx=[0], part=(start, stop, plan, need, first))
+                if number == len(self.work) - 1:
+                    sink(region, y)
+                else:
+                    if store is None:
+                        store = torch.empty((*y.shape[:3], *out_size), dtype=y.dtype, device="cpu", memory_format=torch.channels_last_3d)
+                    store[..., region[0][0]:region[0][1], region[1][0]:region[1][1]].copy_(y)
+                y = None
+            x = store
+
+
 def _exact_decode(model, z, segments, any_end_frame, sink):
     """Tiled decoding equal to the untiled one (fast path) of scaled latents z on the GPU, through _exact_tiled."""
     x = model.conv2(z)
@@ -354,7 +386,7 @@ def _exact_encode(model, x, scale, tile_size, any_end_frame):
 
 def _vae_float_to_cpu_uint8(frames):
     frames.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
-    return frames.to(device="cpu", dtype=torch.uint8)
+    return transfer.move(frames, "cpu", torch.uint8)  # (without a RAM copy of the video in its float dtype, nor a GPU one of a cropped view)
 
 
 def _blend_v_edge_(top_edge, tile, blend_extent):
@@ -651,12 +683,8 @@ class AttentionBlock(nn.Module):
                                                      2).contiguous().chunk(
                                                          3, dim=-1)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        # apply attention (by chunks of queries where SDPA has no memory-efficient kernel for the VAE's dtype)
+        x = vae_ops.attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output

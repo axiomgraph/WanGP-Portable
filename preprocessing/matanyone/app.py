@@ -1360,15 +1360,18 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
     with gr.Column( visible=True):
         with gr.Row():
-            with gr.Accordion("Video Tutorial (click to expand)", open=False, elem_classes="custom-bg"):
+            # The tutorial players load only while the accordion is open: a loaded player keeps a video decoder in the browser's GPU memory
+            with gr.Accordion("Video Tutorial (click to expand)", open=False, elem_classes="custom-bg") as tutorial_accordion:
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### Case 1: Single Target")
-                        gr.Video(value="preprocessing/matanyone/tutorial_single_target.mp4", elem_classes="video")
+                        tutorial_single_video = gr.Video(elem_classes="video")
 
                     with gr.Column():
                         gr.Markdown("### Case 2: Multiple Targets")
-                        gr.Video(value="preprocessing/matanyone/tutorial_multi_targets.mp4", elem_classes="video")
+                        tutorial_multi_video = gr.Video(elem_classes="video")
+            tutorial_accordion.expand(fn=lambda: ("preprocessing/matanyone/tutorial_single_target.mp4", "preprocessing/matanyone/tutorial_multi_targets.mp4"), outputs=[tutorial_single_video, tutorial_multi_video], show_progress="hidden")
+            tutorial_accordion.collapse(fn=lambda: (None, None), outputs=[tutorial_single_video, tutorial_multi_video], show_progress="hidden")
 
         with gr.Row():
             new_dim= gr.Dropdown(

@@ -28,12 +28,23 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, overlay_slots: int = 0):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.free_overlay_slots: deque[int] = deque(range(overlay_slots))  # exact overlays of a mixed-precision cache, one per live sequence
+
+    def allocate_overlay_slot(self, seq: Sequence) -> None:
+        if seq.overlay_slot < 0 and self.free_overlay_slots:
+            seq.overlay_slot = self.free_overlay_slots.popleft()
+            seq.ring_high = 0
+
+    def release_overlay_slot(self, seq: Sequence) -> None:
+        if seq.overlay_slot >= 0:
+            self.free_overlay_slots.append(seq.overlay_slot)
+            seq.overlay_slot = -1
 
     def grow(self, num_blocks: int):
         first = len(self.blocks)
@@ -67,6 +78,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
+        self.allocate_overlay_slot(seq)
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
@@ -105,6 +117,7 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        self.release_overlay_slot(seq)
 
     def can_append(self, seq: Sequence) -> bool:
         needs_new_block = len(seq) % self.block_size == 1 and len(seq.block_table) < seq.num_blocks

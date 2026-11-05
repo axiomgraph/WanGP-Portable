@@ -6,5 +6,11 @@
   "image_mode": 1,
   "spatial_upsampling_method": "flashvsr",
   "target_ratio": "flashvsr*2",
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "use_configured_model": true,
+    "task": "upscale",
+    "summary": "FlashVSR learned detail recovery with modest VRAM use.",
+    "recommended": true
+  }
 }

@@ -23,7 +23,7 @@ MAX_LENGTH = 512
 NSFW_THRESHOLD = 0.85
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 
-from mmgp import offload
+from mmgp import offload, runtime
 import os
 
 class Mistral3SmallEmbedder(nn.Module):
@@ -35,6 +35,10 @@ class Mistral3SmallEmbedder(nn.Module):
         super().__init__()
         file_path = model_spec
         self.model = offload.fast_load_transformers_model(file_path, writable_tensors= False, defaultConfigPath= os.path.join(os.path.dirname(file_path), "config.json"))
+        # the 1.3 GB token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the 1.3 GB output head, which never runs:
+        # the hidden states come from the base model
+        runtime.lookup_on_cpu(self.model.get_input_embeddings())
+        runtime.unused(self.model.lm_head)
         self.processor = AutoProcessor.from_pretrained(os.path.dirname(file_path), use_fast=False)
         self.yes_token, self.no_token = self.processor.tokenizer.encode(
             ["yes", "no"], add_special_tokens=False
@@ -230,7 +234,7 @@ class Mistral3SmallEmbedder(nn.Module):
 
         # Forward pass through the model
         with text_encoding_progress(self.model.model.language_model.layers, prompt_count=len(txt)):
-            output = self.model(
+            output = self.model.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,

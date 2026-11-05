@@ -113,24 +113,24 @@
         },
         "kernels": {
             "wgpkernels": {
-                "label": "WGPKernels 1.3.0 (CUDA 13, RTX 20XX+)",
+                "label": "WGPKernels 1.4.2 (CUDA 13, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_cu128": {
-                "label": "WGPKernels 1.3.0 (CUDA 12.8, RTX 20XX+)",
+                "label": "WGPKernels 1.4.2 (CUDA 12.8, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_rocm10": {
-                "label": "WGPKernels 1.3.0 (ROCm 10, RDNA4, experimental)",
+                "label": "WGPKernels 1.4.2 (ROCm 10, RDNA4, experimental)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-linux_x86_64.whl"
                 }
             },
             "nunchaku": { 
@@ -157,33 +157,33 @@
             "gguf": {
                 "label": "GGUF llama.cpp CUDA Kernels (PyTorch 2.10 / CUDA 13)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl"
                 }
             },
             "gguf_cu128": {
                 "label": "GGUF llama.cpp CUDA Kernels (PyTorch 2.7.1 / CUDA 12.8)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl"
                 }
             },
             "gguf_rocm10": {
                 "label": "GGUF llama.cpp HIP Kernels (PyTorch 2.13 / ROCm 10, RDNA4, experimental)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl"
                 }
             }
         }
     },
     "gpu_profiles": {
-        "GTX_10":      { "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
-        "RTX_20":      { "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_30":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_40":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_50":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
-        "AMD":         { "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": null, "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
-        "MPS":         { "python": "3.11", "torch": "mps", "triton": null, "sage": null, "sparge": null, "flash": null, "kernels": [], "attention": "sdpa" }
+        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
+        "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_50":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
+        "AMD":         { "platforms": ["win", "linux"], "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": null, "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
+        "MPS":         { "platforms": ["macos"], "python": "3.11", "torch": "mps", "triton": null, "sage": null, "sparge": null, "flash": null, "kernels": [], "attention": "sdpa" }
     }
 }

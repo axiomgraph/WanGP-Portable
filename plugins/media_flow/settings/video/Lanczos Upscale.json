@@ -6,5 +6,9 @@
   "target_ratio": "lanczos*2",
   "chunk_size_seconds": 3.0,
   "sliding_window_overlap": 0,
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "Lanczos resize on the CPU: very fast with negligible VRAM, but recovers no lost detail."
+  }
 }

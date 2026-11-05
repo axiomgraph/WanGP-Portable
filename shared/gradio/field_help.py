@@ -22,6 +22,36 @@ SPATIAL_UPSAMPLER_HELP_INTRO = """Spatial upsamplers increase resolution. Visual
 TEMPORAL_UPSAMPLER_HELP_INTRO = """Temporal upsamplers increase frame rate by generating intermediate frames. WanGP multiplies the output frame rate by the selected factor so video duration and audio synchronization are preserved."""
 
 SYSTEM_HELP = {
+    "custom_sigmas": {
+        "title": "Custom Sigmas",
+        "markdown": """Leave this field empty to use the model's normal schedules.
+
+- Separate sigma values with commas, and phases with a semicolon (`;`). Include one slot per selected phase; leave a slot blank to keep that phase's default.
+- Values must be positive numbers **less than 1**, in strictly descending order. A final `0` is optional and ignored; the sampler always finishes at zero.
+- Each positive value defines one denoising step. An explicit schedule overrides that phase's step count and starting-noise switch. Values are used directly, without another flow shift.
+
+For two phases, `; 0.909375, 0.8571428571428571, 0.6666666666666666` keeps phase 1 automatic and sets three steps for phase 2.
+
+`0.95, 0.7, 0.3;` customizes only phase 1. `0.95, 0.7, 0.3; 0.9, 0.6` customizes both phases. With one phase, omit the semicolon.
+
+When a later phase has an explicit schedule, its first sigma takes precedence over that phase's switch. A notice appears if the values differ.
+
+**Wan:** all phases form one descending schedule. For three phases, use two semicolons, for example `0.95,0.9; 0.8,0.6; 0.4,0.2`. The two switches become 800 and 400. Blank phases keep the normal schedule points within their switch boundaries; Steps controls that normal schedule. Explicit phases replace those points, so the final step count can change.
+
+**H3 and LTX-2:** each phase has its own schedule; phase 2 may restart at a higher sigma than the end of phase 1. A scheduler with a fixed schedule may reject custom values. Clear this field to use its usual schedule.""",
+    },
+    "loras_multipliers": {
+        "title": "LoRA Multipliers",
+        "markdown": """Enter one multiplier per selected LoRA, in the same order. Separate LoRAs with spaces or new lines. Missing multipliers default to `1.0`. Lines beginning with `#` are comments.
+
+- `0.8 1.2` applies 0.8 to the first LoRA and 1.2 to the second. `0` disables a LoRA.
+- Use `;` **inside one multiplier**, without spaces, for phase-specific strengths: with two phases, `1;0` applies only in phase 1, `0;1` only in phase 2, and `1;0.6` uses 1 then 0.6. For three phases, use three values, for example `0;1;0`. A single value applies to every phase.
+- Use `,` inside a phase for a sequence of strengths distributed across its steps, for example `1,0.8,0.6`. Do not put spaces inside that sequence.
+- Models that expose separate LoRA branches also accept `:` between branch strengths, in the order given by that model's help. For example, `1:0.5` sets the two branches independently. Other models do not accept this syntax.
+- The `|` separator divides accelerator-profile LoRAs on the left from additional LoRAs on the right. Preserve it when editing a profile. For example, `1;0 0;1 | 0.7` uses two accelerators in separate phases and an additional LoRA at 0.7 in both.
+
+Use phase syntax only when the selected model supports multiple LoRA phases. H3's automatic phase-2 Turbo is replaced when an accelerator before `|` has a nonzero phase-2 multiplier.""",
+    },
     "spatial_upsampling": {
         "title": "Spatial Upsampler / Visual Refiner",
         "markdown": SPATIAL_UPSAMPLER_HELP_INTRO,
@@ -78,11 +108,11 @@ def _tool_button(kind, popup_id, title, icon):
     )
 
 
-def render_marker(elem_id, help_id, *, title=None, markdown=None, helper_popup_id=None, helper_title=None):
+def render_marker(elem_id, help_id, *, title=None, markdown=None, helper_popup_id=None, helper_title=None, keep_empty=False):
     title, markdown = _resolve_help(help_id, title=title, markdown=markdown)
     has_markdown = bool(str(markdown or "").strip())
     has_helper = bool(str(helper_popup_id or "").strip())
-    if not has_markdown and not has_helper:
+    if not has_markdown and not has_helper and not keep_empty:
         return ""
     popup_html = ""
     popup_id = ""
@@ -191,6 +221,9 @@ def get_css():
 }
 .wangp-field-help-inline {
     margin-left: 6px !important;
+}
+.wangp-field-help-inline:not(:has([data-wangp-model-info-open])) {
+    display: none !important;
 }
 .wangp-field-help-inline-host,
 .wangp-field-help-inline-host > *,
@@ -316,7 +349,8 @@ def get_javascript():
             const targetId = inline.getAttribute("data-wangp-field-help-for") || "";
             const target = document.getElementById(targetId);
             const label = target?.querySelector('[data-testid="block-info"]');
-            if (!label) return;
+            // Only mount incoming markers; an old mounted marker must not discard its replacement popup.
+            if (!label || inline.parentElement === label) return;
             movePopups(sourceRoot, inline.querySelectorAll("[data-wangp-model-info-open]"));
             label.querySelectorAll(".wangp-field-help-inline[data-wangp-field-help-for]").forEach((existing) => {
                 if (existing !== inline && existing.getAttribute("data-wangp-field-help-for") === targetId) existing.remove();

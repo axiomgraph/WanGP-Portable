@@ -26,6 +26,8 @@ class FlashVSRBridge:
     TOPK_RATIO_MAX = 4.0
     UPSAMPLING_VALUE_PREFIX = "flashvsr"
     UPSAMPLING_TWO_PASS_VALUE_PREFIX = "flashvsr2pass"
+    UPSAMPLING_PLUS_VALUE_PREFIX = "flashvsrplus"
+    UPSAMPLING_PLUS_TWO_PASS_VALUE_PREFIX = "flashvsrplus2pass"
     UPSAMPLING_RATIOS = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
     MODE_CHOICES = [
         ("Tiny Decoder (Slightly Lower Quality, Faster Decoding, Needs Less RAM)", MODE_TINY),
@@ -37,8 +39,14 @@ class FlashVSRBridge:
         ("FlashVSR+ Turbo (Hybrid Attention: Faster At High Resolutions, Preference-Aligned Detail)", MODEL_PLUS_TURBO),
         ("FlashVSR v1.1", MODEL_V11),
     ]
-    MODEL_DEFAULT = MODEL_PLUS_TURBO  # a configuration without an explicit model choice runs FlashVSR+ Turbo
+    MODEL_DEFAULT = MODEL_PLUS_TURBO  # offer FlashVSR+ Turbo by default in the upsampling menus
     PLUS_MODELS = (MODEL_PLUS_TURBO,)
+    METHOD_MODELS = {
+        UPSAMPLING_VALUE_PREFIX: MODEL_V11,
+        UPSAMPLING_TWO_PASS_VALUE_PREFIX: MODEL_V11,
+        UPSAMPLING_PLUS_VALUE_PREFIX: MODEL_PLUS_TURBO,
+        UPSAMPLING_PLUS_TWO_PASS_VALUE_PREFIX: MODEL_PLUS_TURBO,
+    }
     QUANTIZATION_BF16 = "bf16"
     QUANTIZATION_INT8 = "int8"
     QUANTIZATION_CHOICES = [("BF16", QUANTIZATION_BF16), ("INT8 ConvRot (Half The Transformer Size, Faster With INT8 Kernels)", QUANTIZATION_INT8)]
@@ -173,10 +181,10 @@ class FlashVSRBridge:
     def cache_windows(self) -> int:
         return self.config()["cache_windows"]
 
-    def overlap_frames(self) -> int:
+    def overlap_frames(self, spatial_upsampling=None) -> int:
         """The output frames of a chunk that the next source chunk regenerates (the Media Flow overlap and the continuation tail)."""
         from postprocessing.flashvsr.runtime import continue_cache_frames
-        return continue_cache_frames(self.model())
+        return continue_cache_frames(self.model() if spatial_upsampling is None else self.model_for_upsampling(spatial_upsampling))
 
     def enabled(self) -> bool:
         return self.settings()[0]
@@ -200,14 +208,27 @@ class FlashVSRBridge:
 
     @classmethod
     def scale_for_upsampling(cls, spatial_upsampling) -> float | None:
-        text = str(spatial_upsampling or "").strip().lower()
-        prefix = cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX if text.startswith(cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX) else cls.UPSAMPLING_VALUE_PREFIX
-        scale = parse_multiplier_suffix(text, prefix, 2.0)
-        return scale if scale in cls.UPSAMPLING_RATIOS else None
+        split = cls.split_value(spatial_upsampling)
+        return None if split is None else split[1]
 
     @classmethod
     def is_two_pass_upsampling(cls, spatial_upsampling) -> bool:
-        return str(spatial_upsampling or "").strip().lower().startswith(cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX)
+        split = cls.split_value(spatial_upsampling)
+        return split is not None and split[0] in (cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX, cls.UPSAMPLING_PLUS_TWO_PASS_VALUE_PREFIX)
+
+    @classmethod
+    def model_for_upsampling(cls, spatial_upsampling) -> str:
+        split = cls.split_value(spatial_upsampling)
+        if split is None:
+            raise ValueError(f"Unknown FlashVSR upsampling mode: {spatial_upsampling}")
+        return cls.METHOD_MODELS[split[0]]
+
+    def method_visible(self, method: str) -> bool:
+        return self.METHOD_MODELS[method] == self.model()
+
+    def preferred_method(self, method: str) -> str:
+        two_pass = self.is_two_pass_upsampling(method)
+        return next(key for key in self.METHOD_MODELS if self.method_visible(key) and self.is_two_pass_upsampling(key) == two_pass)
 
     @classmethod
     def query_upsampler_def(cls) -> dict[str, Any]:
@@ -218,37 +239,38 @@ class FlashVSRBridge:
             "profile": "video",
             "config_key": "flashvsr",
             "pos": 20,
-            "method_pos": {cls.UPSAMPLING_VALUE_PREFIX: 20, cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: 21},
-            "methods": [("FlashVSR", cls.UPSAMPLING_VALUE_PREFIX), ("FlashVSR Two Pass", cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX)],
+            "method_pos": {method: 20 + index for index, method in enumerate(cls.METHOD_MODELS)},
+            "methods": [("FlashVSR v1.1", cls.UPSAMPLING_VALUE_PREFIX), ("FlashVSR v1.1 Two Pass", cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX),
+                        ("FlashVSR+ Turbo", cls.UPSAMPLING_PLUS_VALUE_PREFIX), ("FlashVSR+ Turbo Two Pass", cls.UPSAMPLING_PLUS_TWO_PASS_VALUE_PREFIX)],
             "vae_methods": [],
-            "multipliers": {cls.UPSAMPLING_VALUE_PREFIX: cls.UPSAMPLING_RATIOS, cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: cls.UPSAMPLING_RATIOS},
+            "multipliers": {method: cls.UPSAMPLING_RATIOS for method in cls.METHOD_MODELS},
             "default_spatial_upsampling": cls.upsampling_value(2.0),
             "postprocessing_category": "upsampler",
-            "description": "Provides learned detail recovery and is optimized for modest VRAM use. FlashVSR v1.1 and FlashVSR+ Turbo (faster at high resolutions, preference-aligned detail) are selected in Configuration > Extensions. The Full decoder's final VAE decode can be slow; Tiny is faster, and Two Pass may reduce horizontal banding.",
+            "description": "Provides learned detail recovery and is optimized for modest VRAM use. Configuration > Extensions chooses which version is normally offered: FlashVSR v1.1 or FlashVSR+ Turbo (faster at high resolutions, preference-aligned detail). Extract Settings restores the version saved with the media even when it is hidden by the current configuration. The Full decoder's final VAE decode can be slow; Tiny is faster, and Two Pass may reduce horizontal banding.",
             "media_descriptions": {"video": "Its learned reconstruction is designed for good temporal stability."},
             "method_descriptions": {
-                cls.UPSAMPLING_VALUE_PREFIX: "Restore detail and spatially upscale with learned FlashVSR reconstruction (v1.1 or FlashVSR+ Turbo, chosen in Configuration > Extensions). The Full decoder's final VAE decode can be slow; Tiny is faster and large outputs can consume substantial VRAM.",
-                cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: "Apply two FlashVSR restoration passes for stronger detail reconstruction and reduced horizontal banding, at approximately twice the processing cost.",
+                cls.UPSAMPLING_VALUE_PREFIX: "Restore detail and spatially upscale with FlashVSR v1.1. The Full decoder's final VAE decode can be slow; Tiny is faster and large outputs can consume substantial VRAM.",
+                cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX: "Apply two FlashVSR v1.1 restoration passes for stronger detail reconstruction and reduced horizontal banding, at approximately twice the processing cost.",
+                cls.UPSAMPLING_PLUS_VALUE_PREFIX: "Restore detail and spatially upscale with FlashVSR+ Turbo, with faster processing at high resolutions and preference-aligned detail.",
+                cls.UPSAMPLING_PLUS_TWO_PASS_VALUE_PREFIX: "Apply two FlashVSR+ Turbo restoration passes for stronger detail reconstruction and reduced horizontal banding, at approximately twice the processing cost.",
             },
         }
 
     @classmethod
     def split_value(cls, value) -> tuple[str, float] | None:
-        scale = cls.scale_for_upsampling(value)
-        if scale is None:
-            return None
-        return (cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX if cls.is_two_pass_upsampling(value) else cls.UPSAMPLING_VALUE_PREFIX), scale
+        text = str(value or "").strip().lower()
+        for method in sorted(cls.METHOD_MODELS, key=len, reverse=True):
+            scale = parse_multiplier_suffix(text, method, 2.0)
+            if scale in cls.UPSAMPLING_RATIOS:
+                return method, scale
+        return None
 
     @classmethod
     def build_value(cls, method, scale) -> str | None:
         scale = float(scale or 2.0)
         if scale not in cls.UPSAMPLING_RATIOS:
             scale = 2.0
-        if method == cls.UPSAMPLING_TWO_PASS_VALUE_PREFIX:
-            return cls.upsampling_two_pass_value(scale)
-        if method == cls.UPSAMPLING_VALUE_PREFIX:
-            return cls.upsampling_value(scale)
-        return None
+        return format_multiplier_value(method, scale) if method in cls.METHOD_MODELS else None
 
     def is_upsampling(self, spatial_upsampling) -> bool:
         return self.scale_for_upsampling(spatial_upsampling) is not None
@@ -265,7 +287,7 @@ class FlashVSRBridge:
             with gr.Row():
                 mode = gr.Dropdown(choices=self.MODE_CHOICES, value=config["mode"], label="FlashVSR Spatial Upsampling (Needs Triton; SpargeAttn optional)", interactive=not lock_config)
             with gr.Row():
-                model = gr.Dropdown(choices=self.MODEL_CHOICES, value=config["model"], label="Model", info="FlashVSR+ Turbo always runs with memory profile 0 and processes 16 frames per step.", interactive=not lock_config)
+                model = gr.Dropdown(choices=self.MODEL_CHOICES, value=config["model"], label="Model", info="Chooses the version normally shown in upsampling menus. Extract Settings can restore the other version without changing this preference. FlashVSR+ Turbo always runs with memory profile 0 and processes 16 frames per step.", interactive=not lock_config)
                 quantization = gr.Dropdown(choices=self.QUANTIZATION_CHOICES, value=config["quantization"], label="Transformer Quantization", interactive=not lock_config)
             with gr.Row():
                 backend = gr.Dropdown(choices=SPARSE_BACKEND_CHOICES, value=config["backend"], label="Backend", interactive=not lock_config)
@@ -285,11 +307,21 @@ class FlashVSRBridge:
     def config_requires_release(self, old_config: dict[str, Any], new_config: dict[str, Any], changed_keys: set[str]) -> bool:
         return old_config != new_config or bool({"profile", "video_profile", "vae_config"} & changed_keys)
 
-    def query_download_def(self, enabled_only: bool = True) -> dict[str, Any] | None:
+    def query_download_def(self, enabled_only: bool = True, spatial_upsampling=None) -> dict[str, Any] | None:
         if enabled_only and not self.enabled():
             return None
         _, variant = self.settings()
-        files = [self.transformer_filename(self.model(), self.quantization()), self.lq_proj_filename(self.model()), self.POSI_PROMPT_FILENAME]
+        model = self.model() if spatial_upsampling is None else self.model_for_upsampling(spatial_upsampling)
+        return self._model_download_def(model, self.quantization(), variant)
+
+    def query_checkpoint_inventory(self):
+        for label, model in self.MODEL_CHOICES:
+            for _, quant in self.QUANTIZATION_CHOICES:
+                for mode in ("tiny", "full"):  # Tiny-Long uses the same files as Tiny.
+                    yield {"name": label.split(" (")[0], "variant": f"{quant.upper()} {mode.title()}", "download_defs": [self._model_download_def(model, quant, mode)]}
+
+    def _model_download_def(self, model, quant, variant):
+        files = [self.transformer_filename(model, quant), self.lq_proj_filename(model), self.POSI_PROMPT_FILENAME]
         if variant != "full":
             files.append(self.TCDECODER_FILENAME)
         return {
@@ -323,7 +355,7 @@ class FlashVSRBridge:
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         from shared.utils.download import process_files_def_if_needed
 
-        return process_files_def_if_needed(self.query_download_def(), process_files=process_files, send_cmd=send_cmd, status_text=status_text)
+        return process_files_def_if_needed(self.query_download_def(spatial_upsampling=spatial_upsampling), process_files=process_files, send_cmd=send_cmd, status_text=status_text)
 
     def load_upsampler(self, spatial_upsampling, *, process_files: Callable[..., Any], init_pipe: Callable[..., int], profile, progress_callback=None, **kwargs):
         scale = self.scale_for_upsampling(spatial_upsampling)
@@ -332,14 +364,13 @@ class FlashVSRBridge:
         enabled, variant = self.settings()
         if not enabled:
             raise RuntimeError("FlashVSR spatial upsampling is disabled in Configuration > Extensions.")
-        self.download(process_files)
+        self.download(process_files, spatial_upsampling=spatial_upsampling)
         from postprocessing.flashvsr.attention_backend import set_sparse_backend
         set_sparse_backend(self.backend())
         from postprocessing.flashvsr.runtime import load_models
 
-        model = self.model()
-        preload_mode = str(self.server_config.get("video_preload_mode", "default"))
-        load_models(self.paths(variant, model), variant=variant, init_pipe=init_pipe, profile=profile, model=model, preload_mode=preload_mode, progress_callback=progress_callback)
+        model = self.model_for_upsampling(spatial_upsampling)
+        load_models(self.paths(variant, model), variant=variant, init_pipe=init_pipe, profile=profile, model=model, progress_callback=progress_callback)
 
     def upscale(self, sample, spatial_upsampling, *, vae_config: int, seed=0, continue_cache=None, return_continue_cache=False, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
         scale = self.scale_for_upsampling(spatial_upsampling)

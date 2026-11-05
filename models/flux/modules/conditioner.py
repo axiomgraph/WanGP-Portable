@@ -20,6 +20,8 @@ class HFEmbedder(nn.Module):
             from mmgp import offload as offloadobj
             self.tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained(os.path.dirname(text_encoder_filename),  max_length=max_length)
             self.hf_module: T5EncoderModel  = offloadobj.fast_load_transformers_model(text_encoder_filename, writable_tensors=False) 
+            from mmgp import runtime
+            runtime.lookup_on_cpu(self.hf_module.get_input_embeddings())  # the token table stays in RAM: mmgp looks up the prompt's rows on the CPU
 
         self.hf_module = self.hf_module.eval().requires_grad_(False)
 

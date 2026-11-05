@@ -12,9 +12,27 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
 
     def __init__(self, server_config=None, files_locator=None):
         self.server_config = server_config
+        if server_config is not None:
+            from .runtime import configure_depth_estimator
+            configure_depth_estimator(server_config)
 
     def config(self):
         return DLSS5SpatialUpsampler.normalize_config_section(spatial_api.read_config_section_by_key(self.server_config, "dlss5"))
+
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [{"name": "DLSS 5", "variant": "Frame Generation - RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}]
+
+    def query_download_defs(self, enabled_only=True):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [query_preprocessor_download_def("flow", self.server_config)] if self.config()["motion_vector"] == "raft" else []
+
+    def download(self, process_files, *, send_cmd=None, status_text=None, gen=None, **_kwargs):
+        from shared.utils.download import process_files_def_if_needed
+
+        return process_files_def_if_needed(self.query_download_defs(), send_cmd=send_cmd, status_text=status_text or "Downloading DLSS Frame Generation Model Files", gen=gen, process_files=process_files)
 
     @property
     def status(self):

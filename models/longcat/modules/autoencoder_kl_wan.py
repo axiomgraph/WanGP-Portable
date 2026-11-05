@@ -14,6 +14,7 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 from shared.utils.phase_progress import vae_decoding_progress, set_phase_status
+from shared.kernels import vae_ops
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -414,8 +415,8 @@ class WanAttentionBlock(nn.Module):
         qkv = qkv.permute(0, 1, 3, 2).contiguous()
         q, k, v = qkv.chunk(3, dim=-1)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
+        # apply attention (by chunks of queries where SDPA has no memory-efficient kernel for the VAE's dtype)
+        x = vae_ops.attention(q, k, v)
 
         x = x.squeeze(1).permute(0, 2, 1).reshape(batch_size * time, channels, height, width)
 

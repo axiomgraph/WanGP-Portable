@@ -21,7 +21,7 @@ def _round_bf16(v):
 
 
 @triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _modulate_bits(X, SCALE, SHIFT, N, D: tl.constexpr, BLOCK: tl.constexpr):
+def _modulate_bits(X, SCALE, SHIFT, N, D: tl.constexpr, ROWS_BITS: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = i < N
     if D % BLOCK == 0:
@@ -29,22 +29,29 @@ def _modulate_bits(X, SCALE, SHIFT, N, D: tl.constexpr, BLOCK: tl.constexpr):
     else:
         col = i % D
     x = bf16_bits_to_fp32(tl.load(X + i, valid, 0))
-    scale = _round_bf16(tl.load(SCALE + col, valid, 0))  # the modulation rows rounded to BF16 as the eager .to(dtype)
-    shift = _round_bf16(tl.load(SHIFT + col, valid, 0))
+    if ROWS_BITS:  # BF16 modulation rows (the model dtype), read as bits
+        scale = bf16_bits_to_fp32(tl.load(SCALE + col, valid, 0))
+        shift = bf16_bits_to_fp32(tl.load(SHIFT + col, valid, 0))
+    else:  # FP32 rows rounded to BF16 as the eager .to(dtype)
+        scale = _round_bf16(tl.load(SCALE + col, valid, 0))
+        shift = _round_bf16(tl.load(SHIFT + col, valid, 0))
     factor = _round_bf16(1.0 + scale)
     scaled = _round_bf16(x * factor)
     tl.store(X + i, fp32_to_bf16_bits(scaled + shift), valid)
 
 
 def norm_modulate(x, norm, shift, scale, segments):
-    """norm(x) (BF16), then per segment x * (1 + scale[row]) + shift[row] with the eager path's BF16 roundings, in place on the norm output."""
+    """norm(x) (BF16), then per segment x * (1 + scale[row]) + shift[row] with the eager path's BF16 roundings, in place on the norm
+    output; the modulation rows FP32 (rounded to BF16 as the eager cast) or BF16 (read as bits)."""
     output = norm(x)
     bits = output.view(torch.int16)
     width = x.shape[-1]
+    rows_bits = scale.dtype == torch.bfloat16
+    scale, shift = (scale.view(torch.int16), shift.view(torch.int16)) if rows_bits else (scale, shift)
     for start, stop, row in segments:
         if stop > start:
             size = (stop - start) * width
-            _modulate_bits[(triton.cdiv(size, 1024),)](bits[start:stop], scale[row], shift[row], size, width, 1024, enable_fp_fusion=False)
+            _modulate_bits[(triton.cdiv(size, 1024),)](bits[start:stop], scale[row], shift[row], size, width, rows_bits, 1024, enable_fp_fusion=False)
     torch.autograd.graph.increment_version(output)
     return output
 

@@ -92,6 +92,8 @@ def normalize_choice_def(choice_def):
 
 
 def infer_main_outputs(model_def):
+    if model_def.get("world_outputs", False):  # interactive worlds, rendered as videos
+        return ["world", "video"]
     if model_def.get("audio_only", False):
         return ["audio"]
     if model_def.get("mesh_outputs", False):
@@ -107,6 +109,8 @@ def infer_outputs(model_def):
     outputs = infer_main_outputs(model_def)
     if model_def.get("returns_audio", False) and "audio" not in outputs:
         outputs.append("audio")
+    # other kinds of output a model can also give, such as "text" side files (a transcript) or an optional "video"
+    outputs += [output for output in model_def.get("extra_outputs", []) if output not in outputs]
     return outputs
 
 
@@ -134,12 +138,12 @@ def infer_inputs(model_def):
 
 
 def custom_guide_kinds(model_def):
-    """Media kinds of the custom_guide file input ("3d", "audio", ...; "file" for other formats such as MIDI or scores)."""
-    from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS
+    """Media kinds of the custom_guide file input ("3d", "world", ...; "file" for other formats such as MIDI or scores)."""
+    from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
     custom_guide = model_def.get("custom_guide")
     if custom_guide is None:
         return []
-    kinds = ["3d" if file_type.lower() in MESH_IMPORT_EXTENSIONS else "file" for file_type in custom_guide.get("file_types", [])]
+    kinds = ["3d" if file_type.lower() in MESH_IMPORT_EXTENSIONS else "world" if file_type.lower() in WORLD_EXTENSIONS else "file" for file_type in custom_guide.get("file_types", [])]
     return list(dict.fromkeys(kinds or ["file"]))
 
 
@@ -157,7 +161,8 @@ def infer_media_inputs(model_def):
     image_control = image_outputs and not model_def.get("reference_video_enabled", False)
     custom_guide = model_def.get("custom_guide")
     return {
-        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False))}} if custom_guide is not None else {}),
+        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False)),
+                           **{key: custom_guide[key] for key in ("model_mode", "model_mode_not", "video_prompt_type", "video_prompt_type_not", "audio_prompt_type", "audio_prompt_type_not") if key in custom_guide}}} if custom_guide is not None else {}),
         "image": {
             "start": "S" in image_prompt_types_allowed,
             "end": "E" in image_prompt_types_allowed or bool(model_def.get("end_frames_always_enabled", False)),
@@ -181,6 +186,9 @@ def infer_media_inputs(model_def):
             "reference": bool(model_def.get("reference_audio_enabled", False)),
             # A control audio drives the output and is kept as its soundtrack.
             "control": bool(model_def.get("output_audio_is_input_audio", False)) or _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "S"),
+            # the soundtrack of a video (audio_prompt_type "K": the Control Video's first audio track) as the audio input
+            "soundtrack": _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "K")
+                          or guide_custom_choices is not None and "K" in "".join(guide_custom_choices.get("audio_letters", {}).values()),
             "output": bool(model_def.get("audio_only", False) or model_def.get("returns_audio", False)),
         },
     }
@@ -213,6 +221,7 @@ def infer_capabilities(model_def, main_outputs, outputs, inputs, media_inputs):
         "lora": not bool(model_def.get("no_lora", False)),
         # 3D capabilities are only listed for 3D models, which keeps the other models' metadata unchanged.
         **({"image_to_3d": image_inputs["reference"], "text_to_3d": "text" in inputs and not model_def.get("one_image_ref_needed", False), "video_to_3d": video_inputs["reference"], "3d_to_3d": "3d" in inputs} if "3d" in main_outputs else {}),
+        **({"text_to_world": "text" in inputs, "image_to_world": image_inputs["start"]} if "world" in main_outputs else {}),
         # Specialized workflows can narrow capabilities inferred from shared controls.
         **model_def.get("capability_overrides", {}),
     }

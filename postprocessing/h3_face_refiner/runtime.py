@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import gc
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -9,7 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from shared.utils import offload_registry
+from postprocessing.face_refiner.bridge import PrivateRuntime, model_step_callback
 from shared.utils.audio_video import slice_audio_window
 
 
@@ -147,17 +146,16 @@ def turbo_lora(pipeline, turbo_path: str | None, model_type: str, multiplier: fl
         _restore_loras(transformer, snapshot, model_type)
 
 
-class H3FaceRefinerRuntime:
+class H3FaceRefinerRuntime(PrivateRuntime):
     def __init__(self):
-        self.model = None
-        self.offloadobj = None
+        super().__init__(RUNTIME_NAME)
         self.shared_offloadobj = None
         self.profile = None
 
     def load(self, shared_context=None) -> None:
         import wgp
 
-        profile = int(wgp.get_default_profile("video"))
+        profile = 0
         shared_offloadobj = None if shared_context is None else shared_context.offloadobj
         if self.model is not None and self.profile == profile and self.shared_offloadobj is shared_offloadobj:
             return
@@ -169,32 +167,30 @@ class H3FaceRefinerRuntime:
             model_kwargs = {"disable_pinning": True}
             if shared_context is not None:
                 model_kwargs.update(shared_h3_pipeline=shared_context.model, shared_h3_offloadobj=shared_context.offloadobj)
-            print(f"[H3FaceRefine] Loading private H3 runtime with default video memory profile {profile}; GGUF Q4_K_M text encoder; RAM pinning disabled")
-            self.model, self.offloadobj = wgp.load_models(DEFAULT_MODEL_TYPE, override_profile=profile, output_type="video", config_id=TEXT_ENCODER_CONFIG, track_as_main=False, **model_kwargs)
+            tqdm.write(f"[H3FaceRefine] Loading private H3 runtime with postprocessor memory profile {profile}; GGUF Q4_K_M text encoder; RAM pinning disabled")
+            self.model, self.offloadobj = wgp.load_models(DEFAULT_MODEL_TYPE, override_profile=profile, output_type="video", config_id=TEXT_ENCODER_CONFIG, track_as_main=False, extension=True, **model_kwargs)
             self.shared_offloadobj = shared_offloadobj
             if shared_context is not None:
                 self.model.set_offload_handoff(shared_context.offloadobj, self.offloadobj)
                 print(f"[H3FaceRefine] Reusing text encoder, video VAE, audio VAE, and latent upscaler from loaded H3 model '{shared_context.model_type}'; loading only pruned Ref2VA denoiser")
             self.profile = profile
-            offload_registry.register_offloadobj(RUNTIME_NAME, self.offloadobj, self.release)
+            self.adopt(self.model, self.offloadobj)
         except Exception:
             self.release()
             raise
 
+    def _before_release(self):
+        if self.shared_offloadobj is not None:
+            self.model.detach_shared_components()
+
     def release(self) -> None:
         if self.shared_offloadobj is not None:
             self.shared_offloadobj.unload_all()
-        if self.offloadobj is not None:
-            offload_registry.unregister_offloadobj(RUNTIME_NAME, self.offloadobj)
-            if self.shared_offloadobj is not None:
-                self.model.detach_shared_components()
-            self.offloadobj.release()
-        self.model = self.offloadobj = self.shared_offloadobj = self.profile = None
-        gc.collect()
+        super().release()
+        self.shared_offloadobj = self.profile = None
 
     def unload_all(self) -> None:
-        if self.offloadobj is not None:
-            self.offloadobj.unload_all()
+        super().unload_all()
         if self.shared_offloadobj is not None:
             self.shared_offloadobj.unload_all()
 
@@ -230,17 +226,7 @@ def refine_video(video: torch.Tensor | None, strengths: torch.Tensor, *, pipelin
             def status_callback(phase):
                 _report(progress_callback, f"{label} - {phase}" if label else phase)
 
-            def step_callback(step_idx=-1, _latent=None, _force_refresh=False, read_state=False, **kwargs):
-                if callable(abort_callback) and abort_callback():
-                    pipeline._interrupt = True
-                    return
-                if read_state:
-                    return
-                phase = kwargs.get("progress_title", "H3 Face Refinement")
-                phase = f"{label} - {phase}" if label else phase
-                _report(progress_callback, phase, int(step_idx) + 1, kwargs.get("override_num_inference_steps", int(sampling_steps)))
-
-            step_callback.checkpoint = lambda: step_callback(read_state=True)
+            step_callback = model_step_callback(pipeline, abort_callback, progress_callback, "H3 Face Refinement", sampling_steps, label)
 
             if hasattr(pipeline, "_interrupt"):
                 pipeline._interrupt = False

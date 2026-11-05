@@ -644,9 +644,10 @@ WAC.handleCopyButtonClick = function (event) {
   event.preventDefault();
   event.stopPropagation();
   const source = String(button.getAttribute('data-copy-source') || '');
-  const jsonNode = source === 'json' ? button.closest('.chat__tool-json') : null;
-  const pre = jsonNode ? jsonNode.querySelector('pre') : null;
-  const text = source === 'json' ? String((pre && pre.textContent) || '') : String(button.getAttribute('data-copy-text') || '');
+  const jsonNode = source === 'json' || source === 'stdout' ? button.closest('.chat__tool-json') : null;
+  // 'stdout' copies a Python run's printed output as it is now (it keeps growing while the script runs)
+  const pre = jsonNode ? (source === 'stdout' && jsonNode.querySelector('.chat__tool-stdout')) || jsonNode.querySelector('pre') : null;
+  const text = jsonNode ? String((pre && pre.textContent) || '') : String(button.getAttribute('data-copy-text') || '');
   if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
     WAC.markCopyButton(button, 'error');
     return true;
@@ -709,9 +710,12 @@ WAC.trackDisclosurePointer = function (event) {
   else WAC.toggleDisclosure(node);
 };
 
+// Media links in replies open like the attachment thumbnails.
+WAC.attachmentSelector = 'a.chat__attachment, .chat__transcript a[data-media-kind], a.chat__pending-upload-link';
+
 WAC.handleAttachmentPointerDown = function (event) {
   WAC.attachmentTouch = null;
-  const link = event && event.target && event.target.closest ? event.target.closest('a.chat__attachment') : null;
+  const link = event && event.target && event.target.closest ? event.target.closest(WAC.attachmentSelector) : null;
   if (!link) return false;
   WAC.attachmentTouch = event.pointerType === 'touch' || event.pointerType === 'pen'
     ? {id: event.pointerId, x: event.clientX, y: event.clientY, link, moved: !event.isPrimary}
@@ -724,6 +728,7 @@ WAC.trackAttachmentTouch = function (event) {
   if (!touch || touch.id !== event.pointerId) return;
   if (event.type === 'pointercancel' || Math.hypot(event.clientX - touch.x, event.clientY - touch.y) > 10) touch.moved = true;
   if (event.type === 'pointerup' && !touch.moved) {
+    if (window.WanGPAppPlayer && WanGPAppPlayer.open(touch.link)) return;  // web apps and previews play in the app player
     if (WAC.openAttachment && WAC.openAttachment(touch.link)) return;
     const target = touch.link.target || '_blank';
     if (target === '_blank') window.open(touch.link.href, '_blank', 'noopener');
@@ -732,11 +737,11 @@ WAC.trackAttachmentTouch = function (event) {
 };
 
 WAC.handleAttachmentClick = function (event) {
-  const link = event.target.closest('a.chat__attachment');
+  const link = event.target.closest(WAC.attachmentSelector);
   if (!link) return false;
   const touch = WAC.attachmentTouch;
   WAC.attachmentTouch = null;
-  if ((event.detail !== 0 && touch) || (WAC.openAttachment && WAC.openAttachment(link))) {
+  if ((event.detail !== 0 && touch) || (window.WanGPAppPlayer && WanGPAppPlayer.open(link)) || (WAC.openAttachment && WAC.openAttachment(link))) {
     event.preventDefault();
     event.stopPropagation();
   }
@@ -1002,7 +1007,7 @@ WAC.consumePayload = function (payload) {
     WAC.syncRecoveryPending = false;
   }
   if (hasRevision) WAC.chatRevision = revision;
-  if (event.pending_upload_count !== undefined) WAC.setPendingUploadCount(event.pending_upload_count);
+  if (event.pending_uploads !== undefined) WAC.setPendingUploads(event.pending_uploads);
   if (event.type === 'reset') {
     WAC.reset();
     if (chatSessionId) WAC.chatSessionId = chatSessionId;
@@ -1270,7 +1275,7 @@ WAC.ensureShell = function () {
       </div>
       <div class="chat__status" aria-live="polite">
         <div class="chat__status-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div class="chat__status-text"></div>
+        <div class="chat__status-main"><div class="chat__status-text"></div><div class="chat__status-detail" hidden></div><div class="chat__status-progress" hidden><span></span></div></div>
         <button class="chat__status-pause" type="button" aria-label="Pause Deepy" disabled>Pause</button>
         <button class="chat__status-stop" type="button" aria-label="Stop Deepy" disabled>Stop</button>
       </div>
@@ -1644,7 +1649,12 @@ WAC.renderStreamingMarkdownLine = function (node, state, line) {
   }
   if (WAC.appendStreamingListItem(node, state, line)) return;
   if (!line.trim()) {
-    if (!state.list) node.appendChild(document.createElement('br'));
+    // A paragraph break measures what the final rendering gives it (a paragraph margin), and nothing after a block with its own margin (code, heading, list), so the text does not shift when the block is finalized.
+    if (!state.list && node.lastElementChild && node.lastElementChild.tagName === 'BR') {
+      const gap = document.createElement('span');
+      gap.className = 'chat__stream-gap';
+      node.appendChild(gap);
+    }
     state.blockBoundary = true;
     return;
   }
@@ -1906,6 +1916,7 @@ WAC.upsertBlock = function (event) {
     if (existing) WAC.renderStreamingMarkdown(live, initialText);
     else WAC.queueStreamingReveal(live, initialText);
   }
+  window.WanGPAppPlayer?.sync(node);  // Deepy changed the app being played: reload it
   WAC.applyAutoscrollState(scrollState);
 };
 
@@ -2032,7 +2043,33 @@ WAC.patchDisclosureNode = function (current, next) {
   if (currentSummary && nextSummary && currentSummary.innerHTML !== nextSummary.innerHTML) currentSummary.innerHTML = nextSummary.innerHTML;
   const currentBody = current.querySelector(':scope > .chat__disclosure-body');
   const nextBody = next.querySelector(':scope > .chat__disclosure-body');
+  if (currentBody && nextBody && WAC.patchLiveOutput(currentBody, nextBody)) return;
   if (currentBody && nextBody && currentBody.innerHTML !== nextBody.innerHTML) currentBody.innerHTML = nextBody.innerHTML;
+};
+
+// A running Python script updates only its live output (progress, printed lines): the code and the copy buttons stay as they are,
+// and the output keeps following its last line unless the user scrolled up in it.
+WAC.patchLiveOutput = function (currentBody, nextBody) {
+  const key = currentBody.getAttribute('data-static-key');
+  if (!key || key !== nextBody.getAttribute('data-static-key')) return false;
+  const currentLive = currentBody.querySelector('[data-live-output]');
+  const nextLive = nextBody.querySelector('[data-live-output]');
+  if (!currentLive || !nextLive) return false;
+  const currentMeta = currentLive.querySelector('.chat__tool-live-meta');
+  const nextMeta = nextLive.querySelector('.chat__tool-live-meta');
+  if (currentMeta && nextMeta && currentMeta.textContent !== nextMeta.textContent) currentMeta.textContent = nextMeta.textContent;
+  const nextOut = nextLive.querySelector('.chat__tool-stdout');
+  let currentOut = currentLive.querySelector('.chat__tool-stdout');
+  if (nextOut && !currentOut) {
+    currentOut = nextOut.cloneNode(false);
+    currentLive.appendChild(currentOut);
+  }
+  if (currentOut && nextOut && currentOut.textContent !== nextOut.textContent) {
+    const following = currentOut.scrollHeight - currentOut.scrollTop - currentOut.clientHeight < 8;
+    currentOut.textContent = nextOut.textContent;
+    if (following) currentOut.scrollTop = currentOut.scrollHeight;
+  }
+  return true;
 };
 
 WAC.patchBlockNode = function (current, next) {
@@ -2172,6 +2209,7 @@ WAC.upsertMessage = function (message, preserveIncrementalState, messageIndex) {
   WAC.hideEmpty();
   WAC.applyDisclosureState(transcript);
   WAC.syncQueuedRequestEdit();
+  window.WanGPAppPlayer?.sync(existing || node);
   WAC.applyAutoscrollState(scrollState);
 };
 
@@ -2208,16 +2246,15 @@ WAC.uploadMediaFiles = async function (files, request, notice, updateGallery, fr
   return lastId;
 };
 
-WAC.setPendingUploadCount = function (count) {
-  WAC.pendingUploadCount = count;
+WAC.setPendingUploads = function (items) {
+  WAC.pendingUploads = items;
   WAC.refreshChatDraftActions?.();
-  const counter = document.getElementById('assistant_chat_upload_count');
-  if (!counter) return;
-  counter.hidden = !count;
-  const label = count + ' media attached to the next message';
-  counter.title = label; counter.setAttribute('aria-label', label);
-  const text = 'x' + count;
-  if (counter.lastElementChild.textContent !== text) counter.lastElementChild.textContent = text;
+  const strip = document.getElementById('assistant_chat_pending_uploads');
+  if (!strip) return;
+  const html = items.map(item => item.html).join('');
+  // Repeated events carry the same previews: keep their loaded images.
+  if (WAC.pendingUploadsHtml !== html) {WAC.pendingUploadsHtml = html; strip.innerHTML = html;}
+  strip.hidden = !items.length;
 };
 
 WAC.mountChatUpload = function (request, notice, updateGallery) {
@@ -2225,13 +2262,24 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
   if (!controls || document.getElementById('assistant_chat_upload_button')) return;
   const button = document.createElement('button');
   button.id = 'assistant_chat_upload_button'; button.type = 'button';
-  button.title = 'Upload images or videos'; button.setAttribute('aria-label', button.title);
+  button.title = 'Upload images, videos or audio'; button.setAttribute('aria-label', button.title);
   button.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
   const input = document.createElement('input');
-  input.type = 'file'; input.accept = 'image/*,video/*'; input.multiple = true; input.hidden = true;
+  // Audio by extension: iOS Safari filters audio/* as video and greys out audio files.
+  input.type = 'file'; input.accept = 'image/*,video/*,.wav,.mp3,.aac,.flac,.m4a,.ogg,.opus,.wma'; input.multiple = true; input.hidden = true;
   const status = document.createElement('span');
   status.id = 'assistant_chat_upload_status'; status.setAttribute('role', 'status'); status.hidden = true;
   const uploadNotice = text => { status.textContent = text; status.hidden = !text; };
+  const strip = document.createElement('div');
+  strip.id = 'assistant_chat_pending_uploads'; strip.hidden = true;
+  WAC.pendingUploadsHtml = '';
+  strip.onclick = async event => {
+    const remove = event.target.closest('[data-unattach]');
+    if (!remove) return;
+    remove.disabled = true;
+    try {WAC.consumePayload((await request('media/unattach', {chat_session_id: WAC.chatSessionId, media_id: remove.dataset.unattach})).event);}
+    catch (error) {uploadNotice(error.message); remove.disabled = false;}
+  };
   button.onclick = () => input.click();
   input.onchange = async () => {
     if (!input.files.length) return;
@@ -2250,29 +2298,26 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
   };
   controls.append(button, input);
   if (document.body.hasAttribute('data-deepy-app')) {
-    const counter = document.createElement('span'); counter.id = 'assistant_chat_upload_count'; counter.hidden = true;
-    counter.setAttribute('role', 'status');
-    counter.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 6-6 4 4 3-3 5 5"/></svg><span></span>';
     const clear = document.createElement('button'); clear.id = 'assistant_chat_clear_draft'; clear.type = 'button';
     clear.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/></svg>';
     let clearing = false;
     WAC.refreshChatDraftActions = () => {
       const hasText = !!WAC.requestInput().value;
-      clear.disabled = clearing || (!hasText && !WAC.pendingUploadCount);
+      clear.disabled = clearing || (!hasText && !WAC.pendingUploads.length);
       clear.title = hasText ? 'Clear text' : 'Remove last attachment'; clear.setAttribute('aria-label', clear.title);
     };
     clear.onclick = async () => {
       if (WAC.requestInput().value) {WAC.setRequestInputValue(''); return;}
       clearing = true; WAC.refreshChatDraftActions();
-      try {WAC.consumePayload((await request('media/unattach-last', {chat_session_id: WAC.chatSessionId})).event);}
+      try {WAC.consumePayload((await request('media/unattach', {chat_session_id: WAC.chatSessionId})).event);}
       catch (error) {uploadNotice(error.message);}
       finally {clearing = false; WAC.refreshChatDraftActions();}
     };
     WAC.requestInput().addEventListener('input', WAC.refreshChatDraftActions);
-    controls.append(status, counter, clear);
-    WAC.setPendingUploadCount(WAC.pendingUploadCount || 0);
+    controls.append(status, strip, clear);
   }
-  else controls.after(status);
+  else {controls.before(strip); controls.after(status);}
+  WAC.setPendingUploads(WAC.pendingUploads || []);
 };
 
 WAC.waitForChatUpload = async function () {
@@ -2322,6 +2367,7 @@ WAC.renderStatus = function (status, restoreAnchor) {
   const pauseNode = node.querySelector('.chat__status-pause');
   const stopNode = node.querySelector('.chat__status-stop');
   if (!status || !status.visible || !status.text) {
+    WAC.renderStatusProgress(node, null);
     node.classList.remove('is-visible');
     node.removeAttribute('data-kind');
     if (textNode) textNode.textContent = '';
@@ -2341,6 +2387,7 @@ WAC.renderStatus = function (status, restoreAnchor) {
     return;
   }
   if (textNode) { textNode.textContent = String(status.text).replace(/_/g, '_\u200b'); textNode.title = String(status.text); }
+  WAC.renderStatusProgress(node, status);
   const kind = String(status.kind || 'status');
   node.dataset.kind = kind;
   if (pauseNode) {
@@ -2358,6 +2405,44 @@ WAC.renderStatus = function (status, restoreAnchor) {
   node.classList.add('is-visible');
   WAC.setBusyInputHelper(kind !== 'session_loading');
   WAC.syncStatusLayout(scrollState);
+};
+
+// A detail line and a progress bar under the status text (a running Python script reports both), then the tool that script is calling.
+WAC.renderStatusProgress = function (node, status) {
+  if (!node.querySelector('.chat__status-main')) {
+    const textNode = node.querySelector('.chat__status-text');
+    if (!textNode) return;
+    const main = document.createElement('div');
+    main.className = 'chat__status-main';
+    main.innerHTML = '<div class="chat__status-detail" hidden></div><div class="chat__status-progress" hidden><span></span></div>';
+    textNode.replaceWith(main);
+    main.prepend(textNode);
+  }
+  if (!node.querySelector('.chat__status-sub')) {
+    const subNode = document.createElement('div');
+    subNode.className = 'chat__status-sub';
+    subNode.hidden = true;
+    node.querySelector('.chat__status-main').appendChild(subNode);
+  }
+  const detailNode = node.querySelector('.chat__status-detail');
+  const barNode = node.querySelector('.chat__status-progress');
+  const detail = status && status.detail ? String(status.detail) : '';
+  if (detailNode) {
+    if (detailNode.textContent !== detail) { detailNode.textContent = detail; detailNode.title = detail; }
+    detailNode.hidden = !detail;
+  }
+  const progress = status && status.progress && Number(status.progress.total) > 0 ? status.progress : null;
+  if (barNode) {
+    barNode.hidden = !progress;
+    const fill = barNode.firstElementChild;
+    if (progress && fill) fill.style.width = Math.max(0, Math.min(100, 100 * Number(progress.done || 0) / Number(progress.total))).toFixed(1) + '%';
+  }
+  const subNode = node.querySelector('.chat__status-sub');
+  const sub = status && status.sub ? String(status.sub) : '';
+  if (subNode) {
+    if (subNode.textContent !== sub) { subNode.textContent = sub; subNode.title = sub; }
+    subNode.hidden = !sub;
+  }
 };
 
 WAC.setStats = function (stats) {
@@ -2402,7 +2487,7 @@ WAC.sync = function (messages, status, stats, acknowledgedSubmissionIds) {
 
 WAC.reset = function () {
   WAC.clearStreamingReveals();
-  WAC.setPendingUploadCount(0);
+  WAC.setPendingUploads([]);
   WAC.compactScrollState = null;
   if (WAC.queuedEditMessageId) WAC.finishQueuedRequestEdit();
   WAC.state = { order: [], messages: {}, status: null, stats: null };
@@ -2465,9 +2550,19 @@ WAC.applyEvent = function (payload) {
 WAC.syncDisclosureBridge = function () {
   const transcript = WAC.transcript();
   if (!transcript || transcript === WAC.disclosureNode) return;
-  if (WAC.disclosureNode) WAC.disclosureNode.removeEventListener('toggle', WAC.handleDisclosureToggle, true);
+  if (WAC.disclosureNode) {
+    WAC.disclosureNode.removeEventListener('toggle', WAC.handleDisclosureToggle, true);
+  }
   WAC.disclosureNode = transcript;
   WAC.disclosureNode.addEventListener('toggle', WAC.handleDisclosureToggle, true);
+};
+
+WAC.handleThumbnailError = function (event) {
+  const image = event.target;
+  const icon = image.nextElementSibling;
+  if (image.tagName !== 'IMG' || !image.classList.contains('chat__attachment-thumb') || !icon || !icon.hasAttribute('data-attachment-icon')) return;
+  image.hidden = true;  // a preview that could not be made: its typed icon instead of a broken image
+  icon.hidden = false;
 };
 
 WAC.handleScroll = function () {
@@ -2716,7 +2811,8 @@ WAC.installDockBridge = function () {
     }
   }, true);
   document.addEventListener('keydown', (event) => {
-    if (event.target.closest?.('dialog[open]')) return;
+    // Escape in a full-screen viewer only leaves full screen.
+    if (event.target.closest?.('dialog[open]') || document.fullscreenElement) return;
     if (event.key === 'Escape' && WAC.queuedEditMessageId) {
       event.preventDefault();
       event.stopPropagation();
@@ -2774,6 +2870,7 @@ WAC.installDockBridge = function () {
 };
 
 if (!WAC.init) {
+  document.addEventListener('error', WAC.handleThumbnailError, true);  // load errors do not bubble: caught on the way down, on every page that shows the chat
   WAC.installObserver();
   WAC.installEventBridge();
   WAC.installDockBridge();

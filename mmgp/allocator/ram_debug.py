@@ -450,7 +450,7 @@ def _find_objects():
     numpy = _numpy()
     pil, offload = sys.modules.get("PIL.Image"), sys.modules.get("mmgp.offload")  # looked up, never imported by a census
     slots = [("tensors", torch.Tensor), ("storages", torch.UntypedStorage), ("storages", torch.TypedStorage)]
-    slots += [("registrations", offload._HostRegistration), ("offloads", offload.offload)] if offload is not None else []
+    slots += [("registrations", sys.modules["mmgp.pinned"].Registration), ("offloads", offload.offload)] if offload is not None else []
     slots += [("images", pil.Image)] if pil is not None else []
     found = {"tensors": [], "storages": [], "arrays": {}, "bytes": {}, "images": [], "registrations": [], "offloads": []}
     slot_of = found["types"] = {}  # type -> slot name, or "" when the type holds nothing of interest
@@ -1351,7 +1351,7 @@ def _ram_where(rec, stack_id):
     """The allocation site: the innermost frame of the application's code, with the mmgp function that allocated for it (pinning, staging)."""
     where = _vram_debug._where(rec, stack_id)
     for code, line in rec.stack_frames[stack_id]:
-        if code.co_filename.endswith(os.path.join("mmgp", "offload.py")):
+        if code.co_filename.endswith((os.path.join("mmgp", "offload.py"), os.path.join("mmgp", "pinned.py"))):
             name = getattr(code, "co_qualname", code.co_name)
             return f"{where} (mmgp {name})" if code.co_name not in where else where
     return where
@@ -1901,7 +1901,7 @@ def summary(result):
         for phase in result["phases"]:
             hooked = phase.get("hooked_at_peak")
             if hooked and hooked["groups"]:
-                pinning = [group for group in hooked["groups"] if "(mmgp _pinned_block" in group["where"] or "(mmgp _StagingRing" in group["where"]]
+                pinning = [group for group in hooked["groups"] if "(mmgp block)" in group["where"] or "(mmgp _StagingRing" in group["where"]]
                 others = [group for group in hooked["groups"] if group not in pinning]
                 note = f"; MMGP pinned weights and staging ring {sum(group['mb'] for group in pinning) / 1024:.2f} GiB, not listed" if pinning else ""
                 text.append(f"### Hooked allocations alive at the peak of {phase['name']} ({hooked['time_s']:.1f} s): PyTorch {hooked['torch_gb']:.2f} GiB, NumPy {hooked['numpy_gb']:.2f} GiB{note}\n\n"

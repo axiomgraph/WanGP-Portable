@@ -15,7 +15,7 @@ import yaml
 from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen3ForCausalLM as HfQwen3ForCausalLM, Qwen3Model
 
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils.text_encoder_cache import TextEncoderCache
 
 from .models.autoencoder_oobleck import AutoencoderOobleck
@@ -315,6 +315,7 @@ class ACEStep15Pipeline:
             ignore_unused_weights=True,
         )
         self.text_encoder_2.eval()
+        runtime.lookup_on_cpu(self.text_encoder_2.embed_tokens)  # the 0.3 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
 
     def _load_lm(self):
         config_path = os.path.join(os.path.dirname(self.lm_weights_path), "config.json")

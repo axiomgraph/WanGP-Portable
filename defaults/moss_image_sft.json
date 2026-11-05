@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "MOSS Image 5B SFT",
+        "name": "Moss Image 5B SFT",
         "architecture": "moss_image",
         "description": "MOSS-Image SFT: curated-data post-training of MOSS-Image Base, using the same text-to-image and layout workflows. 50 steps with CFG.",
         "URLs": [

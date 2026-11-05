@@ -242,7 +242,7 @@ class QwenImagePipeline(): #DiffusionPipeline
             ).to(device)
 
             with text_encoding_progress(self.text_encoder.model.language_model.layers, prompt_count=len(prompt)):
-                outputs = self.text_encoder(input_ids=model_inputs.input_ids, attention_mask=model_inputs.attention_mask, pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw, output_hidden_states=True)
+                outputs = self.text_encoder.model(input_ids=model_inputs.input_ids, attention_mask=model_inputs.attention_mask, pixel_values=model_inputs.pixel_values, image_grid_thw=model_inputs.image_grid_thw, output_hidden_states=True)
             hidden_states = outputs.hidden_states[-1]
             split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
             split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
@@ -258,7 +258,7 @@ class QwenImagePipeline(): #DiffusionPipeline
                     return_tensors="pt",
                 ).to(device)
                 with text_encoding_progress(self.text_encoder.model.language_model.layers, prompt_count=len(prompts)):
-                    hidden_states = self.text_encoder(input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True).hidden_states[-1]
+                    hidden_states = self.text_encoder.model(input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True).hidden_states[-1]
                 split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
                 split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
                 attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]

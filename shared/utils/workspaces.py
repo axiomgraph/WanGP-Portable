@@ -234,17 +234,18 @@ class WorkspaceStore:
             workspace_id = self.session_workspaces.get(session_id)
             return self.get(workspace_id) if workspace_id else None
 
-    def create(self, name, *, deepy_session_id=None, mcp_agent_id=None, storage_mode=None):
+    def create(self, name, *, deepy_session_id=None, mcp_agent_id=None, storage_mode=None, folder=None):
+        """A given absolute folder (a plugin's Deepy session folder) makes the workspace dedicated and may already hold its media."""
         with self.lock:
             if deepy_session_id and deepy_session_id in self.session_workspaces:
                 raise ValueError('This Deepy session already has a dedicated workspace.')
-            mode = storage_mode or self.default_mode
+            mode = 'dedicated' if folder is not None else storage_mode or self.default_mode
             if mode not in MODES:
                 raise ValueError('Choose shared or dedicated workspace storage.')
             record = {'id': uuid.uuid4().hex, 'name': self._name(name, owner=deepy_session_id or mcp_agent_id), 'gallery': {}, 'last_activity': time.time(), 'archive_protected': False}
             if mode == 'dedicated':
-                record.update(storage_mode=mode, folder=self._new_folder(record))
-                self._directory(record).mkdir(parents=True, exist_ok=False)
+                record.update(storage_mode=mode, folder=self._new_folder(record) if folder is None else str(folder))
+                self._directory(record).mkdir(parents=True, exist_ok=folder is not None)
             if mcp_agent_id:
                 record['mcp_agent_id'] = mcp_agent_id
             if deepy_session_id:
@@ -253,6 +254,18 @@ class WorkspaceStore:
             if deepy_session_id:
                 self.session_workspaces[deepy_session_id] = record['id']
             return record['id']
+
+    def lease(self, workspace_id, deepy_session_id):
+        """Assign a workspace to a Deepy session for a plugin job without recording it as its owner."""
+        with self.lock:
+            self.get(workspace_id)
+            if deepy_session_id in self.session_workspaces:
+                raise ValueError('This Deepy session already has a workspace.')
+            self.session_workspaces[deepy_session_id] = workspace_id
+
+    def end_lease(self, deepy_session_id):
+        with self.lock:
+            del self.session_workspaces[deepy_session_id]
 
     def rename(self, workspace_id, name, *, deepy_session_id=None):
         with self.lock:

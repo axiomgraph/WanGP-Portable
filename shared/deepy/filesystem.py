@@ -18,7 +18,7 @@ from typing import Any
 import ffmpeg
 from PIL import Image
 
-from shared.deepy.image_channels import image_color_details
+from shared.deepy.image_channels import image_color_details, upright_size
 from shared.deepy.media_registry import detect_media_type
 from shared.utils.video_decode import resolve_media_binary
 
@@ -217,6 +217,8 @@ class FileAccessPolicy:
             raise PermissionError(f"Filesystem read is not authorized for: {self.virtualize_path(target)}")
         if file and not target.is_file():
             named = sorted(target.parent.glob(f"{glob.escape(target.name)}.*")) if not target.suffix and target.parent.is_dir() else []
+            if not named and isinstance(path, str) and not path.startswith("@") and not Path(path).is_absolute():  # a relative path meant for another folder, e.g. a Python sandbox file ('scratch/a.png')
+                named = [candidate for root in self.read_roots for candidate in (root / path, root / "sandbox" / path) if candidate.is_file()]
             raise FileNotFoundError(f"Path is not an existing file: {self.virtualize_path(target)}" + (f" (did you mean {', '.join(self.virtualize_path(item) for item in named[:3])}?)" if named else ""))
         if directory and not target.is_dir():
             raise FileNotFoundError(f"Path is not an existing directory: {self.virtualize_path(target)}")
@@ -306,8 +308,8 @@ def list_entries(policy: FileAccessPolicy, path: str = "", pattern: str = "*", r
     limit = max(1, min(int(limit), 1000))
     offset = max(0, int(offset))
     media_type = str(media_type or "all").strip().lower()
-    if media_type not in {"all", "image", "video", "audio", "3d", "txt", "other"}:
-        raise ValueError("media_type must be all, image, video, audio, 3d, txt, or other")
+    if media_type not in {"all", "image", "video", "audio", "3d", "world", "txt", "other"}:
+        raise ValueError("media_type must be all, image, video, audio, 3d, world, txt, or other")
     candidates = directory.rglob(pattern) if recursive else iter(sorted(directory.glob(pattern), key=lambda entry: str(entry).casefold()))
     entries = []
     for item in candidates:
@@ -400,7 +402,7 @@ def _probe_media(path: Path, media_type: str) -> dict[str, Any]:
 
 def _query_image(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
-        width, height = image.size
+        width, height = upright_size(image)
         color_details = image_color_details(image)
         frame_count = int(getattr(image, "n_frames", 1) or 1)
         duration = sum(float(image.seek(index) or image.info.get("duration", 0) or 0) for index in range(frame_count)) / 1000 if frame_count > 1 else None
@@ -417,12 +419,53 @@ def file_info(path: str, policy: FileAccessPolicy | None = None) -> dict[str, An
         if media_type == "3d":
             from shared.utils.mesh_outputs import asset_summary
             result = {"status": "done", "path": str(target), "filename": target.name, "size_bytes": target.stat().st_size, "file_type": "3d", **asset_summary(str(target)), "error": ""}
+        elif media_type == "world":
+            from shared.utils.world_outputs import world_summary
+            result = {"status": "done", "path": str(target), "filename": target.name, "size_bytes": target.stat().st_size, "file_type": "world", **world_summary(str(target)), "error": ""}
         else:
             result = _query_image(target) if media_type == "image" else _probe_media(target, media_type) if media_type in {"video", "audio"} else {"status": "done", "path": str(target), "filename": target.name, "size_bytes": target.stat().st_size, "file_type": "file", "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream", "error": ""}
         result["modified"] = target.stat().st_mtime
         return result
     except (OSError, ValueError, ffmpeg.Error) as exc:
         return {"status": "error", "path": str(target), "size_bytes": target.stat().st_size, "error": str(exc) or "Unable to inspect file."}
+
+
+ARCHIVE_ENTRIES_SHOWN = 50
+
+
+def _query_archive(file_path: Path) -> dict[str, Any]:
+    """A ZIP archive (an RGBA video's PNG frames, for example): its entries, the first ones by name."""
+    with zipfile.ZipFile(file_path) as archive:
+        names = archive.namelist()
+    return {"status": "done", "path": str(file_path), "filename": file_path.name, "size_bytes": file_path.stat().st_size, "file_type": "archive",
+            "entry_count": len(names), "entries": names[:ARCHIVE_ENTRIES_SHOWN], "error": ""}
+
+
+def query_text_lines(path: str, start_line: int = 1) -> dict[str, Any]:
+    """UTF-8 text from start_line (from 1) in whole lines, up to TEXT_MAX_CHARS characters; next_line when the file goes on."""
+    file_path = _resolved_path(path)
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    shown, size = [], 0
+    for line in lines[max(start_line, 1) - 1:]:
+        if shown and size + len(line) + 1 > TEXT_MAX_CHARS:
+            break
+        shown.append(line)
+        size += len(line) + 1
+    end_line = max(start_line, 1) - 1 + len(shown)
+    return {"status": "done", "path": str(file_path), "filename": file_path.name, "file_type": "text", "text": "\n".join(shown), "start_line": max(start_line, 1),
+            "end_line": end_line, "line_count": len(lines), **({"next_line": end_line + 1} if end_line < len(lines) else {}), "error": ""}
+
+
+def query_side_file(path: str, start_line: int = 1) -> dict[str, Any]:
+    """A file saved beside a media item: a media file's details, an archive's entries, or text read by lines from start_line (any length)."""
+    file_path = _resolved_path(path)
+    if detect_media_type(str(file_path)) in {"image", "video", "audio"} or zipfile.is_zipfile(file_path):
+        return query_file(path)
+    try:
+        return query_text_lines(path, start_line)
+    except UnicodeError:  # a binary companion (a MIDI score, ...): what it is
+        return {"status": "done", "path": str(file_path), "filename": file_path.name, "size_bytes": file_path.stat().st_size, "file_type": "file",
+                "mime_type": mimetypes.guess_type(file_path.name)[0] or "application/octet-stream", "error": ""}
 
 
 def query_file(path: str) -> dict[str, Any]:
@@ -435,6 +478,8 @@ def query_file(path: str) -> dict[str, Any]:
             return _query_image(file_path)
         if media_type in {"video", "audio"}:
             return _probe_media(file_path, media_type)
+        if zipfile.is_zipfile(file_path):
+            return _query_archive(file_path)
         with file_path.open("r", encoding="utf-8") as reader:
             text = reader.read(TEXT_MAX_CHARS + 1)
         if len(text) > TEXT_MAX_CHARS:
@@ -762,37 +807,17 @@ def unzip_file(policy: FileAccessPolicy, source: str, destination: str = "", ove
     return {"status": "done", "source": str(source_path), "path": str(destination_path), "file_count": len(files), "size_bytes": sum(member.file_size for member in files), "overwritten_count": overwritten_count, "error": ""}
 
 
-_ARTIFACT_REFERENCE_SCHEMA = {
-    "type": "object",
-    "description": "A Deepy artifact reference rendered server-side; the compiled content must not be copied into the tool call. Most consumers require finalization, while write_artifact_text may export current committed progress.",
-    "properties": {
-        "$artifact": {"type": "string", "description": "Artifact ID returned by wangp_artifact."},
-        "where": {"type": "array", "items": {"type": "object"}},
-        "select": {"type": "string", "description": "Optional dotted field to extract from each record or from a ledger."},
-        "template": {"type": "string", "description": "Optional Python-style format template applied to each object record."},
-        "join": {"type": "string", "description": "Join rendered record values into one text payload."},
-        "prefix": {"type": "string"},
-        "suffix": {"type": "string"},
-        "offset": {"type": "integer", "default": 0},
-        "limit": {"type": "integer"},
-    },
-    "required": ["$artifact"],
-    "additionalProperties": False,
-}
-
-
 IO_ACTIONS = {
-    "list": {"description": "List authorized roots or a page of directory entries. When has_more is true, repeat the same filters with offset set to next_offset.", "access": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory; omit to list authorized roots."}, "pattern": {"type": "string", "default": "*", "description": "Filename glob."}, "media_type": {"type": "string", "enum": ["all", "image", "video", "audio", "txt", "other"], "default": "all", "description": "Implicit extension filter. Typed filters return files only; other excludes supported media and .txt files."}, "recursive": {"type": "boolean", "default": False}, "limit": {"type": "integer", "default": 200, "description": "Maximum entries to return; Deepy may shorten the page to fit its context-safe output budget."}, "offset": {"type": "integer", "default": 0, "description": "Entry offset; preserve the previous filters and use its next_offset to continue."}, "store_artifact": {"type": "boolean", "default": False, "description": "Store the exact returned page in a working artifact and return compact progress instead of echoing all entries."}, "artifact_id": {"type": "string", "description": "Existing record-set artifact to append this page to."}, "artifact_title": {"type": "string", "description": "Title used when creating a new file collection artifact."}}}},
+    "list": {"description": "List authorized roots or a page of directory entries. When has_more is true, repeat the same filters with offset set to next_offset.", "access": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory; omit to list authorized roots."}, "pattern": {"type": "string", "default": "*", "description": "Filename glob."}, "media_type": {"type": "string", "enum": ["all", "image", "video", "audio", "txt", "other"], "default": "all", "description": "Implicit extension filter. Typed filters return files only; other excludes supported media and .txt files."}, "recursive": {"type": "boolean", "default": False}, "limit": {"type": "integer", "default": 200, "description": "Maximum entries to return; Deepy may shorten the page to fit its context-safe output budget."}, "offset": {"type": "integer", "default": 0, "description": "Entry offset; preserve the previous filters and use its next_offset to continue."}}}},
     "info": {"description": "Return file, directory, or media metadata.", "access": "always", "parameters": {"type": "object", "properties": {"source": {"type": "string", "description": "Authorized path or Gallery media id."}}, "required": ["source"]}},
     "read_text": {"description": "Read a 1-based line range from a UTF-8 text file. Use next_line to continue and eof to distinguish a completed range from the end of the file.", "access": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "default": 1}, "end_line": {"type": "integer"}, "encoding": {"type": "string", "enum": ["utf-8", "utf-8-sig"], "default": "utf-8-sig"}}, "required": ["path"], "additionalProperties": False}},
     "search_text": {"description": "Search authorized UTF-8 files and return matching lines.", "access": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "query": {"type": "string"}, "pattern": {"type": "string", "default": "*", "description": "Filename glob."}, "recursive": {"type": "boolean", "default": False}, "regex": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False}, "limit": {"type": "integer", "default": 100}}, "required": ["path", "query"]}},
-    "write_text": {"description": "Create, overwrite, or append literal UTF-8 text already present in the request. For artifact content, use write_artifact_text instead of copying it here.", "access": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}, "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "default": "create"}, "encoding": {"type": "string", "enum": ["utf-8", "utf-8-sig"], "default": "utf-8"}}, "required": ["path", "text"]}},
-    "write_artifact_text": {"description": "Render an artifact directly to a UTF-8 file without placing the compiled payload in Deepy's context or tool call. Unfinished record sets may be exported as explicit partial progress; overwrite the file after the complete artifact is finalized.", "access": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "artifact": _ARTIFACT_REFERENCE_SCHEMA, "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "default": "create"}, "encoding": {"type": "string", "enum": ["utf-8", "utf-8-sig"], "default": "utf-8"}}, "required": ["path", "artifact"]}},
+    "write_text": {"description": "Create, overwrite, or append literal UTF-8 text already present in the request.", "access": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}, "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "default": "create"}, "encoding": {"type": "string", "enum": ["utf-8", "utf-8-sig"], "default": "utf-8"}}, "required": ["path", "text"]}},
     "mkdir": {"description": "Create an authorized directory.", "access": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     "copy": {"description": "Copy an authorized file to a writable destination.", "access": "write", "parameters": {"type": "object", "properties": {"source": {"type": "string", "description": "Authorized path or Gallery media id."}, "destination": {"type": "string"}, "overwrite": {"type": "boolean", "default": False}}, "required": ["source", "destination"]}},
     "move": {"description": "Move an authorized writable file or directory to an unused destination.", "access": "write", "parameters": {"type": "object", "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}, "required": ["source", "destination"]}},
     "delete": {"description": "Permanently delete an authorized writable file or directory; recursive is required for a non-empty directory.", "access": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean", "default": False}}, "required": ["path"]}},
-    "zip": {"description": "Create a persistent ZIP from authorized files or folders.", "access": "write", "parameters": {"type": "object", "properties": {"sources": {"oneOf": [{"type": "array", "items": {"type": "string"}}, _ARTIFACT_REFERENCE_SCHEMA], "description": "Authorized paths or Gallery media ids, or an artifact reference selecting paths."}, "destination": {"type": "string", "description": "Optional folder/.zip path; plain paths use video outputs."}}, "required": ["sources"]}},
+    "zip": {"description": "Create a persistent ZIP from authorized files or folders.", "access": "write", "parameters": {"type": "object", "properties": {"sources": {"type": "array", "items": {"type": "string"}, "description": "Authorized paths or Gallery media ids."}, "destination": {"type": "string", "description": "Optional folder/.zip path; plain paths use video outputs."}}, "required": ["sources"]}},
     "unzip": {"description": "Safely extract an authorized ZIP into a writable directory without replacing existing files by default.", "access": "write", "parameters": {"type": "object", "properties": {"source": {"type": "string", "description": "Authorized ZIP file path."}, "destination": {"type": "string", "description": "Optional extraction directory; defaults to a folder named after the ZIP beside it when writable, otherwise in video outputs."}, "overwrite": {"type": "boolean", "default": False}}, "required": ["source"]}},
     "download": {"description": "Create a session-long download link for an existing file.", "access": "always", "parameters": {"type": "object", "properties": {"source": {"type": "string", "description": "Authorized file path or Gallery media id."}}, "required": ["source"]}},
 }

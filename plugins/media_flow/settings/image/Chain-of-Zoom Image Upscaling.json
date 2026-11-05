@@ -6,5 +6,9 @@
   "image_mode": 1,
   "spatial_upsampling_method": "coz",
   "target_ratio": "coz*4",
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "Chain-of-Zoom x2 to x16 with tiled SD3 diffusion: slow, large downloads, may invent detail at high magnification."
+  }
 }

@@ -36,6 +36,8 @@
 	let draggedIndex = null;
 	let dragOverIndex = null;
 	let itemLabels = {};
+	let ancestorsByValue = {};
+	let folderValues = new Set();
 	let panelStyle = "";
 	const rowHeight = 28;
 	const panelPadding = 8;
@@ -48,6 +50,8 @@
 	$: breadcrumbMode = display_mode === "breadcrumb";
 	$: itemLabels = collectLabels(normalizedHierarchy, breadcrumbMode, breadcrumb_separator);
 	$: flatItems = flattenItems(normalizedHierarchy, breadcrumbMode, breadcrumb_separator);
+	$: ({ ancestorsByValue, folderValues } = collectFolderSelection(normalizedHierarchy));
+	$: checkboxes = folderValues.size > 0;
 	$: searchTerm = searchQuery.trim().toLowerCase();
 	$: searchMode = searchTerm.length > 0;
 	$: searchResults = searchMode ? filterItems(flatItems, searchTerm) : [];
@@ -114,14 +118,59 @@
 		return String(item.value || item.path || item.name || "");
 	}
 
+	// Folders that carry a value can be selected as a whole; they then include everything below them.
+	function valueForFolder(folder) {
+		return folder.value === undefined || folder.value === null ? "" : String(folder.value);
+	}
+
 	function collectLabels(root, _breadcrumbMode, _breadcrumbSeparator) {
 		const labels = {};
 		function visit(folder, folderPath = "") {
 			for (const item of folder.items || []) labels[valueForItem(item)] = displayLabelForItem(item, folderPath);
-			for (const child of folder.folders || []) visit(child, folderPathForFolder(child, folderPath));
+			for (const child of folder.folders || []) {
+				const childPath = folderPathForFolder(child, folderPath);
+				if (valueForFolder(child)) labels[valueForFolder(child)] = displayLabelForPath(childPath);
+				visit(child, childPath);
+			}
 		}
 		visit(root);
 		return labels;
+	}
+
+	function collectFolderSelection(root) {
+		const ancestors = {};
+		const folders = new Set();
+		function add(entryValue, chain) {
+			if (!ancestors[entryValue]) ancestors[entryValue] = [];
+			ancestors[entryValue].push(chain);
+		}
+		function visit(folder, chain) {
+			for (const item of folder.items || []) add(valueForItem(item), chain);
+			for (const child of folder.folders || []) {
+				const childValue = valueForFolder(child);
+				if (childValue) {
+					add(childValue, chain);
+					folders.add(childValue);
+				}
+				visit(child, childValue ? [...chain, childValue] : chain);
+			}
+		}
+		visit(root, []);
+		return { ancestorsByValue: ancestors, folderValues: folders };
+	}
+
+	function isIncluded(entryValue, chosen) {
+		const chains = ancestorsByValue[entryValue];
+		return Boolean(chains) && chains.every((chain) => chain.some((ancestor) => chosen.has(ancestor)));
+	}
+
+	function withoutIncluded(values) {
+		const chosen = new Set(values);
+		return values.filter((entryValue) => !isIncluded(entryValue, chosen));
+	}
+
+	function isEntryCovered(entry, selected) {
+		return entry.search_ancestors.some((ancestor) => selected.includes(ancestor));
 	}
 
 	function folderPathForFolder(folder, parentPath = "") {
@@ -147,9 +196,12 @@
 		return parts.length ? parts.join(breadcrumb_separator) : String(path || "");
 	}
 
+	function displayLabelForPath(path) {
+		return breadcrumbMode ? formatBreadcrumb(path) : path;
+	}
+
 	function displayLabelForItem(item, folderPath = "") {
-		const itemPath = pathForItem(item, folderPath) || String(item.value || "");
-		return breadcrumbMode ? formatBreadcrumb(itemPath) : itemPath;
+		return displayLabelForPath(pathForItem(item, folderPath) || String(item.value || ""));
 	}
 
 	function searchTextForItem(item, folderPath = "") {
@@ -158,14 +210,19 @@
 
 	function flattenItems(root, _breadcrumbMode, _breadcrumbSeparator) {
 		const items = [];
-		function visit(folder, folderPath = "") {
+		function visit(folder, folderPath = "", ancestors = []) {
 			for (const item of folder.items || []) {
 				const itemPath = pathForItem(item, folderPath);
 				const slash = itemPath.lastIndexOf("/");
 				const parentPath = slash > -1 ? itemPath.slice(0, slash) : folderPath;
-				items.push({ ...item, search_name: labelForItem(item), search_path: parentPath, search_text: searchTextForItem(item, folderPath), search_display: displayLabelForItem(item, folderPath) });
+				items.push({ ...item, search_key: `i:${valueForItem(item)}`, search_ancestors: ancestors, search_name: labelForItem(item), search_path: parentPath, search_text: searchTextForItem(item, folderPath), search_display: displayLabelForItem(item, folderPath) });
 			}
-			for (const child of folder.folders || []) visit(child, folderPathForFolder(child, folderPath));
+			for (const child of folder.folders || []) {
+				const childPath = folderPathForFolder(child, folderPath);
+				const childValue = valueForFolder(child);
+				if (childValue) items.push({ ...child, search_folder: true, search_key: `f:${childPath}`, search_ancestors: ancestors, search_name: labelForFolder(child), search_path: folderPath, search_text: breadcrumbMode ? displayLabelForPath(childPath) : labelForFolder(child), search_display: displayLabelForPath(childPath) });
+				visit(child, childPath, childValue ? [...ancestors, childValue] : ancestors);
+			}
 		}
 		visit(root);
 		return items;
@@ -201,11 +258,23 @@
 		tick().then(updatePanelPosition);
 	}
 
-	function toggleItem(item) {
+	function toggleItem(item, covered = false) {
 		if (!interactive) return;
 		const itemValue = valueForItem(item);
 		if (selectedValue.includes(itemValue)) dispatch(selectedValue.filter((selected) => selected !== itemValue), "select", { value: itemValue, selected: false });
-		else dispatch([...selectedValue, itemValue], "select", { value: itemValue, selected: true });
+		else if (!covered) dispatch([...selectedValue, itemValue], "select", { value: itemValue, selected: true });
+	}
+
+	function toggleFolderSelection(folder, covered = false) {
+		if (!interactive) return;
+		const folderValue = valueForFolder(folder);
+		if (selectedValue.includes(folderValue)) dispatch(selectedValue.filter((selected) => selected !== folderValue), "select", { value: folderValue, selected: false });
+		else if (!covered) dispatch(withoutIncluded([...selectedValue, folderValue]), "select", { value: folderValue, selected: true });
+	}
+
+	function toggleEntry(entry, covered) {
+		if (entry.search_folder) toggleFolderSelection(entry, covered);
+		else toggleItem(entry, covered);
 	}
 
 	function removeValue(index) {
@@ -314,7 +383,7 @@
 			else closePanel();
 		} else if (event.key === "Enter" && searchMode && searchResults.length) {
 			event.preventDefault();
-			toggleItem(searchResults[0]);
+			toggleEntry(searchResults[0], isEntryCovered(searchResults[0], selectedValue));
 		} else if (event.key === "ArrowDown") {
 			event.preventDefault();
 			openPanel();
@@ -385,6 +454,11 @@
 							on:dragleave={() => dragOverIndex = null}
 							on:drop={(event) => onDrop(index, event)}
 						>
+							{#if folderValues.has(selected)}
+								<svg class="hierarchy-selector-chip-folder" viewBox="0 0 20 20" aria-hidden="true">
+									<path d="M2.75 6.25h5.4l1.55 1.7h7.55c.55 0 1 .45 1 1v6.3c0 .55-.45 1-1 1H2.75c-.55 0-1-.45-1-1v-8c0-.55.45-1 1-1Z" />
+								</svg>
+							{/if}
 							<span class="hierarchy-selector-chip-text">{displayValue(selected)}</span>
 							<button type="button" class="hierarchy-selector-remove" aria-label="Remove" on:click|stopPropagation={() => removeValue(index)}>x</button>
 						</span>
@@ -414,27 +488,40 @@
 					<div bind:this={panelContentEl} class="hierarchy-selector-panel-content">
 						{#if searchMode}
 							{#if searchResults.length}
-								{#each searchResults as item (valueForItem(item))}
-									{@const selected = selectedValue.includes(valueForItem(item))}
+								{#each searchResults as item (item.search_key)}
+									{@const selected = selectedValue.includes(item.search_folder ? valueForFolder(item) : valueForItem(item))}
+									{@const covered = isEntryCovered(item, selectedValue)}
 									<div
 										class="hierarchy-search-row"
+										class:hierarchy-search-row-check={checkboxes}
 										class:hierarchy-search-row-selected={selected}
-										title={item.search_display || selectedLabelForItem(item)}
+										class:hierarchy-search-row-covered={covered && !selected}
+										title={covered && !selected ? "Included by a selected folder" : item.search_display || selectedLabelForItem(item)}
 										role="button"
 										tabindex="0"
 										aria-pressed={selected}
-										on:click={() => toggleItem(item)}
+										on:click={() => toggleEntry(item, covered)}
 										on:keydown={(event) => {
 											if (event.key === "Enter" || event.key === " ") {
 												event.preventDefault();
-												toggleItem(item);
+												toggleEntry(item, covered);
 											}
 										}}
 									>
 										<span class="hierarchy-search-spacer"></span>
+										{#if checkboxes}
+											<span class="hierarchy-check" class:hierarchy-check-on={selected} class:hierarchy-check-covered={covered && !selected} aria-hidden="true">
+												<svg viewBox="0 0 16 16"><path d="M3.5 8.3l3 3 6-6.6" /></svg>
+											</span>
+										{/if}
 										<svg class="hierarchy-search-icon" viewBox="0 0 20 20" aria-hidden="true">
-											<path d="M5.25 2.75h6.05L15.75 7.2v10.05H5.25V2.75Z" />
-											<path d="M11.25 2.95V7.3h4.3" />
+											{#if item.search_folder}
+												<path d="M2.75 6.25h5.4l1.55 1.7h7.55c.55 0 1 .45 1 1v6.3c0 .55-.45 1-1 1H2.75c-.55 0-1-.45-1-1v-8c0-.55.45-1 1-1Z" />
+												<path d="M2.25 7.95V5.6c0-.55.45-1 1-1h4.5l1.35 1.65" />
+											{:else}
+												<path d="M5.25 2.75h6.05L15.75 7.2v10.05H5.25V2.75Z" />
+												<path d="M11.25 2.95V7.3h4.3" />
+											{/if}
 										</svg>
 										{#if breadcrumbMode}
 											<span class="hierarchy-search-label hierarchy-search-name">{item.search_display}</span>
@@ -452,7 +539,7 @@
 								<div class="hierarchy-search-empty">{search_empty_label}</div>
 							{/if}
 						{:else}
-							<TreeNodes folders={normalizedHierarchy.folders || []} items={normalizedHierarchy.items || []} depth={0} {expanded} value={selectedValue} {toggleItem} {toggleFolder} {valueForItem} {labelForItem} />
+							<TreeNodes folders={normalizedHierarchy.folders || []} items={normalizedHierarchy.items || []} depth={0} {expanded} value={selectedValue} {checkboxes} {toggleItem} {toggleFolder} {toggleFolderSelection} {valueForItem} {valueForFolder} {labelForItem} />
 						{/if}
 					</div>
 				</div>
@@ -572,6 +659,22 @@
 		background: var(--input-background-fill);
 	}
 
+	.hierarchy-selector-chip-folder {
+		flex: 0 0 auto;
+		width: 15px;
+		height: 15px;
+		margin-left: 5px;
+		color: var(--body-text-color-subdued);
+		stroke: currentColor;
+		stroke-width: 1.5;
+		stroke-linejoin: round;
+		fill: none;
+	}
+
+	.hierarchy-selector-chip-folder + .hierarchy-selector-chip-text {
+		padding-left: 4px;
+	}
+
 	.hierarchy-selector-chip-text {
 		min-width: 0;
 		overflow: hidden;
@@ -682,6 +785,56 @@
 
 	.hierarchy-search-row:hover {
 		background: var(--background-fill-secondary);
+	}
+
+	.hierarchy-search-row-check {
+		grid-template-columns: 16px 16px 20px minmax(0, 1fr);
+	}
+
+	.hierarchy-search-row-covered {
+		cursor: default;
+	}
+
+	:global(.hierarchy-check) {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		box-sizing: border-box;
+		width: 16px;
+		height: 16px;
+		margin: 0;
+		padding: 0;
+		border: 1.5px solid var(--body-text-color-subdued);
+		border-radius: var(--checkbox-border-radius, 4px);
+		background: var(--input-background-fill);
+		color: transparent;
+		cursor: pointer;
+	}
+
+	:global(.hierarchy-check svg) {
+		width: 12px;
+		height: 12px;
+		stroke: currentColor;
+		stroke-width: 2.2;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+		fill: none;
+	}
+
+	:global(button.hierarchy-check:not(.hierarchy-check-covered):hover) {
+		border-color: var(--checkbox-border-color-hover, var(--color-accent));
+	}
+
+	:global(.hierarchy-check.hierarchy-check-on) {
+		border-color: var(--checkbox-border-color-selected, var(--color-accent));
+		background: var(--checkbox-background-color-selected, var(--color-accent));
+		color: #fff;
+	}
+
+	:global(.hierarchy-check.hierarchy-check-covered) {
+		border-style: dashed;
+		color: var(--body-text-color-subdued);
+		cursor: default;
 	}
 
 	.hierarchy-search-spacer {

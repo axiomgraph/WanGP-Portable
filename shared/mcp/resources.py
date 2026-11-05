@@ -22,6 +22,8 @@ GUIDE_SECTIONS = {  # heading -> when to read it; the workflows index lists thes
     "Post-processing and media utilities": "upscaling, frame interpolation, sound treatments, and the toolbox utilities (extract, merge, remux, resize, 3D views, SVG drawings)",
     "Speech and chained media": "speech, songs and media made from other generated media, such as talking videos driven by a speech clip",
     "Extraction by spoken words": "cutting audio or video where given words are spoken",
+    "Python sandbox": "computing and composing with Python: exact typography over images, charts, grids, palettes, procedural SVG, subtitles from timings, clips frame by frame",
+    "Web research": "looking things up on the web when the toolbox offers wangp_web_search: facts, dates, current events, references, the look of real subjects, reading a page before quoting it, downloading reference files, cookies for signed-in sites, LoRAs from Civitai and Hugging Face",
     "Visual verification": "checking produced images or videos: content, text spelling, anatomy, artifacts",
     "Long video and sliding windows": "videos longer than one window: window planning, key frames and end-frame anchors, injected frames, continuation",
     "Prompt files and long documents": "skills, long prompts kept in files, and writing long documents",
@@ -55,6 +57,16 @@ def indexed_section_record(uri: str) -> dict[str, Any] | None:
     return {"server": "wangp", "uri": uri, "name": slug, "title": sections[slug][0], "description": "A section of the WanGP workflows guide.", "mime_type": "text/markdown"}
 
 
+def plugin_skill_record(uri: str) -> dict[str, Any] | None:
+    """The record of a plugin toolbox skill URI: served by a resource template, it is absent from resource listings."""
+    from shared.utils.plugins import get_deepy_plugin_skill
+
+    skill = get_deepy_plugin_skill(uri)
+    if skill is None or skill.routing:
+        return None
+    return {"server": "wangp", "uri": uri, "name": skill.name, "title": skill.name.replace("-", " ").title(), "description": skill.description, "mime_type": "text/markdown"}
+
+
 def resource_record(item, server="wangp"):
     return {"server": server, "uri": str(item.uri), "name": item.name, "title": item.title or item.name, "description": item.description or "", "mime_type": item.mimeType or ""}
 
@@ -82,10 +94,13 @@ async def query_resources(pages, resources, read_resource, arguments, *, servers
         page = pages.page(["resources", server, query], records, key="resources", limit=arguments.get("limit", 20), cursor=arguments.get("cursor"), metadata={"unavailable_servers": dict(unavailable_servers or {})})
     else:
         matches = [resource for resource in resources if resource["uri"] == uri and (not server or resource["server"] == server)]
-        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri)) is not None:
+        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri) or plugin_skill_record(uri)) is not None:
             matches = [section_record]
         if not matches:
-            raise ValueError(f"Unknown MCP resource: {uri}")
+            prefix = uri.rsplit("/", 1)[0] + "/" if "/" in uri.removeprefix("wangp://") else ""
+            siblings = sorted(resource["uri"].removeprefix(prefix) for resource in resources if prefix and resource["uri"].startswith(prefix))
+            hint = f" Available under {prefix}: {', '.join(siblings)}." if siblings else " Search with query instead of uri."
+            raise ValueError(f"Unknown MCP resource: {uri}.{hint}")
         matching_servers = sorted({resource["server"] for resource in matches})
         if not server:
             if len(matching_servers) != 1:
@@ -181,7 +196,7 @@ def _select_markdown_sections(markdown: str, section_filter: str) -> tuple[str, 
         if not matches:
             matches = [section for section in sections if any(pattern in str(section[key]).casefold() for key in ("section", "heading"))]
     if not matches:
-        raise ValueError(f"Markdown section not found: {section_filter}")
+        raise ValueError(f"Markdown section not found: {section_filter}. Its sections: " + "; ".join(str(section["section"]) for section in sections))
     return "\n\n".join(str(section["content"]) for section in matches), [str(section["section"]) for section in matches]
 
 

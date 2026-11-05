@@ -13,8 +13,10 @@ absent, handlers may expose a ``status`` property containing ``"enabled"`` or
 provides a valid status. Disabled handlers may expose ``reason_disabled``. This
 instance property is separate from the definition's existing per-method
 ``status`` progress labels.
-Model persistence is shared through
-``wgp_config["audio_processors"]["persistence"]``. Dispatch retains at most one
+Handlers may implement ``method_available(method)`` and ``method_visible(method)``.
+Both default to True: hidden methods remain usable and are added to menus only
+when restoring their selection; unavailable methods are excluded even then.
+The shared Postprocessor VRAM Usage policy controls profile 0. Dispatch retains at most one
 audio processor handler and releases it before another handler runs.
 
 Plugin authors can register processors from ``plugin_info.json`` with:
@@ -32,11 +34,13 @@ upsampler plugin registration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import importlib
 from typing import Any, Callable
 
 from shared.utils import offload_registry
-from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status
+from . import memory as processor_memory
+from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status, handler_method_available, handler_method_in_choices
 
 
 AUDIO_PROCESSOR_TYPE_SOUNDTRACK = "soundtrack"
@@ -47,9 +51,7 @@ AUDIO_PROCESSOR_CONFIG_KEY = "audio_processors"
 PERSISTENCE_CONFIG_KEY = "persistence"
 PERSIST_UNLOAD = 1
 PERSIST_RAM = 2
-PERSIST_AUTO = 3 # stays loaded with memory profile 0 (its RAM pinned only while it runs, shared with the other models) and the current model's VRAM Preload
-PERSISTENCE_CHOICES = [("Auto", PERSIST_AUTO), ("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
-_SHARED_PERSISTENCE_BINDING_KEY = "__shared_persistence__"
+PERSIST_AUTO = 3  # Legacy config migration value.
 
 MMAUDIO_METHOD = "mmaudio"
 CUSTOM_SOUNDTRACK_METHOD = "custom"
@@ -200,7 +202,7 @@ def _config_key_from_handler_def(handler_def: dict[str, Any], fallback_name: str
 
 
 def default_config_sections(handler_modules: list[str] | None = None) -> dict[str, Any]:
-    sections = {PERSISTENCE_CONFIG_KEY: PERSIST_AUTO}
+    sections = {}
     for path in audio_processor_handlers if handler_modules is None else handler_modules:
         handler_cls = _load_processor_class(str(path or "").strip())
         if not hasattr(handler_cls, "default_config"):
@@ -384,21 +386,21 @@ def _gr_update(**kwargs):
     return gr.update(**kwargs)
 
 
-def soundtrack_choices(*, include_none: bool = True, include_control: bool = False, include_voice: bool = False, enabled_only: bool = True, label_context: str | None = None, voice_label_context: str | None = None) -> list[tuple[str, str]]:
-    choices = query_method_choices(AUDIO_PROCESSOR_TYPE_SOUNDTRACK, include_none=include_none, enabled_only=enabled_only, label_context=label_context)
+def soundtrack_choices(*, include_none: bool = True, include_control: bool = False, include_voice: bool = False, enabled_only: bool = True, label_context: str | None = None, voice_label_context: str | None = None, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
+    choices = query_method_choices(AUDIO_PROCESSOR_TYPE_SOUNDTRACK, include_none=include_none, enabled_only=enabled_only, label_context=label_context, selected_method=selected_method, include_hidden=include_hidden)
     if include_control:
         choices.append(("Control Video Audio Track (Reuse Control Video Audio Track)", CONTROL_AUDIO_METHOD))
     if include_voice:
-        choices += query_method_choices(AUDIO_PROCESSOR_TYPE_VOICE_REPLACEMENT, include_none=False, enabled_only=enabled_only, label_context=voice_label_context or label_context)
+        choices += query_method_choices(AUDIO_PROCESSOR_TYPE_VOICE_REPLACEMENT, include_none=False, enabled_only=enabled_only, label_context=voice_label_context or label_context, selected_method=selected_method, include_hidden=include_hidden)
     return choices
 
 
-def voice_replacement_choices(*, include_none: bool = True, enabled_only: bool = True, label_context: str | None = None) -> list[tuple[str, str]]:
-    return query_method_choices(AUDIO_PROCESSOR_TYPE_VOICE_REPLACEMENT, include_none=include_none, enabled_only=enabled_only, label_context=label_context)
+def voice_replacement_choices(*, include_none: bool = True, enabled_only: bool = True, label_context: str | None = None, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
+    return query_method_choices(AUDIO_PROCESSOR_TYPE_VOICE_REPLACEMENT, include_none=include_none, enabled_only=enabled_only, label_context=label_context, selected_method=selected_method, include_hidden=include_hidden)
 
 
-def audio_edit_choices(*, include_none: bool = False, enabled_only: bool = True) -> list[tuple[str, str]]:
-    return query_method_choices(AUDIO_PROCESSOR_TYPE_AUDIO_EDIT, include_none=include_none, enabled_only=enabled_only, label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING)
+def audio_edit_choices(*, include_none: bool = False, enabled_only: bool = True, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
+    return query_method_choices(AUDIO_PROCESSOR_TYPE_AUDIO_EDIT, include_none=include_none, enabled_only=enabled_only, label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING, selected_method=selected_method, include_hidden=include_hidden)
 
 
 def has_audio_source_soundtrack(*, enabled_only: bool = True) -> bool:
@@ -435,7 +437,7 @@ def late_remux_refresh_updates(method):
 
 
 def create_generation_audio_ui(gr, ui_get, ui_defaults, *, any_control_video: bool = False, update_form: bool = False):
-    postprocess_choices = soundtrack_choices(include_none=True, include_control=any_control_video)
+    postprocess_choices = soundtrack_choices(include_none=True, include_control=any_control_video, selected_method=normalize_method(ui_get("postprocess_audio")))
     postprocess_value = _choice_value(postprocess_choices, ui_get("postprocess_audio"), "")
     postprocess_metadata = method_metadata(postprocess_value)
     postprocess_audio = gr.Dropdown(choices=postprocess_choices, value=postprocess_value, visible=True, scale=1, label="Postprocess Remux Audio")
@@ -448,7 +450,7 @@ def create_generation_audio_ui(gr, ui_get, ui_defaults, *, any_control_video: bo
     with gr.Column(visible=postprocess_metadata["needs_audio_source"]) as postprocess_audio_source_col:
         audio_source = gr.Audio(value=ui_defaults.get("audio_source", None), type="filepath", label="Soundtrack", show_download_button=True)
 
-    replace_voice_choices = voice_replacement_choices(include_none=True)
+    replace_voice_choices = voice_replacement_choices(include_none=True, selected_method=normalize_method(ui_get("replace_voice_method")))
     replace_voice_value = _choice_value(replace_voice_choices, ui_get("replace_voice_method"), "")
     replace_voice_metadata = method_metadata(replace_voice_value)
     with gr.Column(visible=len(replace_voice_choices) > 1) as replace_voice_col:
@@ -459,8 +461,18 @@ def create_generation_audio_ui(gr, ui_get, ui_defaults, *, any_control_video: bo
             replace_voice_sample2 = gr.Audio(value=ui_defaults.get("replace_voice_sample2", None), type="filepath", label="Voice Sample #2", show_download_button=True)
 
     if not update_form:
-        postprocess_audio.input(fn=soundtrack_refresh_updates, inputs=[postprocess_audio], outputs=[postprocess_audio_prompt_col, postprocess_audio_control_col, postprocess_audio_source_col])
-        replace_voice_method.input(fn=voice_replacement_refresh_updates, inputs=[replace_voice_method], outputs=[replace_voice_sample_row, replace_voice_sample2_row])
+        def refresh_soundtrack(method):
+            choices = soundtrack_choices(include_control=any_control_video, selected_method=normalize_method(method))
+            value = _choice_value(choices, method)
+            return gr.update(choices=choices, value=value), *soundtrack_refresh_updates(value)
+
+        def refresh_voice(method):
+            choices = voice_replacement_choices(selected_method=normalize_method(method))
+            value = _choice_value(choices, method)
+            return gr.update(choices=choices, value=value), *voice_replacement_refresh_updates(value)
+
+        postprocess_audio.input(fn=refresh_soundtrack, inputs=[postprocess_audio], outputs=[postprocess_audio, postprocess_audio_prompt_col, postprocess_audio_control_col, postprocess_audio_source_col])
+        replace_voice_method.input(fn=refresh_voice, inputs=[replace_voice_method], outputs=[replace_voice_method, replace_voice_sample_row, replace_voice_sample2_row])
 
     return {
         "postprocess_audio": postprocess_audio,
@@ -479,14 +491,24 @@ def create_generation_audio_ui(gr, ui_get, ui_defaults, *, any_control_video: bo
     }
 
 
+def late_audio_edit_menu(selected=None):
+    choices = audio_edit_choices(selected_method=normalize_method(selected))
+    return choices, _choice_value(choices, selected, choices[0][1] if choices else None)
+
+
+def late_remux_menu(selected=None):
+    choices = soundtrack_choices(include_none=False, include_control=False, include_voice=True, voice_label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING, selected_method=normalize_method(selected))
+    default = CUSTOM_SOUNDTRACK_METHOD if CUSTOM_SOUNDTRACK_METHOD in {method for _, method in choices} else (choices[0][1] if choices else None)
+    return choices, _choice_value(choices, selected, default)
+
+
 def create_late_audio_edit_ui(gr, *, default_visibility_false: dict[str, Any], update_form: bool = False):
-    choices = audio_edit_choices()
-    value = choices[0][1] if choices else ""
+    choices, value = late_audio_edit_menu()
     metadata = method_metadata(value)
-    postprocess_audio = gr.Dropdown(choices=choices, value=value, visible=True, scale=1, label="Audio Action", show_label=False, elem_classes="postprocess")
-    with gr.Row(visible=metadata["needs_voice_sample"]) as replace_voice_sample_row:
+    postprocess_audio = gr.Dropdown(choices=choices, visible=True, scale=1, label="Audio Action", show_label=False, elem_classes="postprocess", **({} if update_form else {"value": value}))
+    with gr.Row(**({} if update_form else {"visible": metadata["needs_voice_sample"]})) as replace_voice_sample_row:
         replace_voice_sample = gr.Audio(label="Voice Sample #1", type="filepath", show_download_button=True)
-    with gr.Row(visible=metadata["needs_voice_sample2"]) as replace_voice_sample2_row:
+    with gr.Row(**({} if update_form else {"visible": metadata["needs_voice_sample2"]})) as replace_voice_sample2_row:
         replace_voice_sample2 = gr.Audio(label="Voice Sample #2", type="filepath", show_download_button=True)
     if not update_form:
         postprocess_audio.change(fn=audio_edit_refresh_updates, inputs=[postprocess_audio], outputs=[replace_voice_sample_row, replace_voice_sample2_row])
@@ -500,8 +522,7 @@ def create_late_audio_edit_ui(gr, *, default_visibility_false: dict[str, Any], u
 
 
 def create_late_remux_ui(gr, *, update_form: bool = False, default_visibility_false: dict[str, Any]):
-    choices = soundtrack_choices(include_none=False, include_control=False, include_voice=True, voice_label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING)
-    default_value = CUSTOM_SOUNDTRACK_METHOD if CUSTOM_SOUNDTRACK_METHOD in {method for _, method in choices} else (choices[0][1] if choices else "")
+    choices, default_value = late_remux_menu()
     value = "" if update_form else default_value
     metadata = method_metadata(value)
     with gr.Column(visible=True) as postprocess_audio_col:
@@ -538,13 +559,15 @@ def create_late_remux_ui(gr, *, update_form: bool = False, default_visibility_fa
     }
 
 
-def query_method_choices(processor_type: str, *, include_none: bool = True, enabled_only: bool = False, label_context: str | None = None) -> list[tuple[str, str]]:
+def query_method_choices(processor_type: str, *, include_none: bool = True, enabled_only: bool = False, label_context: str | None = None, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
     choices = [("None", "")] if include_none else []
     for handler in processor_handlers(processor_type, enabled_only=enabled_only):
         handler_def = handler.query_audio_processor_def()
         for label, method in _method_choices(handler_def):
-            if _method_has_type(handler_def, method, processor_type):
+            if _method_has_type(handler_def, method, processor_type) and handler_method_in_choices(handler, method, selected_method=normalize_method(selected_method), include_hidden=include_hidden):
                 choice_label = _method_label(handler_def, method, label_context)
+                if hasattr(handler, "format_choice_label"):
+                    choice_label = handler.format_choice_label(choice_label, method)
                 choices.append((_method_pos(handler_def, method), str(choice_label or "").casefold(), str(method or ""), choice_label, method))
     return choices[:1] + [(label, method) for _, _, _, label, method in sorted(choices[1:])] if include_none else [(label, method) for _, _, _, label, method in sorted(choices)]
 
@@ -556,6 +579,8 @@ def validate_method(method, processor_type: str | None = None, **kwargs) -> str:
         return "You must choose a valid audio processing method" if method else "You must choose at least one audio processing method"
     if processor_type is not None and not _method_has_type(handler.query_audio_processor_def(), method, processor_type):
         return f"{method_label(method)} is not available for this audio processing stage"
+    if not handler_method_available(handler, method):
+        return f"{method_label(method)} is not available"
     if hasattr(handler, "validate_method"):
         error = handler.validate_method(method, **kwargs)
         if error:
@@ -579,6 +604,9 @@ def query_download_defs(enabled_only: bool = True) -> list[dict[str, Any]]:
 
 def _dispatch_processor(handler, operation: str, method, *args, **kwargs):
     _activate_audio_processor(handler)
+    kwargs["profile"] = kwargs["profile_no"] = 0
+    if kwargs.get("init_pipe") is None:
+        kwargs["init_pipe"] = partial(processor_memory.init_pipe, server_config=_audio_processor_server_config)
     persistent = persistent_models()
     try:
         return getattr(handler, operation)(method, *args, **kwargs)
@@ -650,12 +678,12 @@ def persistence(server_config: dict[str, Any] | None = None) -> int:
 
 
 def persistent_models(server_config: dict[str, Any] | None = None) -> bool:
-    return persistence(server_config) in (PERSIST_RAM, PERSIST_AUTO)
+    return True
 
 
 def automatic_memory(server_config: dict[str, Any] | None = None) -> bool:
-    """Auto: the models stay loaded and use memory profile 0 with the current model's VRAM Preload mode."""
-    return persistence(server_config) == PERSIST_AUTO
+    """Postprocessors use the shared profile 0 VRAM policy."""
+    return True
 
 
 def write_persistence(server_config: dict[str, Any], value) -> int:
@@ -693,7 +721,7 @@ def write_config_section(server_config: dict[str, Any], handler, config: dict[st
 
 def migrate_audio_processor_config(server_config: dict[str, Any]) -> bool:
     before = repr(server_config.get(AUDIO_PROCESSOR_CONFIG_KEY, None))
-    write_persistence(server_config, persistence(server_config))
+    _nested_configs(server_config).pop(PERSISTENCE_CONFIG_KEY, None)
     for handler in _audio_processor_handlers:
         if _default_config(handler):
             write_config_section(server_config, handler, read_config_section(server_config, handler))
@@ -702,15 +730,18 @@ def migrate_audio_processor_config(server_config: dict[str, Any]) -> bool:
 
 
 def create_config_ui(gr, server_config: dict[str, Any], *, lock_config: bool = False) -> list[AudioProcessorConfigBinding]:
-    shared_persistence = gr.Dropdown(choices=PERSISTENCE_CHOICES, value=write_persistence(server_config, persistence(server_config)), label="Audio Processor Model Persistence", interactive=not lock_config)
-    bindings = [AudioProcessorConfigBinding(None, _SHARED_PERSISTENCE_BINDING_KEY, [(PERSISTENCE_CONFIG_KEY, shared_persistence)])]
-    for handler in _audio_processor_handlers:
-        if not hasattr(handler, "create_config_ui"):
-            continue
-        config = write_config_section(server_config, handler, read_config_section(server_config, handler))
-        controls = handler.create_config_ui(gr, config, lock_config=lock_config)
-        if controls:
-            bindings.append(AudioProcessorConfigBinding(handler, config_key_for_handler(handler), list(controls)))
+    bindings = []
+    handlers = [handler for handler in _audio_processor_handlers if hasattr(handler, "create_config_ui")]
+    if not handlers:
+        return bindings
+    with gr.Tabs():
+        for handler in handlers:
+            config = write_config_section(server_config, handler, read_config_section(server_config, handler))
+            with gr.Tab(_handler_name(handler)) as tab:
+                controls = handler.create_config_ui(gr, config, lock_config=lock_config)
+            tab.visible = bool(controls)
+            if controls:
+                bindings.append(AudioProcessorConfigBinding(handler, config_key_for_handler(handler), list(controls)))
     return bindings
 
 
@@ -728,7 +759,7 @@ def collect_config_update(bindings: list[AudioProcessorConfigBinding], values) -
                 raise ValueError("Audio processor config UI values do not match registered controls")
             config[field] = values[index]
             index += 1
-        updates[binding.config_key] = {PERSISTENCE_CONFIG_KEY: normalize_persistence(config[PERSISTENCE_CONFIG_KEY])} if binding.handler is None else _normalize_config_section(binding.handler, {**_default_config(binding.handler), **config})
+        updates[binding.config_key] = _normalize_config_section(binding.handler, {**_default_config(binding.handler), **config})
     if index != len(values):
         raise ValueError("Audio processor config UI values do not match registered controls")
     return updates
@@ -737,8 +768,6 @@ def collect_config_update(bindings: list[AudioProcessorConfigBinding], values) -
 def validate_config_update_messages(bindings: list[AudioProcessorConfigBinding], updates: dict[str, dict[str, Any]]) -> list[str]:
     messages = []
     for binding in bindings:
-        if binding.handler is None:
-            continue
         if binding.config_key in updates and hasattr(binding.handler, "validate_config_section"):
             message = binding.handler.validate_config_section(updates[binding.config_key])
             if isinstance(message, str) and message:
@@ -751,15 +780,13 @@ def validate_config_update_messages(bindings: list[AudioProcessorConfigBinding],
 def apply_config_update(server_config: dict[str, Any], bindings: list[AudioProcessorConfigBinding], updates: dict[str, dict[str, Any]]) -> None:
     for binding in bindings:
         if binding.config_key in updates:
-            if binding.handler is None:
-                write_persistence(server_config, updates[binding.config_key][PERSISTENCE_CONFIG_KEY])
-            else:
-                write_config_section(server_config, binding.handler, updates[binding.config_key])
+            write_config_section(server_config, binding.handler, updates[binding.config_key])
 
 
 def release_changed_config_processors(old_config: dict[str, Any], new_config: dict[str, Any], changed_keys) -> None:
     changed_keys = set(changed_keys)
-    released_handler = _active_audio_processor_handler if persistence(old_config) != persistence(new_config) else None
+    memory_changed = processor_memory.config_values(old_config) != processor_memory.config_values(new_config)
+    released_handler = _active_audio_processor_handler if memory_changed else None
     if released_handler is not None:
         _release_audio_processor_handler(released_handler)
     for handler in _audio_processor_handlers:
@@ -771,5 +798,5 @@ def release_changed_config_processors(old_config: dict[str, Any], new_config: di
             should_release = handler.config_requires_release(old_section, new_section, changed_keys)
         else:
             should_release = old_section != new_section
-        if should_release and handler is not released_handler:
+        if (should_release or memory_changed) and handler is not released_handler:
             _release_audio_processor_handler(handler)

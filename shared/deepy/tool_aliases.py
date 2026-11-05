@@ -3,8 +3,8 @@
 
 RENAMED_ARGUMENTS = {
     "extract_image": {"time_seconds": "time_s"},
-    "extract_video": {"start_time": "start_s", "end_time": "end_s", "duration": "duration_s"},
-    "extract_audio": {"start_time": "start_s", "end_time": "end_s", "duration": "duration_s"},
+    "extract_video": {"start_time": "start_s", "end_time": "end_s", "duration": "duration_s", "start_seconds": "start_s", "end_seconds": "end_s", "duration_seconds": "duration_s"},
+    "extract_audio": {"start_time": "start_s", "end_time": "end_s", "duration": "duration_s", "start_seconds": "start_s", "end_seconds": "end_s", "duration_seconds": "duration_s"},
     "inspect_audio": {"start_time": "start_s", "duration": "duration_s", "min_silence": "min_silence_s", "preview_seconds": "preview_s"},
     "inspect_video": {"start_time_seconds": "start_s", "end_time_seconds": "end_s", "min_frames_between_samples": "min_gap_frames", "min_seconds_between_samples": "min_gap_s", "prompt": "question"},
     "inspect_media": {"time_seconds": "time_s", "prompt": "question"},

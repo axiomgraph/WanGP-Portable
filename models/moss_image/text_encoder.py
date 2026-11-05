@@ -45,6 +45,7 @@ class TextEncoder(nn.Module):
         config._prompt_enhancer_safe_legacy = True
         self._interrupt = False
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        runtime.lookup_on_cpu(self.embed_tokens)  # the 1.9 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
         self.layers = nn.ModuleList([Qwen3_5DecoderLayer(config, index) for index in range(config.num_hidden_layers)])
         for layer in self.layers:
             if layer.layer_type == 'full_attention':

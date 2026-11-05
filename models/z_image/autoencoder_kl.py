@@ -19,6 +19,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from shared.kernels import vae_ops
 from shared.utils.conv_bands import band_convs, conv_bands
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -58,6 +59,22 @@ def _resnet_forward(resnet, input_list):
     hidden_states = resnet.norm2(hidden_states)
     hidden_states = resnet.conv2(resnet.nonlinearity(hidden_states))
     return hidden_states.add_(input_tensor).div_(resnet.output_scale_factor)
+
+
+def _attention_forward(attn, hidden_states, *args, **kwargs):
+    """diffusers' AttnProcessor2_0 for this VAE's mid-block attention (no mask or encoder states) with the attention through
+    vae_ops.attention: by chunks of queries where SDPA has no memory-efficient kernel (BF16 on Turing), the same values elsewhere."""
+    residual = hidden_states
+    batch, channels, height, width = hidden_states.shape
+    hidden_states = attn.group_norm(hidden_states.view(batch, channels, height * width)).transpose(1, 2)
+    query, key, value = attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states)
+    head_dim = key.shape[-1] // attn.heads
+    query, key, value = (x.view(batch, -1, attn.heads, head_dim).transpose(1, 2) for x in (query, key, value))
+    hidden_states = vae_ops.attention(query, key, value).transpose(1, 2).reshape(batch, -1, attn.heads * head_dim).to(query.dtype)
+    hidden_states = attn.to_out[1](attn.to_out[0](hidden_states)).transpose(-1, -2).reshape(batch, channels, height, width)
+    if attn.residual_connection:
+        hidden_states = hidden_states + residual
+    return hidden_states / attn.rescale_output_factor
 
 
 def _decoder_forward(decoder, sample):
@@ -205,6 +222,8 @@ class AutoencoderKL(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModel
                 module.inplace = True
             elif isinstance(module, ResnetBlock2D):  # called by diffusers' mid and encoder blocks with the tensor itself
                 module.forward = lambda input_tensor, *args, _resnet=module, **kwargs: _resnet_forward(_resnet, [input_tensor])
+            elif isinstance(module, Attention):
+                module.forward = functools.partial(_attention_forward, module)
         for block in self.decoder.up_blocks:
             for resnet in block.resnets:
                 resnet.forward = functools.partial(_resnet_forward, resnet)

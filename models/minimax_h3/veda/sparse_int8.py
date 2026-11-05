@@ -10,10 +10,11 @@ from shared.kernels.triton_tuner import LaunchTuner
 TILE = 128
 KEY_BLOCK = 64
 LOG2E = 1.4426950408889634
-_tuner = LaunchTuner("h3_veda_attention", 1, "H3 Veda")
+_tuner = LaunchTuner("h3_veda_attention", 2, "H3 Veda")
 _launches = ((4, 3), (4, 2), (8, 3))
+_TUNING_TILES = 256  # query tiles timed per candidate
 
-@triton.jit
+@triton.jit(do_not_specialize=("stride_sh",))
 def _quantize_kernel(X, Xq, Scale, stride_xn, stride_xh, stride_sh,
                      pre_scale, D: tl.constexpr, BLK: tl.constexpr):
     """One INT8 scale per (block of BLK slots, head), upstream's rounding."""
@@ -50,7 +51,7 @@ def quantize(x: torch.Tensor, block: int,
     return out, scale
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("stride_qs", "stride_ks", "stride_ih", "stride_iq", "n_q_tiles"))
 def _attention_kernel(Q, K, V, Q_scale, K_scale, Index, Count, Valid, Out,
                       stride_n, stride_h, stride_vn, stride_vh,
                       stride_qs, stride_ks, stride_ih, stride_iq,
@@ -113,8 +114,8 @@ def attend(q, k, v, index, count, valid_count):
     k_int8, k_scale = quantize(k, KEY_BLOCK)
     v16 = v.to(torch.float16)
     out = torch.empty_like(q)
-    def launch(destination, config):
-        _attention_kernel[(slots // TILE, heads)](
+    def launch(destination, config, tiles=slots // TILE):
+        _attention_kernel[(tiles, heads)](
             q_int8, k_int8, v16, q_scale, k_scale, index, count, valid_count, destination,
             q.stride(0), q.stride(1), v16.stride(0), v16.stride(1),
             q_scale.stride(0), k_scale.stride(0), index.stride(0), index.stride(1),
@@ -123,11 +124,10 @@ def attend(q, k, v, index, count, valid_count):
 
     def prepare_scratch():
         scratch = torch.empty_like(out)
-        return lambda config: launch(scratch, config)
+        return lambda config: launch(scratch, config, min(slots // TILE, _TUNING_TILES))
 
     config = _launches[0]
     if kernel_policy.allow_approximate():
-        config = _tuner.config("attention", (dim, triton.next_power_of_2(slots // TILE), heads), q.device,
-                               _launches, prepare_scratch, tunable=True)
+        config = _tuner.config("attention", (dim,), q.device, _launches, prepare_scratch, tunable=True)
     launch(out, config)
     return out

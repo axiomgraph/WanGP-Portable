@@ -31,8 +31,7 @@ class SiluAndMul(nn.Module):
 
     def __init__(self, use_triton: bool = True):
         super().__init__()
-        self.use_triton = use_triton
-        self.use_bf16_bits = False  # set by models for BF16 on GPUs that run Triton without BF16 conversions (shared.kernels.bf16_bits)
+        self.use_triton = use_triton  # the LM features' Triton switch; silu_mul picks the kernel the GPU and dtype run
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, y = x.chunk(2, -1)
@@ -41,8 +40,6 @@ class SiluAndMul(nn.Module):
     def forward_list(self, x_list: list[torch.Tensor]) -> torch.Tensor:
         x = x_list[0]
         x_list.clear()
-        if self.use_bf16_bits and x.dtype == torch.bfloat16:
-            return bf16_bits.silu_mul(x)
         return silu_mul(x, self.use_triton)
 
 
@@ -52,6 +49,8 @@ def silu_mul(x, use_triton=True):
         output = torch.empty((*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype)
         _silu_mul_kernel[(triton.cdiv(output.numel(), 256),)](x, output, output.shape[-1], output.numel(), 256)
         return output
+    if use_triton and triton is not None and bf16_bits.applies(x):  # Turing: the same kernel reading BF16 as bits
+        return bf16_bits.silu_mul(x)
     gate, value = x.chunk(2, -1)
     F.silu(gate, inplace=True).mul_(value)
     return gate.contiguous()

@@ -12,6 +12,8 @@ from shared.utils.gallery_media import gallery_media_ids
 
 
 def restore_media_links(transcript, replay_commands, media_records):
+    from shared.deepy.chat import media_link_attributes
+
     paths, replacements, thumbnails = {}, {}, {}
 
     def register(path):
@@ -76,7 +78,8 @@ def restore_media_links(transcript, replay_commands, media_records):
             value = image_src.sub(lambda match: match[1] + thumbnails.get(html.unescape(match[2]), match[2]) + match[3], value)
             if links is not None:
                 value = links.sub(lambda match: replacements[match[0]], value)
-            return legacy.sub(legacy_url, value)
+            # Saved replies keep the link attributes they were rendered with.
+            return media_link_attributes(legacy.sub(legacy_url, value))
         return value
 
     transcript[:] = rewrite(transcript)

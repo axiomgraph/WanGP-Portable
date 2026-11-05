@@ -1,6 +1,6 @@
 
 from shared.utils.phase_progress import generation_progress
-from mmgp import offload
+from mmgp import offload, runtime
 
 import torch, json, os
 import math
@@ -103,6 +103,10 @@ class model_factory():
         require_blockwise_int8(transformer, "Qwen Image 20B Modulation", ("transformer_blocks.*.img_mod.1", "transformer_blocks.*.txt_mod.1"))
 
         text_encoder = offload.fast_load_transformers_model(text_encoder_filename, writable_tensors=False, modelClass=Qwen2_5_VLForConditionalGeneration, defaultConfigPath=os.path.join(tokenizer_path, "config.json"))
+        # the 1 GB token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the 1 GB output head, which never runs: the
+        # hidden states come from the base model
+        runtime.lookup_on_cpu(text_encoder.get_input_embeddings())
+        runtime.unused(text_encoder.lm_head)
         # text_encoder = offload.fast_load_transformers_model(text_encoder_filename, do_quantize=True,  writable_tensors= True , modelClass=Qwen2_5_VLForConditionalGeneration, defaultConfigPath="text_encoder_config.json", verboseLevel=2)
         # text_encoder.to(torch.float16)
         # offload.save_model(text_encoder, "text_encoder_quanto_fp16.safetensors", do_quantize= True)

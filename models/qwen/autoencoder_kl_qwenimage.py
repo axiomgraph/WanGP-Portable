@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from shared.kernels import scaled_fp16
+from shared.kernels import scaled_fp16, vae_ops
 
 from shared.utils.conv_bands import conv_bands
 import torch.utils.checkpoint
@@ -347,8 +347,8 @@ class QwenImageAttentionBlock(nn.Module):
         qkv = qkv.permute(0, 1, 3, 2).contiguous()
         q, k, v = qkv.chunk(3, dim=-1)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
+        # apply attention (by chunks of queries where SDPA has no memory-efficient kernel: BF16 on Turing)
+        x = vae_ops.attention(q, k, v)
 
         x = x.squeeze(1).permute(0, 2, 1).reshape(batch_size * time, channels, height, width)
 

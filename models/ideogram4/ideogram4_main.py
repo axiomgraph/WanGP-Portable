@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 from transformers.masking_utils import create_causal_mask
 from tqdm import tqdm
 
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 
 from models.flux.modules.autoencoder_flux2 import AutoencoderKLFlux2, AutoEncoderParamsFlux2
@@ -135,6 +135,7 @@ def _load_text_encoder(filename: str, config_path: str, dtype: torch.dtype) -> I
         text_encoder = Ideogram4TextEncoder(config)
     text_encoder.language_model.rotary_emb.reset_inv_freq()
     offload.load_model_data(text_encoder.language_model, filename, modelPrefix="language_model", writable_tensors=False, default_dtype=dtype)
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 1.2 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     text_encoder.eval().requires_grad_(False)
     return text_encoder
 

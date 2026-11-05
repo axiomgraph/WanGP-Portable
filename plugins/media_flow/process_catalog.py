@@ -142,6 +142,7 @@ def load_process_definitions() -> tuple[dict[str, dict], str | None]:
         if not isinstance(raw_settings, dict):
             return {}, f"Process setting file {settings_path.name} must contain a JSON object."
         process_name = str(settings_path.stem).strip()
+        info = raw_settings.pop("process", None)  # catalog metadata, kept out of generation settings
         model_type = str(raw_settings.get("model_type") or "").strip()
         system_handler = str(raw_settings.get("system_handler") or "").strip()
         if len(process_name) == 0:
@@ -150,7 +151,7 @@ def load_process_definitions() -> tuple[dict[str, dict], str | None]:
             return {}, f"Process setting file {settings_path.name} is missing model_type."
         if process_name in process_definitions:
             continue
-        process_definitions[process_name] = {"settings": raw_settings, "path": remap_process_settings_path(settings_path), "media_kind": process_settings_media_kind(raw_settings)}
+        process_definitions[process_name] = {"settings": raw_settings, "path": remap_process_settings_path(settings_path), "media_kind": process_settings_media_kind(raw_settings), "info": info if isinstance(info, dict) else {}}
     if len(process_definitions) == 0:
         return {}, f"No process setting files were found in: {PROCESS_SETTINGS_DIR}"
     return process_definitions, None

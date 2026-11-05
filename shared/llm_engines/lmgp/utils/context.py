@@ -18,15 +18,22 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     speculative_verify: bool = False
+    # mixed-precision KV cache (layers.kv_formats): the exact-overlay row of each written token (-1: none), and per sequence the first row
+    # of its overlay (-1: none) and the first position read from the ring
+    overlay_mapping: torch.Tensor | None = None
+    overlay_base: torch.Tensor | None = None
+    ring_start: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, has_previous_state=False, speculative_verify=False):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, has_previous_state=False, speculative_verify=False,
+                overlay_mapping=None, overlay_base=None, ring_start=None):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, bool(has_previous_state), cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, bool(speculative_verify))
+    _CONTEXT = Context(is_prefill, bool(has_previous_state), cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, bool(speculative_verify),
+                       overlay_mapping, overlay_base, ring_start)
 
 def reset_context():
     global _CONTEXT

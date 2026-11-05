@@ -133,6 +133,34 @@ export function wangpScheduleUpdate(callback) {
     wangpUpdateJobs.push(callback);
     wangpUpdateChannel.port2.postMessage(0);
 }
+// Gradio copies every incoming object prop, so Svelte sees a new choices list,
+// elem_classes array or editor layer/brush option on each form refresh even when
+// the content is identical, and re-runs every reactive statement reading it
+// (option lists, editor tool setup with its forced layouts). A content-equal
+// object prop is the prop the component already holds: do not assign it.
+// value and loading_status keep Gradio's handling: a value carries output
+// semantics and a status is published once per actual change by Mn.
+function wangpSameProp(previous, next) {
+    if (previous === null || typeof previous !== "object" || previous instanceof Map || previous instanceof Set || next instanceof Map || next instanceof Set) return false;
+    try { return JSON.stringify(previous) === JSON.stringify(next); } catch { return false; }
+}
+// An unchanged primitive value is the value the bound component already holds
+// and shows; Svelte would not invalidate it. Skip it together with its
+// value_is_output mark (the mark carries the incoming value), so the component
+// runs no update cycle for it: Textbox reads layout before every update and
+// Slider rewrites its range input, both forcing a layout of the whole form.
+// Object values keep Gradio's handling: components react to their identity.
+function wangpSkipUpdate(node, update, next) {
+    const prop = update.prop;
+    // A label/visibility-only update clears the mark; a node whose mark is already
+    // cleared has nothing to apply (Svelte would not invalidate it either).
+    if (prop === "value_is_output" && next === false && node.props.value_is_output === false) return true;
+    if (prop === "value" || (prop === "value_is_output" && next === true && "wangpValue" in update)) {
+        const value = prop === "value" ? next : update.wangpValue;
+        return (value === null || typeof value !== "object") && Object.is(node.props.value, value);
+    }
+    return prop !== "loading_status" && next !== null && typeof next === "object" && wangpSameProp(node.props[prop], next);
+}
 """
 # Gradio's status store replaces an entry on each actual status/progress change.
 # Mn also runs after data messages and visits previously completed outputs. Do
@@ -281,6 +309,13 @@ _PATCHES = {
         ('async function f(){await Promise.all([n.set([125,140]),r.set([-125,-140])]),await Promise.all([n.set([-125,140]),r.set([125,-140])]),await Promise.all([n.set([-125,0]),r.set([125,-0])]),await Promise.all([n.set([125,0]),r.set([-125,0])])}', 'async function f(){for(const [left,right] of [[[125,140],[-125,-140]],[[-125,140],[125,-140]],[[-125,0],[125,0]],[[125,0],[-125,0]]]){if(u)return;await Promise.all([n.set(left),r.set(right)])}}'),
         ('return rt(()=>(a(),()=>u=!0))', 'return rt(()=>(a(),()=>{u=!0;n.set([0,0],{hard:!0});r.set([0,0],{hard:!0})}))'),
     ],
+    'Textbox-pyOssf2O.js': [
+        # The autoscroll check reads the textarea's scroll geometry before every
+        # update, forcing a layout of the whole form between the flush's DOM
+        # writes. Only a value change can move the scroll position: a label or
+        # visibility update needs no read and performs no scroll.
+        ('tt(()=>{x=v&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})', 'tt(()=>{x=v&&(l.$$.dirty[0]&1)!==0&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})'),
+    ],
     'AudioPlayer-DG1QBBp6.js': [
         # Svelte invalidates timeRef after this DOM write, re-running the
         # reactive waveform.on() statement and leaking a listener each tick.
@@ -306,6 +341,10 @@ _PATCHES = {
         ('c[0]&1024&&n.value!==i[10]&&me(n,i[10])', 'c[0]&1024&&wangpModelInput(n,i[10])'),
     ],
     'Tabs-DtiML6DO.js': [
+        # Every tab registration during a form refresh starts a measurement after
+        # the same tick; each one reads layout between the flush's DOM writes.
+        # One measurement after that tick sees the same final DOM.
+        ('async function V(){if(!w)return;await We();', 'let wangpTabsMeasuring=false;async function V(){if(!w||wangpTabsMeasuring)return;wangpTabsMeasuring=true;await We();wangpTabsMeasuring=false;'),
         # Test whether all tabs fit without the overflow trigger first. Its
         # existing width otherwise keeps the last tab trapped in overflow.
         ('let p=s.width;const D=ye(b,J);', '''if (!s.width) return;
@@ -433,6 +472,12 @@ _PATCHES = {
         ('jC.SchedulerSystem = XC;', _EDITOR_SCHEDULER + 'jC.SchedulerSystem = XC;'),
         ('this._pauseUpdate = e;', 'this._pauseUpdate = e; e ? this.removeTickerListener() : this.addTickerListener();'),
         ('this._tickerAdded || !this.domElement ||', 'this._pauseUpdate || this._tickerAdded || !this.domElement ||'),
+        # Every form refresh marks the editor value as output again (afterUpdate
+        # clears the flag), which re-runs the value sync with force_empty. The
+        # forced clear reset both Pixi canvases, rebuilt their cursors and read
+        # layout for each tool change even when nothing was drawn or loaded.
+        # Clear only when the editors hold something, as a user clear does.
+        ('if (await R0(), !wn() || (await Q(!0, !1, wn), !wn())) return;', 'if (await R0(), !wn() || (await Q(!1, !1, wn), !wn())) return;'),
     ],
     'Blocks-BMC4HgbM.js': [
         ('requestAnimationFrame(()=>{Jt(he,pe,oe)})', 'wangpScheduleUpdate(()=>{Jt(he,pe,oe)})'),
@@ -464,7 +509,7 @@ _PATCHES = {
         # A label/visibility/options update carries no new value. Marking it as
         # one makes editors interpret their old empty prop as a server clear.
         ('S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!0}))',
-         'S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!(de&&de.__type__==="update"&&!Object.prototype.hasOwnProperty.call(de,"value"))}))'),
+         'S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!(de&&de.__type__==="update"&&!Object.prototype.hasOwnProperty.call(de,"value")),wangpValue:de&&de.__type__==="update"?de.value:de}))'),
         # Re-publish after a component clears its indicator or a layout rebuild.
         ('function Ao(S,J,K){', 'function Ao(S,J,K){wangpStatusCache.delete(String(S));'),
         ('function Bo(ae){', 'function Bo(ae){wangpStatusCache.clear();wangpPendingCache.clear();'),
@@ -486,6 +531,11 @@ _PATCHES = {
         ('function Qo(e,o,t,r){', _UPDATE_SCHEDULER + 'function Qo(e,o,t,r){'),
         ('uv(q)', 'wangpScheduleUpdate(q)'),
         ('function lf(e,o={}){', 'function lf(e,o={}){' + _NATIVE_EVENT_STREAM),
+        # Deliver every partial output in its own task: gr.skip() must not erase
+        # an earlier queue/abort trigger, and consumers must read object updates
+        # before the next diff mutates them. Posted tasks avoid hidden-tab timer
+        # throttling while preserving Gradio's microtask boundaries.
+        ('let h=e[_];typeof window<"u"&&typeof document<"u"?setTimeout(h,0,u):h(u)', 'let h=e[_];typeof window<"u"&&typeof document<"u"?wangpScheduleUpdate(()=>h(u)):h(u)'),
         # Inspect only the actual gallery-view output, never unrelated text.
         # Its whole response must be discarded before an old index can paint.
         ('for(let g=0;g<ge.length;g++)for(let P=0;', 'for(let g=0;g<ge.length;g++){const view=ge[g].find(v=>v&&v.prop==="value"&&s[v.id]?.props.elem_id==="wangp-gallery-view");if(view&&window.WanGPGallerySelection?.acceptView(view.value)===false)continue;for(let P=0;'),
@@ -506,7 +556,7 @@ _PATCHES = {
         # Clear its open flag so the next queued audio/UI update can reconnect.
         ('s.onerror=async function(){await Promise.all', 's.onerror=async function(){ze(r,n.abort_controller);await Promise.all'),
         ('function q(){l.update(k=>{for(let g=0;', 'function q(){l.update(k=>{const wangpDirty=new Set;for(let g=0;'),
-        ('f.props[v.prop]=j}return k}),ge=[]', 'f.props[v.prop]=j;' + _MARK_ANCESTORS + 'return k}),ge=[]'),
+        (':j=v.value,f.props[v.prop]=j}return k}),ge=[]', ':j=v.value;if(wangpSkipUpdate(f,v,j))continue;f.props[v.prop]=j;' + _MARK_ANCESTORS + 'return k}),ge=[]'),
         ('l.set(h)', 'Object.values(s).forEach(node=>node.__wangp_revision=(node.__wangp_revision||0)+1),l.set(h)'),
     ],
     'Index-Cuq53rtW.js': [

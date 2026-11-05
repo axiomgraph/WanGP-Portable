@@ -178,10 +178,11 @@ class LTXUpsamplerRuntime:
         try:
             self.model, self.offloadobj = wgp.load_models(
                 MODEL_TYPES[variant],
-                override_profile=5,
+                override_profile=0,
                 output_type="video",
                 runtime_model_type=FAKE_MODEL_TYPES[variant],
                 track_as_main=False,
+                extension=True,
             )
             self._load_loras(wgp, variant)
             offload_registry.register_offloadobj(RUNTIME_NAME, self.offloadobj, self.release)

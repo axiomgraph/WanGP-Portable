@@ -68,6 +68,109 @@ def _snapshot_traverse(value, func, is_root):
     return value
 
 
+def _same_constructor_args(kwargs, current):
+    if kwargs.keys() != current.keys():
+        return False
+    try:
+        return all(kwargs[key] is current[key] or kwargs[key] == current[key] for key in kwargs)
+    except Exception:
+        return False
+
+
+# Gradio 5.29's Blocks.postprocess_data constructs a new component for every
+# update dictionary so the session holds the component the update describes.
+# A form refresh sends hundreds of updates whose arguments equal the session
+# component's; constructing those copies dominated postprocessing. Reuse the
+# component when the arguments are unchanged; everything else is the original.
+_POSTPROCESS_DATA_HASH = 'b9962fc450b9ccb8'
+_STATE_IDS_HASH = '74d61935b157993c'
+
+
+async def _postprocess_data(self, block_fn, predictions, state):
+    from gradio import blocks, components, processing_utils, utils
+
+    state = state or blocks.SessionState(self)
+    if isinstance(predictions, dict) and predictions == blocks.skip() and len(block_fn.outputs) > 1:
+        predictions = [blocks.skip()] * len(block_fn.outputs)
+    if isinstance(predictions, dict) and len(predictions) > 0:
+        predictions = blocks.convert_component_dict_to_list([block._id for block in block_fn.outputs], predictions)
+    if len(block_fn.outputs) == 1 and not block_fn.batch:
+        predictions = [predictions]
+    self.validate_outputs(block_fn, predictions)
+    output = []
+    for i, block in enumerate(block_fn.outputs):
+        try:
+            if predictions[i] is components._Keywords.FINISHED_ITERATING:
+                output.append(None)
+                continue
+        except (IndexError, KeyError) as err:
+            raise ValueError(f"Number of output components does not match number of values returned from from function {block_fn.name}") from err
+        if block.stateful:
+            if not utils.is_prop_update(predictions[i]):
+                state[block._id] = predictions[i]
+            output.append(None)
+            continue
+        prediction_value = predictions[i]
+        if utils.is_prop_update(prediction_value):
+            prediction_value = utils.delete_none(prediction_value, skip_value=True)
+        if isinstance(prediction_value, blocks.Block):
+            prediction_value = prediction_value.constructor_args.copy()
+            prediction_value["__type__"] = "update"
+        if utils.is_prop_update(prediction_value):
+            current = state[block._id]
+            kwargs = current.constructor_args.copy()
+            kwargs.update(prediction_value)
+            kwargs.pop("value", None)
+            kwargs.pop("__type__")
+            kwargs["render"] = False
+            if not _same_constructor_args(kwargs, current.constructor_args):
+                state[block._id] = block.__class__(**kwargs)
+            prediction_value = blocks.postprocess_update_dict(block=state[block._id], update_dict=prediction_value, postprocess=block_fn.postprocess)
+        elif block_fn.postprocess:
+            if not isinstance(block, components.Component):
+                raise blocks.InvalidComponentError(f"{block.__class__} Component not a valid output component.")
+            if block._id in state:
+                block = state[block._id]
+            prediction_value = block.postprocess(prediction_value)
+            if isinstance(prediction_value, (blocks.GradioModel, blocks.GradioRootModel)):
+                prediction_value_serialized = prediction_value.model_dump()
+            else:
+                prediction_value_serialized = prediction_value
+            prediction_value_serialized = await processing_utils.async_move_files_to_cache(prediction_value_serialized, block, postprocess=True)
+            if block._id not in state:
+                state[block._id] = block
+            state[block._id].value = prediction_value_serialized
+        output.append(await processing_utils.async_move_files_to_cache(prediction_value, block, postprocess=True))
+    return output
+
+
+def _get_state_ids_to_track(self, block_fn, state):
+    from gradio import utils
+
+    if state is None:
+        return [], []
+    state_ids_to_track, hashed_values = [], []
+    stateful = [block for block in block_fn.outputs if block.stateful]
+    if stateful:
+        # One pass over the listeners instead of one per stateful output.
+        changed = {target for fn in state.blocks_config.fns.values() for target in fn.targets}
+        for block in stateful:
+            if (block._id, "change") in changed:
+                state_ids_to_track.append(block._id)
+                hashed_values.append(utils.deep_hash(state[block._id]))
+    return state_ids_to_track, hashed_values
+
+
+def _install_postprocess_patch(blocks):
+    import hashlib
+    for name, expected in (('postprocess_data', _POSTPROCESS_DATA_HASH), ('get_state_ids_to_track', _STATE_IDS_HASH)):
+        source = inspect.getsource(getattr(blocks.Blocks, name))
+        if hashlib.sha256(source.encode()).hexdigest()[:16] != expected:
+            raise RuntimeError(f'Gradio engine patch requires the pinned Gradio 5.29 Blocks.{name}')
+    blocks.Blocks.postprocess_data = _postprocess_data
+    blocks.Blocks.get_state_ids_to_track = _get_state_ids_to_track
+
+
 def install():
     from gradio import blocks, component_meta, data_classes, processing_utils, routes, utils
     from gradio_client import utils as client_utils
@@ -79,6 +182,8 @@ def install():
     gradio_media_response_patch.install()
     gradio_frontend_patch.install()
     routes.move_uploaded_files_to_cache = _move_uploaded_files_to_cache
+    if blocks.Blocks.postprocess_data is not _postprocess_data:
+        _install_postprocess_patch(blocks)
 
     if component_meta.updateable is _updateable:
         return

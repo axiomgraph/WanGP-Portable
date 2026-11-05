@@ -28,7 +28,7 @@ from shared.remote_llm.images import temporary_image_paths
 from shared.mcp.bridge import build_tool_proxy
 from shared.remote_llm.opencode_backend import OpenCodeBackend
 from shared.remote_llm.base import BackendEvent
-from shared.remote_llm.deepy_runner import _visual_query, run_remote_deepy_turn
+from shared.remote_llm.deepy_runner import REMOTE_HISTORY_MAX_CHARS, _restored_history, _visual_query, run_remote_deepy_turn
 from shared.remote_llm.usage import build_remote_usage_stats, claude_context_window
 from shared.prompt_enhancer.qwen35_assistant_runtime import extract_tool_calls
 
@@ -1165,6 +1165,12 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         result = asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset", "steps": 8}))
         self.assertEqual(result, {"status": "done"})
         self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset", "steps": 8})])
+        calls.clear()
+        asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset"}))
+        self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset"})])  # a parameter left out does not reach WanGP as null
+        calls.clear()
+        asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset", "steps": None}))
+        self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset", "steps": None})])  # an explicit null does
 
     def test_temporary_image_paths_are_removed(self):
         with temporary_image_paths([Image.new("RGB", (4, 4), "red")]) as paths:
@@ -1201,6 +1207,59 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         status_events = [json.loads(payload)["event"].get("status") for command, payload in sent if command == "chat_output" and json.loads(payload)["event"]["type"] == "status"]
         self.assertIn({"visible": True, "kind": "tool", "text": "Generate - sunset..."}, status_events)
 
+    def test_remote_engine_receives_the_turns_it_has_not_seen(self):
+        class Recording(_ClosableBackend):
+            def __init__(self):
+                super().__init__()
+                self.prompts = []
+
+            def run_turn(self, text, **_kwargs):
+                self.prompts.append(text)
+                return "answer"
+
+            def interrupt(self):
+                pass
+
+        session = AssistantSessionState()
+        codex, claude = Recording(), Recording()
+
+        def turn(engine, text):
+            user_id, _event = assistant_chat.add_user_message(session, text)
+            begin_assistant_turn(session, user_id, text)
+            run_remote_deepy_turn({"llm_engines": {"deepy": engine}}, session, text, "system", _FakeToolbox(), lambda *_args: None)
+
+        with patch("shared.remote_llm.deepy_runner.create_backend", side_effect=[codex, claude]):
+            turn("codex", "first")
+            turn("codex", "second")
+            turn("claude", "third")
+            turn("codex", "fourth")
+        self.assertNotIn("wangp_conversation_history", codex.prompts[0])
+        self.assertNotIn("wangp_conversation_history", codex.prompts[1])
+        history = claude.prompts[0].split("</wangp_conversation_history>")[0]
+        self.assertIn("first", history)
+        self.assertIn("second", history)
+        history = codex.prompts[2].split("</wangp_conversation_history>")[0]
+        self.assertIn("third", history)  # what the other engine did, and nothing it already holds
+        self.assertNotIn("second", history)
+
+    def test_restored_history_keeps_the_latest_messages_whole(self):
+        results = [{"role": "tool", "tool_call_id": str(number), "content": f"result {number} " + "x" * 100_000} for number in range(10)]
+        messages = [{"role": "user", "content": "first words"}, *results, {"role": "assistant", "content": "latest words"}]
+        history, cut = _restored_history(messages)
+        self.assertTrue(cut)
+        self.assertLessEqual(len(json.dumps(history, ensure_ascii=False)), REMOTE_HISTORY_MAX_CHARS)
+        self.assertEqual(history[0]["content"], "first words")
+        self.assertEqual(history[-1]["content"], "latest words")
+        self.assertIn("characters shortened", history[1]["content"])
+        self.assertTrue(history[1]["content"].startswith("result 0"))
+        self.assertEqual(history[-2]["content"], results[-1]["content"])
+        self.assertEqual(_restored_history(messages[:2]), ([{"role": "user", "content": "first words"}, {"role": "tool", "tool_call_id": "0", "content": results[0]["content"]}], False))
+        words = [{"role": "user", "content": f"{number} " + "y" * 100_000} for number in range(10)]  # nothing left to shorten: the oldest go
+        history, cut = _restored_history(words)
+        self.assertTrue(cut)
+        self.assertLessEqual(len(json.dumps(history, ensure_ascii=False)), REMOTE_HISTORY_MAX_CHARS)
+        self.assertEqual(history[-1]["content"], words[-1]["content"])
+
     def test_remote_deepy_keeps_codex_alive_while_browser_login_completes(self):
         session = AssistantSessionState()
         user_id, _event = assistant_chat.add_user_message(session, "make a sunset")
@@ -1210,6 +1269,57 @@ class RemoteLLMAdapterTests(unittest.TestCase):
             run_remote_deepy_turn({"llm_engines": {"deepy": "codex"}}, session, "make a sunset", "system", _FakeToolbox(), lambda *_args: None)
         self.assertIs(session.remote_backends["codex"], backend)
         self.assertFalse(backend.closed)
+
+    def test_remote_turn_drains_a_render_before_restoring_the_conversation(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                session = AssistantSessionState()
+                user_id, _ = assistant_chat.add_user_message(session, "Render two shots")
+                begin_assistant_turn(session, user_id, "Render two shots")
+                between_shots = threading.Event()
+                observed = []
+
+                def render(name, arguments):
+                    # A paused render needs both the stop signal and the session lock to exit.
+                    with session.turn_lock:
+                        session.pause_requested = True
+                        session.pause_resume_event.clear()
+                    between_shots.set()
+                    session.pause_resume_event.wait(3)
+                    with session.turn_lock:
+                        observed.append((session.interrupt_requested, session.current_turn is not None))
+                    return {"status": "interrupted", "tool": name}
+
+                def end_early(prompt, *, call_tool, **kwargs):
+                    worker = threading.Thread(target=call_tool, args=("wangp_generate", {}), daemon=True)
+                    worker.start()
+                    self.addCleanup(worker.join, 3)
+                    self.assertTrue(between_shots.wait(3))
+                    if failed:
+                        raise ConnectionError("provider disconnected")
+                    return ""
+
+                backend, toolbox = Mock(), _FakeToolbox()
+                backend.run_turn.side_effect = end_early
+                toolbox.call = Mock(side_effect=render)
+                session.remote_backends["opencode"] = backend
+                args = ({"llm_engines": {"deepy": "opencode"}}, session, "Render two shots", "system", toolbox, lambda *_: None)
+                if failed:
+                    with self.assertRaisesRegex(ConnectionError, "provider disconnected"):
+                        run_remote_deepy_turn(*args)
+                else:
+                    run_remote_deepy_turn(*args)
+                self.assertEqual(observed, [(True, True)])
+                self.assertIsNone(session.current_turn)
+                self.assertIn("ended its turn", session.interruption_notice)
+                backend.interrupt.assert_not_called()
+
+                # An old provider callback must stay closed after the next turn starts.
+                session.interrupt_requested = False
+                begin_assistant_turn(session, user_id, "Next turn")
+                late = backend.run_turn.call_args.kwargs["call_tool"]("wangp_generate", {})
+                self.assertTrue(late["cancelled"])
+                toolbox.call.assert_called_once()
 
     def test_remote_deepy_streams_reasoning_and_progress_status(self):
         session = AssistantSessionState()

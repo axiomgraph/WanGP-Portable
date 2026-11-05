@@ -71,9 +71,13 @@ class DeepyPublicationQueue:
 
     def _coalesce_append(self, data: str, metadata: dict[str, Any]) -> bool:
         incoming = metadata["event"]
-        if not self.queue:
+        # Every token chunk is followed by a stats event: look past pending stats so appends keep merging instead of filling the backlog
+        index = len(self.queue) - 1
+        while index >= 0 and self.queue[index][2] is not None and self.queue[index][2]["type"] == "stats":
+            index -= 1
+        if index < 0:
             return False
-        cmd, _previous_data, previous_metadata = self.queue[-1]
+        cmd, _previous_data, previous_metadata = self.queue[index]
         if cmd != "chat_output" or previous_metadata is None or previous_metadata["type"] != "append_block_text":
             return False
         previous = previous_metadata["event"]
@@ -93,7 +97,7 @@ class DeepyPublicationQueue:
         merged_envelope["event_id"] = metadata["envelope"].get("event_id", merged_envelope.get("event_id"))
         previous_metadata["pending_size"] += len(suffix)
         self.pending_bytes += len(suffix)
-        self.queue[-1] = (cmd, None, previous_metadata)
+        self.queue[index] = (cmd, None, previous_metadata)
         self.events_coalesced += 1
         return True
 

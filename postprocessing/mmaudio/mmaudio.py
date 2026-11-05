@@ -76,7 +76,7 @@ def _load_state_dict(model_path, device):
 
 
 @controlled_model_loading
-def get_model(persistent_models = False, verboseLevel = 1, model_name = None, model_path = None) -> tuple[MMAudio, FeaturesUtils, SequenceConfig]:
+def get_model(persistent_models = False, verboseLevel = 1, model_name = None, model_path = None, init_pipe=None) -> tuple[MMAudio, FeaturesUtils, SequenceConfig]:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -132,7 +132,9 @@ def get_model(persistent_models = False, verboseLevel = 1, model_name = None, mo
 
         pipe = { "net" : net, "clip" : feature_utils.clip_model, "syncformer" : feature_utils.synchformer, "vocode" : feature_utils.tod.vocoder, "vae" : feature_utils.tod.vae }
         from mmgp import offload
-        offloadobj = offload.profile(pipe, loading_callback=loading_callback(), profile_no=4, verboseLevel=2)
+        kwargs = {}
+        profile_no = init_pipe(pipe, kwargs, 0)
+        offloadobj = offload.profile(pipe, loading_callback=loading_callback(), profile_no=profile_no, verboseLevel=2, **kwargs)
         if persistent_models:
             from shared.utils import offload_registry
 
@@ -160,11 +162,11 @@ def get_model(persistent_models = False, verboseLevel = 1, model_name = None, mo
 
 @torch.inference_mode()
 def video_to_audio(video, prompt: str, negative_prompt: str, seed: int, num_steps: int,
-                   cfg_strength: float, duration: float, save_path , persistent_models = False, audio_file_only = False, verboseLevel = 1, model_name = None, model_path = None, audio_codec_key = "aac_128"):
+                   cfg_strength: float, duration: float, save_path , persistent_models = False, audio_file_only = False, verboseLevel = 1, model_name = None, model_path = None, audio_codec_key = "aac_128", init_pipe=None):
 
     global device
 
-    net, feature_utils, seq_cfg, offloadobj = get_model(persistent_models, verboseLevel, model_name=model_name, model_path=model_path )
+    net, feature_utils, seq_cfg, offloadobj = get_model(persistent_models, verboseLevel, model_name=model_name, model_path=model_path, init_pipe=init_pipe)
     from shared.utils import offload_registry
     offload_registry.register_offloadobj("MMAudio", offloadobj, release_models if persistent_models else offloadobj.release)
     try:

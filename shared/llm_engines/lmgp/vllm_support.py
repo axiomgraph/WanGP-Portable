@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import functools
 import os
@@ -150,6 +151,54 @@ def resolve_lm_features():
     return LMFeatures(graphs[0], triton[0], flash[0], graphs[1], triton[1], flash[1])
 
 
+@functools.cache
+def _prompt_enhancer_triton_check():
+    """Check Qwen's block accesses, including their masked lowering on Triton 3.9."""
+    global tl
+    import torch
+    import triton
+    import triton.language as tl
+    from tqdm import tqdm
+
+    try:
+        @triton.jit
+        def _smoke_block_pointer_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+            offset = tl.program_id(0) * BLOCK
+            source = tl.make_block_ptr(X, (N,), (1,), (offset,), (BLOCK,), (0,))
+            target = tl.make_block_ptr(Y, (N,), (1,), (offset,), (BLOCK,), (0,))
+            value = tl.load(source, boundary_check=(0,), padding_option="zero")
+            tl.store(target, value + 1, boundary_check=(0,))
+
+        if tuple(map(int, triton.__version__.split(".")[:2])) >= (3, 9):
+            from shared.kernels.fla_block_pointers import lower_block_pointers
+            from shared.kernels.fla_inference import configure_fla_inference_kernels
+            lower_block_pointers(_smoke_block_pointer_kernel)
+            configure_fla_inference_kernels()
+        device = torch.device("cuda", torch.cuda.current_device())
+        x = torch.arange(129, dtype=torch.float32, device=device)
+        y = torch.empty_like(x)
+        _smoke_block_pointer_kernel[(2,)](x, y, N=x.numel(), BLOCK=128)
+        torch.cuda.synchronize(device)
+        if not torch.equal(y, x + 1):
+            raise RuntimeError("incorrect output from the block-pointer kernel")
+    except Exception as exc:
+        message = str(exc).strip().splitlines()
+        reason = f"Triton {triton.__version__} block-pointer test failed: {(message[-1] if message else type(exc).__name__)[:260]}"
+        tqdm.write(f"[WARNING] {reason}. Triton kernels are disabled for Deepy and the prompt enhancer; using PyTorch kernels (slower). Reinstall the supported Triton version for your GPU/PyTorch profile from the WanGP installation guide.")
+        return False, reason
+    return True, "ok"
+
+
+def resolve_prompt_enhancer_lm_features():
+    """Apply Qwen's additional compatibility check without disabling Triton for other model families."""
+    features = resolve_lm_features()
+    if features.triton:
+        supported, reason = _prompt_enhancer_triton_check()
+        if not supported:
+            features = features._replace(triton=False, triton_reason=reason)
+    return features
+
+
 def configure_engine_kernels(model, features):
     """The kernels of the LM engine's layers in model: Triton or PyTorch ones, FlashAttention 2 or PyTorch attention, as features allow
     (CUDA graphs are decided separately)."""
@@ -170,13 +219,14 @@ def configure_engine_kernels(model, features):
 class TextEngine:
     keep_loaded_for_phase2 = True
 
-    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None, kv_cache_int8: bool = False):
+    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None, kv_cache_int8: bool = False, kv_cache_layout: str = "int8"):
         self.model = model
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.enforce_eager = bool(enforce_eager)
         self.graph_pool_handle = graph_pool_handle
         self.kv_cache_int8 = bool(kv_cache_int8)
+        self.kv_cache_layout = str(kv_cache_layout or "int8")
         self._kv_cache_options = {}
         self.hf_config = getattr(model, "config", None)
         self._llm = None
@@ -185,6 +235,7 @@ class TextEngine:
         self._max_num_seqs_hint = None
         self._max_num_batched_tokens_hint = None
         self._last_failure_reason = ""
+        self._disposable = None  # its runtime (KV cache, graphs, state) declared to MMGP as disposable (mmgp.runtime.disposable)
 
     @staticmethod
     def _compute_runtime_hints(prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1):
@@ -220,7 +271,7 @@ class TextEngine:
         self._max_model_len_hint = max_model_len
         self._max_num_seqs_hint = max_num_seqs
         self._max_num_batched_tokens_hint = max_num_batched_tokens
-        self.close()
+        self.close()  # made again larger
 
     def reserve_runtime(self, prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1, min_model_len: int | None = None):
         req_model_len, req_num_seqs, req_num_batched = self._compute_runtime_hints(
@@ -270,9 +321,30 @@ class TextEngine:
             model_object=self.model,
             graph_pool_handle=self.graph_pool_handle,
             kv_cache_int8=self.kv_cache_int8,
+            kv_cache_layout=self.kv_cache_layout,
             **self._kv_cache_options,
         )
         self._sampling_params_cls = SamplingParams
+        from mmgp import runtime
+        # MMGP takes it back only when VRAM runs short while the engine is not in use (its model parked, or idle()): after the blocks of the
+        # idle models; the owner of a live context saves it first (close)
+        self._disposable = runtime.disposable(self.model, "the language model's KV cache", self.close)
+
+    def has_live_context(self) -> bool:
+        """A sequence kept between requests (an assistant's conversation): other requests run beside it (LLMEngine.aside)."""
+        scheduler = None if self._llm is None else self._llm.scheduler
+        return scheduler is not None and bool(scheduler.running or scheduler.waiting)
+
+    def idle(self):
+        """A scope in which the caller's thread runs other models and the engine is not used: MMGP may release its runtime if VRAM runs short."""
+        return contextlib.nullcontext() if self._disposable is None else self._disposable.idle()
+
+    def save_context(self) -> None:
+        """Before the live context goes (the engine closed, or a request run as alone): its owner, while away (the model's
+        _lm_engine_context_saver, e.g. Deepy parked), saves it to RAM, to restore it at its next use."""
+        saver = getattr(self.model, "_lm_engine_context_saver", None)
+        if saver is not None and self.has_live_context():
+            saver()
 
     def release_runtime_allocations(self):
         if self._llm is None:
@@ -289,6 +361,15 @@ class TextEngine:
         return not enforce_eager
 
     def close(self):
+        try:
+            self.save_context()  # the live context of an owner away (Deepy parked) goes to RAM first
+        finally:
+            self._close()
+
+    def _close(self):
+        disposable, self._disposable = getattr(self, "_disposable", None), None
+        if disposable is not None:
+            disposable.close()
         llm = getattr(self, "_llm", None)
         self._llm = None
         if llm is not None:
@@ -316,13 +397,12 @@ class TextEngine:
                 pass
         self._sampling_params_cls = None
         try:
-            import torch
+            from mmgp import cuda_graphs
             # DO NOT add `from torch._inductor import cudagraph_trees` here.
             # Its import registers borrowed Python objects in native TLS on PyTorch
             # 2.10, causing use-after-free and process crashes when a worker exits.
-            # Call the same cleanup as its clear_cublass_cache() helper directly.
             # Our CUDA graphs use torch.cuda.CUDAGraph, not Inductor's graph trees.
-            torch._C._cuda_clearCublasWorkspaces()
+            cuda_graphs.release_blas_workspaces()
         except Exception:
             pass
 

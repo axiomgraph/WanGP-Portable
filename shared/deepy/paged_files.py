@@ -18,8 +18,8 @@ def directory_entries(policy, path="", pattern="*", media_type="all"):
     if not path:
         yield from policy.roots()
         return
-    if media_type not in {"all", "image", "video", "audio", "3d", "txt", "other"}:
-        raise ValueError("media_type must be all, image, video, audio, 3d, txt, or other.")
+    if media_type not in {"all", "image", "video", "audio", "3d", "world", "txt", "other"}:
+        raise ValueError("media_type must be all, image, video, audio, 3d, world, txt, or other.")
     if "/" in pattern or "\\" in pattern or "**" in pattern:
         raise ValueError("list navigates one directory; use rg for recursive file search.")
     root = policy.require_read(path, directory=True)

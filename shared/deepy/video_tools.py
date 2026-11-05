@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 import ffmpeg
 from PIL import Image, ImageDraw, ImageFont
 
+from shared.deepy.image_channels import upright, upright_size
 from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
 from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args, validate_video_output_settings
@@ -33,7 +34,7 @@ def _get_ffmpeg_path() -> str:
 
 
 def _run_ffmpeg(args: list[str]) -> None:
-    result = subprocess.run([_get_ffmpeg_path(), "-y", "-v", "error", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run([_get_ffmpeg_path(), "-y", "-v", "error", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg command failed").strip())
 
@@ -131,6 +132,7 @@ def get_video_thumbnail_data_url(video_path: str) -> str:
             "1",
             "-",
         ],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
     )
     if result.returncode != 0 or len(result.stdout) == 0:
@@ -149,7 +151,7 @@ def picture_checks(path: str, start_s: float = 0.0, end_s: float | None = None, 
     0.1 and close to its neighbours). Only non-empty entries are returned."""
     span = [] if end_s is None or not math.isfinite(end_s) else ["-t", f"{end_s - start_s:.3f}"]
     picture = f"scale=160:-2,blackdetect=d={min_black_s:g}:pix_th=0.10,select='gte(scene,0)',metadata=print:key=lavfi.scene_score"
-    process = subprocess.run([_get_ffmpeg_path(), "-v", "info", "-ss", f"{start_s:.3f}", *span, "-i", path, "-an", "-vf", picture, "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    process = subprocess.run([_get_ffmpeg_path(), "-v", "info", "-ss", f"{start_s:.3f}", *span, "-i", path, "-an", "-vf", picture, "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if process.returncode:
         raise RuntimeError(process.stderr.strip()[-500:] or "ffmpeg could not decode the video.")
     times, scores = [float(time) for time in re.findall(r"pts_time:([\d.]+)", process.stderr)], [float(score) for score in re.findall(r"lavfi\.scene_score=([\d.]+)", process.stderr)]
@@ -162,7 +164,7 @@ def picture_checks(path: str, start_s: float = 0.0, end_s: float | None = None, 
 def quiet_ranges(path: str, *, threshold_db: float = -45.0, min_seconds: float = 1.0) -> list[list[float]]:
     """Stretches (seconds) where the first audio track stays below threshold_db: ffmpeg silencedetect."""
     command = [_get_ffmpeg_path(), "-v", "info", "-i", path, "-vn", "-af", f"silencedetect=n={threshold_db:g}dB:d={min_seconds:g}", "-f", "null", "-"]
-    process = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    process = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
     if process.returncode:
         raise RuntimeError(process.stderr.strip()[-500:] or "ffmpeg could not decode the audio.")
     duration = get_media_duration(path)
@@ -353,7 +355,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
             sizes.append((int(stream["width"]), int(stream["height"])))
         else:
             with Image.open(path) as image:
-                sizes.append(image.size)
+                sizes.append(upright_size(image))
     tile_width, tile_height = sizes[0]
     has_legends = any(legends)
     legend_height = max(32, min(96, tile_height // 8)) if has_legends else 0
@@ -364,7 +366,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
         canvas = Image.new("RGB", (columns * tile_width, rows * cell_height), "black")
         for index, (path, legend) in enumerate(zip(source_paths, legends)):
             with Image.open(path) as source:
-                image = source.convert("RGB")
+                image = upright(source).convert("RGB")
                 image.thumbnail((tile_width, tile_height), Image.Resampling.LANCZOS)
                 x = index % columns * tile_width
                 y = index // columns * cell_height
@@ -883,7 +885,7 @@ def _gain_expression(points: list[tuple[float, float]]) -> str:
 
 def _graph_loudness(args: list[str]) -> float:
     """Integrated loudness (LUFS) of a filter graph's [measure] output, from FFmpeg's EBU R128 summary."""
-    result = subprocess.run([_get_ffmpeg_path(), "-hide_banner", "-nostats", *args, "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run([_get_ffmpeg_path(), "-hide_banner", "-nostats", *args, "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ffmpeg loudness measurement failed").strip())
     loudness = float(re.findall(r"\bI:\s*(-?[\d.]+)\s*LUFS", result.stderr)[-1])
@@ -940,7 +942,7 @@ def resize_crop_image(source_path: str, output_path: str, *, width: int | None =
     if not os.path.isfile(source_path):
         raise FileNotFoundError(f"Image not found: {source_path}")
     with Image.open(source_path) as image:
-        source_width, source_height = image.size
+        source_width, source_height = upright(image).size
         left, top, cropped_width, cropped_height = _resolve_resize_crop_geometry(
             source_width,
             source_height,

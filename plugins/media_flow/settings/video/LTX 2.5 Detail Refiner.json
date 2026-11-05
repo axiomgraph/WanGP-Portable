@@ -5,5 +5,9 @@
   "spatial_upsampling_method": "ltx25_refine",
   "target_ratio": "ltx25_refine*2",
   "chunk_size_seconds": 4.0,
-  "prompt": "sharp photographic detail, crisp natural texture, fine surface detail, clean edges, natural film grain, high resolution footage"
+  "prompt": "sharp photographic detail, crisp natural texture, fine surface detail, clean edges, natural film grain, high resolution footage",
+  "process": {
+    "task": "detail",
+    "summary": "LTX-2.5 detail refiner: refines at x1 or while upscaling x1.5 or x2; the prompt describes the rendering (sharpness, texture, grain)."
+  }
 }

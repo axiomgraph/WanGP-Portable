@@ -4,7 +4,8 @@ USER_CONFIG_KEY = "configs"
 CONFIG_KEYS = SYSTEM_CONFIG_KEYS + (USER_CONFIG_KEY,)
 CONFIG_NAME_KEY = "_name"
 CONFIG_DEFAULT_LABEL_KEY = "_default_label"
-CONFIG_METADATA_KEYS = {CONFIG_NAME_KEY, CONFIG_DEFAULT_LABEL_KEY}
+CONFIG_INFOS_KEY = "_infos"
+CONFIG_METADATA_KEYS = {CONFIG_NAME_KEY, CONFIG_DEFAULT_LABEL_KEY, CONFIG_INFOS_KEY}
 
 
 def get_config_items(configs):
@@ -56,3 +57,7 @@ def get_config_name(configs):
 
 def get_default_label(configs):
     return configs.get(CONFIG_DEFAULT_LABEL_KEY, "Default")
+
+
+def get_config_infos(configs):
+    return configs.get(CONFIG_INFOS_KEY) or ""

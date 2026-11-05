@@ -97,9 +97,13 @@ def load_text_encoder(
             raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
         text_encoder_path = TEXT_ENCODER_PATH[text_encoder_type]
 
-    from mmgp import offload
+    from mmgp import offload, runtime
     # text_encoder = offload.fast_load_transformers_model(text_encoder_path, forcedConfigPath=  os.path.join(os.path.dirname(text_encoder_path), "config.json"))
     text_encoder = offload.fast_load_transformers_model(text_encoder_path,  writable_tensors= False , modelClass=Qwen2_5_VLForConditionalGeneration,  defaultConfigPath= fl.locate_file(os.path.join("Qwen2.5-VL-7B-Instruct", "config.json")) )
+    # the 1 GB token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the 1 GB output head, which never runs: the hidden
+    # states come from the base model
+    runtime.lookup_on_cpu(text_encoder.get_input_embeddings())
+    runtime.unused(text_encoder.lm_head)
 
     # text_encoder = AutoModel.from_pretrained(text_encoder_path, low_cpu_mem_usage=True)
     
@@ -480,7 +484,7 @@ class TextEncoder(nn.Module):
             batch_encoding["attention_mask"].to(device) if use_attention_mask else None
         )
         with text_encoding_progress(self.model.model.language_model.layers, prompt_count=batch_encoding["input_ids"].shape[0]):
-            outputs = self.model(
+            outputs = self.model.model(
                 input_ids=batch_encoding["input_ids"].to(device),
                 attention_mask=attention_mask,
                 output_hidden_states=output_hidden_states

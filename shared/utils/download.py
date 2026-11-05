@@ -2,6 +2,8 @@
 import inspect
 import os, shutil, sys, time
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from urllib.parse import quote
+from tqdm import tqdm
 from shared.utils.download_progress import DownloadCancelled, check_download_cancelled, download_context, download_operation, install_hf_download_patch, resolve_download_gen
 
 
@@ -29,7 +31,9 @@ def generation_downloads(get_gen_info, get_offloadobj=lambda: None):
                     gen["abort"] = True
                     return True  # The queue/API reports this as cancellation from gen["abort"].
                 except DownloadError as exc:
-                    arguments["send_cmd"]("error", str(exc))
+                    message = str(exc)
+                    tqdm.write(message)
+                    arguments["send_cmd"]("error", message)
                     return False
         return run
     return decorate
@@ -41,15 +45,16 @@ def _offline():
     return constants.HF_HUB_OFFLINE
 
 
-def _ensure_online(name):
+def _ensure_online(name, url):
     if _offline():
-        raise DownloadError(f"{name} is missing and WanGP runs offline (--offline): copy it into a checkpoints folder, or run once without --offline to download it")
+        raise DownloadError(f"{name} is missing and WanGP runs offline (--offline): copy it into a checkpoints folder, or run once without --offline to download it\nDownload URL: {url}")
 
 
 def _hf_download(*, gen=None, show_filename=True, file_index=1, file_count=1, **kwargs):
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, hf_hub_url
 
-    _ensure_online(kwargs["filename"])
+    url = hf_hub_url(kwargs["repo_id"], kwargs["filename"], **{key: kwargs[key] for key in ("subfolder", "repo_type", "revision", "endpoint") if key in kwargs})
+    _ensure_online(kwargs["filename"], url)
     gen = resolve_download_gen(gen)
     install_hf_download_patch()
     try:
@@ -58,7 +63,7 @@ def _hf_download(*, gen=None, show_filename=True, file_index=1, file_count=1, **
     except DownloadCancelled:
         raise
     except Exception as exc:
-        raise DownloadError(f"Unable to Download {kwargs['filename']} From {kwargs['repo_id']}: {exc}") from exc
+        raise DownloadError(f"Unable to Download {kwargs['filename']} From {kwargs['repo_id']}: {exc}\nDownload URL: {url}") from exc
 
 # Global variables to track download progress
 _start_time = None
@@ -169,11 +174,12 @@ def create_progress_hook(filename):
 
 
 def process_files_def(repoId=None, sourceFolderList=None, fileList=None, targetFolderList=None, gen=None, show_filename=True):
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi, constants, snapshot_download
     from shared.utils import files_locator as fl
 
     gen = resolve_download_gen(gen)
     check_download_cancelled(gen)
+    install_hf_download_patch()
     if targetFolderList is None:
         targetFolderList = [None] * len(sourceFolderList)
     downloads = []
@@ -186,7 +192,7 @@ def process_files_def(repoId=None, sourceFolderList=None, fileList=None, targetF
         if len(files) == 0:
             if gen is None or _offline():  # offline: the remote listing is unreachable, a folder present locally is taken as complete
                 if fl.locate_folder(sourceFolder if targetFolder is None else os.path.join(targetFolder, sourceFolder), error_if_none=False) is None:
-                    _ensure_online(sourceFolder)
+                    _ensure_online(sourceFolder, f"{constants.ENDPOINT}/{repoId}/tree/main/{quote(sourceFolder)}")
                     snapshot_download(repo_id=repoId, allow_patterns=sourceFolder + "/*", local_dir=local_dir)
                 continue
             # Explicit iteration keeps the opt-in context in this thread, including folder downloads.
@@ -311,8 +317,8 @@ def download_file(url, filename, gen=None, show_filename=True):
 
     gen = resolve_download_gen(gen)
     check_download_cancelled(gen)
-    _ensure_online(os.path.basename(filename))
     url = url.split("|")[0]
+    _ensure_online(os.path.basename(filename), url)
     if url.startswith("https://huggingface.co/") and "/resolve/main/" in url:
         base_dir = os.path.dirname(filename)
         url = url[len("https://huggingface.co/"):]

@@ -10,7 +10,7 @@ from transformers import (
 )
 
 from .utils import freeze
-from mmgp import offload
+from mmgp import offload, runtime
 import torchvision.transforms.functional as F
 from shared.utils.text_encoder_cache import TextEncoderCache
 
@@ -105,6 +105,10 @@ class Qwen2_5_VLTextEmbedder:
             self.max_length = conf.max_length
             self.text_token_padding = text_token_padding
             self.model = freeze(self.model)
+            # the 1 GB token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the 1 GB output head, which never runs:
+            # the hidden states come from the base model
+            runtime.lookup_on_cpu(self.model.get_input_embeddings())
+            runtime.unused(self.model.lm_head)
             return
 
         quantization_config = None
@@ -148,7 +152,7 @@ class Qwen2_5_VLTextEmbedder:
             ).to(self.model.device)
 
             with torch.no_grad():
-                embeds = self.model(**inputs, output_hidden_states=True)["hidden_states"][-1][:, crop_start:]
+                embeds = self.model.model(**inputs, output_hidden_states=True)["hidden_states"][-1][:, crop_start:]
         else:
             max_length = self.max_length + crop_start
             inputs = self.processor(
@@ -162,7 +166,7 @@ class Qwen2_5_VLTextEmbedder:
             ).to(self.model.device)
 
             with torch.no_grad():
-                embeds = self.model(
+                embeds = self.model.model(
                     input_ids=inputs["input_ids"],
                     return_dict=True,
                     output_hidden_states=True,

@@ -42,6 +42,14 @@ FILTER_ICONS = {
             <path d="M12 12v9"/>
         </svg>
     """,
+    model_dropdowns.MODEL_OUTPUT_FILTER_WORLD: """
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20.5 12a8.5 8.5 0 1 1-17 0 8.5 8.5 0 0 1 17 0Z"/>
+            <path d="M3.5 12h5.5M15 12h5.5"/>
+            <path d="M12 3.5c-2.4 2.3-3.5 5.1-3.5 8.5s1.1 6.2 3.5 8.5c2.4-2.3 3.5-5.1 3.5-8.5s-1.1-6.2-3.5-8.5Z"/>
+            <path d="m10.3 13.7 1-2.7 2.7-1-1 2.7-2.7 1Z"/>
+        </svg>
+    """,
 }
 
 FILTER_LABELS = {
@@ -50,6 +58,7 @@ FILTER_LABELS = {
     model_dropdowns.MODEL_OUTPUT_FILTER_IMAGE: "Image-only model families",
     model_dropdowns.MODEL_OUTPUT_FILTER_AUDIO: "Audio-only model families",
     model_dropdowns.MODEL_OUTPUT_FILTER_3D: "3D model families",
+    model_dropdowns.MODEL_OUTPUT_FILTER_WORLD: "Interactive world model families",
 }
 
 
@@ -61,13 +70,10 @@ class ModelOutputFilterControls:
     refresh_trigger: gr.Textbox
 
 
-_displayed_filters = [model_dropdowns.MODEL_OUTPUT_FILTER_ALL, model_dropdowns.MODEL_OUTPUT_FILTER_VIDEO, model_dropdowns.MODEL_OUTPUT_FILTER_IMAGE, model_dropdowns.MODEL_OUTPUT_FILTER_AUDIO]
-
-
-def render_filter(selected_filter):
+def render_filter(selected_filter, filters):
     selected_filter = model_dropdowns.normalize_model_output_filter(selected_filter)
     items = []
-    for filter_key in _displayed_filters:
+    for filter_key in filters:
         active = filter_key == selected_filter
         classes = "wangp-model-output-filter-link" + (" wangp-model-output-filter-link-active" if active else "")
         items.append(
@@ -79,15 +85,13 @@ def render_filter(selected_filter):
                 icon=FILTER_ICONS[filter_key],
             )
         )
-    return "<div class='wangp-model-output-filter' role='group' aria-label='Model family filter' style='grid-template-columns: repeat({0}, minmax(30px, 42px)); width: min(100%, {1}px)'>{2}</div>".format(len(_displayed_filters), 49 * len(_displayed_filters), "".join(items))
+    return "<div class='wangp-model-output-filter' role='group' aria-label='Model family filter' style='grid-template-columns: repeat({0}, minmax(30px, 42px)); width: min(100%, {1}px)'>{2}</div>".format(len(filters), 49 * len(filters), "".join(items))
 
 
 def create_filter(selected_filter, filters):
     """`filters`: the filters to display (model_dropdowns.available_output_filters)."""
-    global _displayed_filters
-    _displayed_filters = list(filters)
     with gr.Column(scale=2, min_width=210, elem_classes=["wangp-model-output-filter-wrap"]):
-        filter_html = gr.HTML(value=render_filter(selected_filter), elem_id="wangp_model_output_filter")
+        filter_html = gr.HTML(value=render_filter(selected_filter, filters), elem_id="wangp_model_output_filter")
         with gr.Row(visible=False, elem_classes=["wangp-model-output-filter-hidden-controls"]):
             target = gr.Textbox(value="", show_label=False, elem_id="wangp_model_output_filter_target")
             apply_button = gr.Button("Apply model output filter", elem_id="wangp_model_output_filter_apply")
@@ -97,6 +101,8 @@ def create_filter(selected_filter, filters):
 
 def apply_filter_selection(deps, state, requested_filter, current_model_type_getter):
     selected_filter = model_dropdowns.normalize_model_output_filter(requested_filter)
+    if selected_filter == model_dropdowns.MODEL_OUTPUT_FILTER_ALL and not deps.server_config.get(model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY, False):
+        return gr.update()
     if isinstance(state, dict):
         state[model_dropdowns.MODEL_OUTPUT_FILTER_CONFIG_KEY] = selected_filter
     current_model_type = current_model_type_getter(state)
@@ -112,10 +118,10 @@ def refresh_for_model_target(deps, state, model_type):
     return f"{selected_filter}|{time.time()}" if changed else gr.update()
 
 
-def render_filter_from_trigger(refresh_value):
+def render_filter_from_trigger(deps, refresh_value):
     selected_filter = str(refresh_value or "").split("|", 1)[0]
     model_dropdowns.debug_model_selector_event("filter.render_trigger", trigger=refresh_value, selected_filter=selected_filter)
-    return gr.update(value=render_filter(selected_filter)) if len(selected_filter) > 0 else gr.update()
+    return gr.update(value=render_filter(selected_filter, model_dropdowns.available_output_filters(deps))) if len(selected_filter) > 0 else gr.update()
 
 
 def bind_filter(controls: ModelOutputFilterControls, *, deps_factory: Callable, state, model_choice_target, current_model_type_getter: Callable):
@@ -127,7 +133,7 @@ def bind_filter(controls: ModelOutputFilterControls, *, deps_factory: Callable, 
         show_progress="hidden",
     )
     controls.refresh_trigger.change(
-        fn=render_filter_from_trigger,
+        fn=lambda refresh_value: render_filter_from_trigger(deps_factory(), refresh_value),
         inputs=[controls.refresh_trigger],
         outputs=[controls.html],
         trigger_mode="always_last",

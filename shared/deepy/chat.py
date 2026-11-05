@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import time
 import urllib.parse
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +17,11 @@ import markdown
 from markdown.extensions.tables import TableExtension, TableProcessor
 
 from shared.deepy import video_tools as deepy_video_tools
+from shared.utils.downloads import registered_download_path
 from shared.utils.gallery_media import gallery_media_ids
-from shared.utils.gallery_sources import MESH_EXTENSIONS
+from shared.utils.gallery_sources import APP_EXTENSIONS, MESH_EXTENSIONS
 from shared.utils.markdown import EscapeHtmlExtension
+from shared.utils.mesh_outputs import splat_viewer_options
 from shared.deepy.config import DEEPY_TYPE_PRIME, normalize_deepy_type
 
 
@@ -100,7 +104,7 @@ _DOWNLOAD_LINK_RE = re.compile(r"!?\[(?:\\.|`[^`\n]*`|[^\]\n])*\]\([^\n)]*\)")
 _GALLERY_MEDIA_ID_RE = re.compile(r"(?:visual|audio):[a-f0-9]{12}", re.IGNORECASE)
 _ABSOLUTE_PATH_START_RE = re.compile(r"(?<![\w:/])(?:[A-Za-z]:[\\/]|\\\\|/(?!/))")
 _TOOL_RESULT_PATH_KEYS = {"destination", "generated_files", "output_file", "output_files", "path", "paths", "source", "sources"}
-_DOWNLOAD_REFERENCE_LIMIT = 20
+_DOWNLOAD_REFERENCE_LIMIT = 100
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _AUDIO_THUMBNAIL_PATH = os.path.join(_REPO_ROOT, "icons", "soundwave.jpg")
 _ARCHIVE_THUMBNAIL_PATH = os.path.join(_REPO_ROOT, "icons", "zip.svg")
@@ -194,7 +198,7 @@ def _shell_markup(deepy_type: str = "", sessions: list[dict[str, Any]] | None = 
   </div>
   <div class="chat__status" aria-live="polite">
     <div class="chat__status-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-    <div class="chat__status-text"></div>
+    <div class="chat__status-main"><div class="chat__status-text"></div><div class="chat__status-detail" hidden></div><div class="chat__status-progress" hidden><span></span></div><div class="chat__status-sub" hidden></div></div>
     <button class="chat__status-pause" type="button" aria-label="Pause Deepy" disabled>Pause</button>
     <button class="chat__status-stop" type="button" aria-label="Stop Deepy" disabled>Stop</button>
   </div>
@@ -233,12 +237,12 @@ def render_settings_launcher_html() -> str:
 
 
 def get_css() -> str:
-    return '\n'.join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ('chat.css', 'workspaces.css', 'workspace_viewer.css'))
+    return '\n'.join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ('chat.css', 'workspaces.css', 'workspace_viewer.css', 'app_player.css'))
 
 
 def get_javascript() -> str:
     shared_scripts = '\n'.join((Path(__file__).parents[1] / 'gradio' / name).read_text(encoding='utf-8') for name in ('form_sync.js', 'generation_state.js'))
-    return shared_scripts + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "hybrid_transport.js"))
+    return shared_scripts + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "app_player.js", "hybrid_transport.js"))
 
 
 def _touch_chat(session) -> int:
@@ -276,8 +280,14 @@ def _control_aware_status(session, status: dict[str, Any] | None) -> dict[str, A
     return status
 
 
-def build_status_event(text: str | None, kind: str = "status", visible: bool = True, stats: dict[str, Any] | None = None, session=None) -> str:
+def build_status_event(text: str | None, kind: str = "status", visible: bool = True, stats: dict[str, Any] | None = None, session=None, detail: str | None = None, progress: dict[str, Any] | None = None, sub: str | None = None) -> str:
     status = None if not visible or not text else {"visible": True, "kind": str(kind or "status"), "text": str(text or "").strip()}
+    if status is not None and detail:
+        status["detail"] = str(detail).strip()
+    if status is not None and sub:  # second level: the tool a running Python script is calling
+        status["sub"] = " ".join(str(sub).split())
+    if status is not None and isinstance(progress, dict) and progress.get("total"):
+        status["progress"] = {"done": int(progress.get("done") or 0), "total": int(progress["total"])}
     status = _control_aware_status(session, status)
     if session is not None:
         session.chat_status = status
@@ -334,12 +344,18 @@ def _message_has_renderable_output(record: dict[str, Any]) -> bool:
     return str(record.get("role", "")).strip() != "assistant" or bool(_ensure_message_blocks(record)) or bool(record.get("attachments"))
 
 
-def pending_upload_count(session) -> int:
-    return sum(bool(item.get('chat_upload')) for item in session.pending_chat_media)
+def _chat_upload_attachments(media: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    # Uploads saved before they kept their path, or whose file is gone, have no card.
+    return [(item['media_id'], attachment) for item in media if item.get('chat_upload') and (attachment := _attachment_from_path(item.get('path', ''), item['title']))]
+
+
+def pending_uploads(session) -> list[dict[str, str]]:
+    """Composer previews of the chat uploads waiting for the next message."""
+    return [{'id': media_id, 'html': _render_pending_upload(media_id, attachment)} for media_id, attachment in _chat_upload_attachments(session.pending_chat_media)]
 
 
 def build_pending_upload_event(session) -> str:
-    return _event_payload({'type': 'pending_uploads', 'pending_upload_count': pending_upload_count(session)}, session, _touch_chat(session))
+    return _event_payload({'type': 'pending_uploads', 'pending_uploads': pending_uploads(session)}, session, _touch_chat(session))
 
 
 def build_sync_event(session, status: dict[str, Any] | None | object = _UNSET, stats: dict[str, Any] | None = None, acknowledged_submission_ids: list[str] | tuple[str, ...] | None = None) -> str:
@@ -352,7 +368,7 @@ def build_sync_event(session, status: dict[str, Any] | None | object = _UNSET, s
         messages = [_render_message_payload(record) for record in list(session.chat_transcript) if _message_has_renderable_output(record)]
         if revision == int(session.chat_revision or 0):
             break
-    event = {"type": "sync", "messages": messages, "status": status, "pending_upload_count": pending_upload_count(session)}
+    event = {"type": "sync", "messages": messages, "status": status, "pending_uploads": pending_uploads(session)}
     if stats is None:
         stored_stats = getattr(session, "remote_usage_stats", None)
         if isinstance(stored_stats, dict):
@@ -379,16 +395,16 @@ def _queued_tail_insert_index(session) -> int:
     return insert_index
 
 
-def add_user_message(session, text: str, queued: bool = False, client_submission_id: str | None = None) -> tuple[str, str]:
+def add_user_message(session, text: str, queued: bool = False, client_submission_id: str | None = None, media: list[dict[str, str]] | None = None, author: str = "You") -> tuple[str, str]:
     submission_id = str(client_submission_id or "").strip()[:128]
     record = {
         "id": _next_message_id(session, "user"),
         "role": "user",
-        "author": "You",
+        "author": author,
         "created_at": _time_label(),
         "blocks": [],
         "attachments": [],
-        "badge": "Queued" if queued else "",
+        "badge": "Queued" if queued else "" if author == "You" else author,
         "queued": bool(queued),
     }
     if submission_id:
@@ -397,8 +413,13 @@ def add_user_message(session, text: str, queued: bool = False, client_submission
     if len(content) > 0:
         record["blocks"].append({"id": _next_block_id("content"), "type": "markdown", "text": content})
     with session.turn_lock:
-        if session.pending_chat_media:
-            record["runtime_media"] = [{key: value for key, value in item.items() if key != 'chat_upload'} for item in session.pending_chat_media]
+        if media is not None:
+            # Media given with the message belong to it alone; pending uploads wait for the next one.
+            if media:
+                record["runtime_media"] = media
+        elif session.pending_chat_media:
+            record["runtime_media"] = [{key: value for key, value in item.items() if key not in ('chat_upload', 'path')} for item in session.pending_chat_media]
+            record["attachments"] = [attachment for _media_id, attachment in _chat_upload_attachments(session.pending_chat_media)]
             session.pending_chat_media = []
         session.chat_transcript.append(record)
     revision = _touch_chat(session)
@@ -723,7 +744,7 @@ def _message_index(session, record: dict[str, Any]) -> int:
 def _message_upsert_event(session, record: dict[str, Any], revision: int) -> str:
     event = {"type": "upsert_message", "message": _render_message_payload(record), "message_index": _message_index(session, record)}
     if record['role'] == 'user':
-        event['pending_upload_count'] = pending_upload_count(session)
+        event['pending_uploads'] = pending_uploads(session)
     return _event_payload(event, session, revision)
 
 
@@ -881,7 +902,7 @@ def build_io_tool_call_label(action: str | None = None, arguments: dict[str, Any
     action_name = str(action or "").strip()
     if not action_name:
         return "List IO Tools"
-    action_label = {"list": "List Files", "info": "Get File Information", "read_text": "Read Text", "search_text": "Search Text", "write_text": "Write Text", "write_artifact_text": "Compile Artifact", "mkdir": "Create Directory", "copy": "Copy File", "move": "Move File or Directory", "delete": "Delete File or Directory", "zip": "Create ZIP", "unzip": "Extract ZIP", "download": "Prepare Download"}.get(action_name, _humanize_tool_value(action_name))
+    action_label = {"list": "List Files", "info": "Get File Information", "read_text": "Read Text", "search_text": "Search Text", "write_text": "Write Text", "mkdir": "Create Directory", "copy": "Copy File", "move": "Move File or Directory", "delete": "Delete File or Directory", "zip": "Create ZIP", "unzip": "Extract ZIP", "download": "Prepare Download"}.get(action_name, _humanize_tool_value(action_name))
     if arguments is None:
         return _finish_tool_call_label(f"Get {action_label} Schema")
 
@@ -912,8 +933,6 @@ def build_io_tool_call_label(action: str | None = None, arguments: dict[str, Any
         mode = str(arguments.get("mode", "create") or "create").casefold()
         verb = "Append to" if mode == "append" else "Create" if mode == "create" else "Overwrite"
         return _finish_tool_call_label(f"{verb} Text File{f' {source}' if source else ''}")
-    if action_name == "write_artifact_text":
-        return _finish_tool_call_label(f"Compile Artifact to Text File{f' {source}' if source else ''}")
     if action_name == "mkdir":
         return _finish_tool_call_label(action_label if not source else f"{action_label} {source}")
     if action_name == "copy":
@@ -1040,7 +1059,7 @@ def build_tool_call_label(
         return _finish_tool_call_label(f"Create{details} {color or 'Color'} Frame")
     if normalized_name == "inspect_video":
         source = _short_tool_label_value(arguments.get("media_id"))
-        start_time, end_time = arguments.get("start_time_seconds"), arguments.get("end_time_seconds")
+        start_time, end_time = arguments.get("start_s", arguments.get("start_time_seconds")), arguments.get("end_s", arguments.get("end_time_seconds"))  # labels see the raw call: former names too
         try:
             range_label = f" from {float(start_time):g}s to {float(end_time):g}s"
         except (TypeError, ValueError):
@@ -1063,7 +1082,7 @@ def build_tool_call_label(
             extension = os.path.splitext(source_basename)[1].casefold()
             if extension in _IMAGE_EXTENSIONS:
                 images += 1
-            elif extension in _VIDEO_EXTENSIONS or isinstance(item, dict) and any(item.get(key) is not None for key in ("frame_no", "time_seconds")):
+            elif extension in _VIDEO_EXTENSIONS or isinstance(item, dict) and any(item.get(key) is not None for key in ("frame_no", "time_s", "time_seconds")):
                 frames += 1
                 if extension in _VIDEO_EXTENSIONS:
                     video_names.append(source_name)
@@ -1139,7 +1158,10 @@ def build_tool_call_label(
         return _finish_tool_call_label("Resolve Media" if not reference else f"Resolve {reference}{f' {kind}' if kind and kind.casefold() != 'all' else ''}")
     if normalized_name == "mcp_resource":
         server = _short_tool_label_value(arguments.get("server"))
-        target = _humanize_tool_value(arguments.get("uri"))
+        uri = str(arguments.get("uri") or "")
+        target = _humanize_tool_value(uri)
+        kind = "Skill" if "://skills/" in uri else "Guide" if "://guides/" in uri else ""  # a skill and a guide can share a name (long-video)
+        target = f"{target} {kind}" if target and kind else target
         if not target:
             return _finish_tool_call_label("List MCP Documents" if not server else f"List {server} Documents")
         query = _short_tool_label_value(arguments.get("query"))
@@ -1231,14 +1253,56 @@ def _event_payload(event: dict[str, Any], session=None, revision: int | None = N
     return json.dumps({"event_id": uuid.uuid4().hex, "instance_id": SERVER_INSTANCE_ID, "event": payload}, ensure_ascii=False)
 
 
+_BARE_URL_RE = re.compile(r"(?<!\]\()(?<![\[<\"'=/A-Za-z0-9])https?://[^\s<>\[\]`\"']+")  # not a markdown link's text or target, nor an attribute
+_CODE_SEGMENT_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.DOTALL)
+
+
+def _autolink_bare_urls(text: str) -> str:
+    """Bare http(s) addresses in prose become markdown autolinks (opened in a new tab below); code, links and HTML attributes are left alone."""
+    def link(match: re.Match) -> str:
+        url = match.group(0)
+        trailing = ""
+        while url and (url[-1] in ".,;:!?*_" or (url[-1] == ")" and url.count("(") < url.count(")"))):
+            url, trailing = url[:-1], url[-1] + trailing
+        return f"<{url}>{trailing}" if url else match.group(0)
+
+    parts = _CODE_SEGMENT_RE.split(text)
+    return "".join(part if index % 2 else _BARE_URL_RE.sub(link, part) for index, part in enumerate(parts))
+
+
+_MEDIA_LINK_RE = re.compile(r'<a href="(/wangp_api/(?:gallery/media/[^"]+|download/[a-f0-9]+))"[^>]*>')
+
+
+def _splat_link_attributes(path: str) -> str:
+    """How the viewer opens a splat file linked from a chat, for the media view of the Web app."""
+    if os.path.splitext(path)[1].lower() != ".ply":
+        return ""
+    options = splat_viewer_options(path)
+    return f" data-media-navigation='{options['navigation']}'" + (f" data-media-walk-start='{options['walk_start']}'" if options["walk_start"] else "") + (" data-media-level='free'" if options["level"] else "")
+
+
+def _media_link(match: re.Match) -> str:
+    href = match[1]
+    path = registered_download_path(html.unescape(href)) or ""
+    kind = _attachment_kind(path)
+    if kind in {"image", "video", "audio", "3d"}:
+        media_format = f' data-media-format="{html.escape(os.path.splitext(path)[1][1:].lower())}"{_splat_link_attributes(path)}' if kind == "3d" else ""
+        return f'<a href="{href}" target="_blank" rel="noopener" data-media-kind="{kind}"{media_format}>'
+    return f'<a href="{href}" download>' if href.startswith("/wangp_api/download/") else f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
+
+
+def media_link_attributes(markup: str) -> str:
+    """Media links in replies open like their thumbnails (new tab or media viewer); other files are downloaded. Also applied to saved replies."""
+    return _MEDIA_LINK_RE.sub(_media_link, markup)
+
+
 def _markdown_to_html(text: str) -> str:
     text = str(text or "").strip()
     if len(text) == 0:
         return ""
-    rendered = markdown.markdown(text, extensions=_MARKDOWN_EXTENSIONS, output_format="html5")
+    rendered = markdown.markdown(_autolink_bare_urls(text), extensions=_MARKDOWN_EXTENSIONS, output_format="html5")
     rendered = re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
-    rendered = re.sub(r'<a href="(/wangp_api/gallery/media/[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
-    rendered = re.sub(r'<a href="(/wangp_api/download/[a-f0-9]+)"', r'<a href="\1" download', rendered)
+    rendered = media_link_attributes(rendered)
     # Add wrap opportunities to visible prose, never HTML attributes or code.
     return re.sub(r"(<pre\b[^>]*>.*?</pre>|<code\b[^>]*>.*?</code>|<[^>]*>)|_", lambda match: match[1] or "_<wbr>", rendered, flags=re.DOTALL)
 
@@ -1473,8 +1537,6 @@ def _structured_tool_presentation(tool_record: dict[str, Any], file_access_polic
     if not isinstance(result, dict):
         return None
     rows = result.get("entries") if isinstance(result.get("entries"), list) else result.get("items") if isinstance(result.get("items"), list) else None
-    if rows is None and str(tool_record.get("name", "")) == "wangp_artifact" and isinstance(result.get("data"), dict):
-        rows = [{"field": key, "value": value} for key, value in result["data"].items()]
     if not rows or not all(isinstance(row, dict) for row in rows):
         return None
     preferred = ["index", "name", "title", "path", "type", "duration_seconds", "size_bytes", "modified", "outline", "prompt", "content", "field", "value"]
@@ -1594,11 +1656,37 @@ def _attachments_from_tool_result(result: dict[str, Any] | None, file_access_pol
         if not output_file or path_key in seen_paths:
             continue
         seen_paths.add(path_key)
-        label = {"image": "Generated image", "video": "Generated video", "audio": "Generated audio", "3d": "Generated 3D asset"}.get(_attachment_kind(output_file), "Generated file")
+        label = {"image": "Generated image", "video": "Generated video", "audio": "Generated audio", "3d": "Generated 3D asset", "app": "Web app"}.get(_attachment_kind(output_file), "Generated file")
         attachment = _attachment_from_path(output_file, label)
         if attachment is not None:
             attachments.append(attachment)
+    for item in result.get("apps") or []:  # web apps a Python run created or changed: played from their sandbox folder
+        folder = _resolved_folder(item.get("folder") if isinstance(item, dict) else None, file_access_policy)
+        if folder:
+            thumbnail = _physical_attachment_path(item.get("thumbnail"), file_access_policy) if item.get("thumbnail") else ""
+            version = str(item.get("version", ""))
+            attachments.append({"kind": "app", "app_kind": "dev", "path": folder, "path_key": f"app:{os.path.normcase(folder)}:{version}", "href": "#", "label": str(item.get("name") or item.get("app") or "Web app"),
+                                "subtitle": "Web app · click to play", "thumb_path": thumbnail, "app_version": version})
+    for preview in result.get("previews") or []:  # Markdown, tables, JSON, SVG (and pages when web apps are on) written under out/
+        path = _physical_attachment_path(preview, file_access_policy)
+        if path and os.path.isfile(path):
+            page = Path(path).suffix.lower() in (".html", ".htm")
+            version = str(int(os.path.getmtime(path)))
+            attachments.append({"kind": "page" if page else "document", "path": path, "path_key": f"preview:{os.path.normcase(path)}:{version}", "href": "#", "label": os.path.basename(path),
+                                "subtitle": "Page · click to open" if page else "Click to preview", "thumb_path": path if path.lower().endswith(".svg") else "", "app_version": version})
     return attachments
+
+
+def _resolved_folder(value: Any, file_access_policy=None) -> str:
+    path = str(value or "").strip()
+    if not path:
+        return ""
+    if file_access_policy is not None:
+        try:
+            path = str(file_access_policy.resolve_path(path))
+        except (OSError, PermissionError, ValueError):
+            return ""
+    return path if os.path.isdir(path) else ""
 
 
 def _attachment_from_tool_result(result: dict[str, Any] | None, file_access_policy=None) -> dict[str, Any] | None:
@@ -1628,7 +1716,10 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
     normalized_path = os.path.normpath(normalized_path).replace("\\", "/")
     path_key = normalized_path.lower()
     from shared.utils.downloads import register_file_download
-    href = register_file_download(normalized_path)["url"]
+    try:
+        href = register_file_download(normalized_path)["url"]
+    except FileNotFoundError:  # a path the model wrote that is not a local file here (an @alias path, a typo): no attachment, never a broken chat
+        return None
     ext = os.path.splitext(normalized_path)[1].lower()
     resolved_label = str(label or os.path.basename(normalized_path) or "Open file").strip()
     subtitle = os.path.basename(normalized_path)
@@ -1647,7 +1738,7 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
         thumb_url = _audio_thumbnail_url()
     elif ext in MESH_EXTENSIONS and os.path.isfile(os.path.splitext(normalized_path)[0] + '.png'):
         thumb_url = href + '/thumbnail'
-    return {
+    attachment = {
         "path_key": path_key,
         "path": normalized_path,
         "href": href,
@@ -1656,6 +1747,9 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
         "kind": kind,
         "thumb_url": thumb_url,
     }
+    if kind == "app":  # a published .wgpapp: played in the app player, its thumbnail beside it
+        attachment.update(app_kind="package", download=os.path.basename(normalized_path), thumb_path=os.path.splitext(normalized_path)[0] + ".png", subtitle="Web app · click to play")
+    return attachment
 
 
 def _attachment_kind(path: str, default: str = "file") -> str:
@@ -1670,6 +1764,8 @@ def _attachment_kind(path: str, default: str = "file") -> str:
         return "audio"
     if ext in MESH_EXTENSIONS:
         return "3d"
+    if ext in APP_EXTENSIONS:
+        return "app"
     return "file" if ext else default
 
 
@@ -1685,7 +1781,7 @@ def _bundled_thumbnail_url(thumbnail_path: str) -> str:
     return register_file_download(path)["url"]
 
 
-def _attachment_icon(kind: str) -> str:
+def _attachment_icon(kind: str, hidden: bool = False) -> str:
     icons = {
         "archive": "<rect x='4' y='6' width='40' height='10' rx='2'></rect><path d='M8 16v22a4 4 0 0 0 4 4h24a4 4 0 0 0 4-4V16'></path><path d='M19 25h10'></path>",
         "audio": "<path d='M18 36V13l19-4v23'></path><path d='M18 19l19-4'></path><ellipse cx='13' cy='37' rx='5' ry='4'></ellipse><ellipse cx='32' cy='33' rx='5' ry='4'></ellipse>",
@@ -1693,10 +1789,13 @@ def _attachment_icon(kind: str) -> str:
         "image": "<rect x='6' y='8' width='36' height='32' rx='4'></rect><circle cx='17' cy='19' r='3'></circle><path d='m10 35 9-9 6 6 5-5 8 8'></path>",
         "video": "<rect x='6' y='10' width='36' height='28' rx='4'></rect><path d='m20 18 11 6-11 6z'></path>",
         "3d": "<path d='m24 6 16 9v18L24 42 8 33V15l16-9ZM8 15l16 9 16-9M24 24v18'></path>",
+        "app": "<rect x='5' y='13' width='38' height='22' rx='11'></rect><path d='M15 20v8M11 24h8'></path><circle cx='31' cy='21' r='1.6'></circle><circle cx='35' cy='27' r='1.6'></circle>",
+        "document": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M18 21h12M18 27h12M18 33h8'></path>",
+        "page": "<rect x='6' y='8' width='36' height='32' rx='3'></rect><path d='M6 15h36M17 25l-5 4 5 4M31 25l5 4-5 4M26 22l-4 14'></path>",
         "file": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M19 23h10M19 29h10M19 35h7'></path>",
     }
     icon_kind = kind if kind in icons else "file"
-    return f"<div class='chat__attachment-thumb chat__attachment-thumb--icon chat__attachment-thumb--{icon_kind}' data-attachment-icon='{icon_kind}'><svg viewBox='0 0 48 48' aria-hidden='true' focusable='false'>{icons[icon_kind]}</svg></div>"
+    return f"<div class='chat__attachment-thumb chat__attachment-thumb--icon chat__attachment-thumb--{icon_kind}' data-attachment-icon='{icon_kind}'{' hidden' if hidden else ''}><svg viewBox='0 0 48 48' aria-hidden='true' focusable='false'>{icons[icon_kind]}</svg></div>"
 
 
 def _render_copy_button(source: str, label: str, text: str | None = None) -> str:
@@ -1769,7 +1868,9 @@ def _render_message_payload(record: dict[str, Any]) -> dict[str, Any]:
         ]
     )
     copy_text = "\n\n".join(str(block.get("text", "")).strip() for block in _ensure_message_blocks(record) if isinstance(block, dict) and block.get("type") == "markdown" and len(str(block.get("text", "")).strip()) > 0)
-    return _compose_message_payload(record, f"{blocks_html}{attachments_html}", copy_text)
+    # A request shows its uploads above its text, as messaging apps do.
+    body_html = f"{attachments_html}{blocks_html}" if record.get("role") == "user" else f"{blocks_html}{attachments_html}"
+    return _compose_message_payload(record, body_html, copy_text)
 
 
 def _render_message_blocks(record: dict[str, Any]) -> tuple[str, set[str]]:
@@ -1882,9 +1983,83 @@ def _render_context_summary_block(block: dict[str, Any], streaming: bool | None 
     )
 
 
+def _short_duration(seconds: Any) -> str:
+    if 0 <= float(seconds or 0) < 10:
+        return f"{float(seconds or 0):.1f} s"
+    seconds = max(0, int(round(float(seconds or 0))))
+    return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min {seconds % 60:02d} s" if seconds < 3600 else f"{seconds // 3600} h {seconds % 3600 // 60:02d}"
+
+
+def _python_section(title: str, body: str, copy_button: str = "", extra_class: str = "") -> str:
+    actions = f"<span class='chat__tool-section-actions'>{copy_button}</span>" if copy_button else ""
+    return f"<div class='chat__tool-json{extra_class}'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>{title}</div>{actions}</div>{body}</div>"
+
+
+def _render_python_live(summary: dict[str, Any]) -> str:
+    """The live part of a running Python script: elapsed time, progress, tool activity and the last printed lines, as text."""
+    facts = [f"Elapsed {_short_duration(summary.get('elapsed_s'))}"]
+    progress = summary.get("progress") if isinstance(summary.get("progress"), dict) else {}
+    if progress.get("total"):
+        facts.append(f"{progress.get('done', 0)} / {progress['total']}" + (f", {_short_duration(progress['eta_s'])} left" if progress.get("eta_s") is not None else ""))
+    calls = summary.get("tool_calls") if isinstance(summary.get("tool_calls"), dict) else {}
+    if calls.get("count"):
+        facts.append(f"{calls['count']} tool call{'s' if calls['count'] > 1 else ''}" + (f", {calls['seconds_each']} s each" if calls.get("seconds_each") else "") + (f", {calls['errors']} failed" if calls.get("errors") else ""))
+    rows = [" · ".join(facts)]
+    if summary.get("current"):
+        rows.append("Now: " + str(summary["current"]) + (f" ({summary['step']})" if summary.get("step") else ""))
+    last = summary.get("last") if isinstance(summary.get("last"), dict) else {}
+    if last:
+        rows.append("Last: " + ": ".join(str(part) for part in (last.get("item") or last.get("tool"), last.get("outcome")) if part))
+    lines = [str(line) for line in summary.get("stdout_tail") or []]
+    output = f"<pre class='chat__pre chat__tool-stdout'>{html.escape(chr(10).join(lines))}</pre>"  # always present (hidden while empty): the browser updates it in place
+    status = f"<pre class='chat__pre chat__tool-live-meta'>{html.escape(chr(10).join(rows))}</pre>"
+    return f"<div class='chat__tool-stack' data-live-output='1'>{_python_section('Status', status, extra_class=' chat__tool-live')}{_python_section('Output', output, _render_copy_button('stdout', 'Copy output'))}</div>"
+
+
+def _render_python_result(result: dict[str, Any], status: str) -> str:
+    """A finished Python run, as the column beside its arguments: Status (time, tool calls, published media, files, notes), Output (what it printed
+    or raised) and Result (the rest of the run's result, without its printed output), the last two with their own copy button."""
+    state = str(result.get("status") or status)
+    verb = {"done": "Done", "error": "Failed", "interrupted": "Stopped", "timeout": "Timed out"}.get(state, state.title() or "Done")
+    facts = [f"{verb} after {_short_duration(result.get('elapsed_s'))}"] if result.get("elapsed_s") is not None else [verb]
+    calls = result.get("tool_calls") if isinstance(result.get("tool_calls"), dict) else {}
+    if calls.get("count"):
+        facts.append(f"{calls['count']} tool call{'s' if calls['count'] > 1 else ''}" + (f", {calls['errors']} failed" if calls.get("errors") else ""))
+    progress = result.get("progress") if isinstance(result.get("progress"), dict) else {}
+    if progress.get("total"):
+        facts.append(f"{progress.get('done', 0)} / {progress['total']}")
+    rows = [" · ".join(facts)]
+    outputs = [item for item in result.get("outputs") or [] if isinstance(item, dict)]
+    if outputs:
+        rows.append("Published: " + ", ".join(os.path.basename(str(item.get("path") or item.get("source") or item.get("media_id") or "")) for item in outputs))
+    files = [str(path) for path in result.get("files") or []]
+    if files:
+        rows.append("Files: " + ", ".join(files[:6]) + (f" (+{len(files) - 6})" if len(files) > 6 else ""))
+    for key in ("restarted", "hint", "next"):
+        if isinstance(result.get(key), str) and result[key]:
+            rows.append(result[key])
+    parts = []
+    if result.get("stdout"):
+        parts.append(str(result["stdout"]).rstrip("\n"))
+    elif result.get("last_output"):
+        parts.append("Last output before the stop:\n" + "\n".join(str(line) for line in result["last_output"]))
+    if result.get("stderr"):
+        parts.append("stderr:\n" + str(result["stderr"]).rstrip("\n"))
+    if result.get("error"):
+        parts.append(str(result["error"]) + "".join(f"\n  {line}" for line in result.get("traceback") or []))
+    printed = {"stdout", "last_output", "stderr", "error", "traceback"}  # shown under Output
+    remaining = json.dumps({key: value for key, value in result.items() if key not in printed}, ensure_ascii=False, indent=2, sort_keys=True)
+    status_block = _python_section("Status", f"<pre class='chat__pre chat__tool-live-meta'>{html.escape(chr(10).join(rows))}</pre>", extra_class=" chat__tool-live")
+    output_block = _python_section("Output", f"<pre class='chat__pre chat__tool-stdout'>{html.escape(chr(10).join(parts))}</pre>", _render_copy_button("stdout", "Copy output")) if parts else ""
+    result_block = _python_section("Result", f"<pre class='chat__pre'>{html.escape(remaining)}</pre>", _render_copy_button("json", "Copy result"), " chat__tool-result")
+    return f"<div class='chat__tool-stack'>{status_block}{output_block}{result_block}</div>"
+
+
 def _render_tool_block(tool_record: dict[str, Any], attachment_html: str = "") -> str:
     name = str(tool_record.get("name", "tool")).strip() or "tool"
     label = _clean_display_filename(str(tool_record.get("label", "")).strip()) or _friendly_tool_label(name)
+    if name == "wangp_python":  # the Python chip already says it ("Run Python: " in sessions saved before 2026-10-23)
+        label = label.removeprefix("Run Python: ").removeprefix("Python: ")
     status = str(tool_record.get("status", "running")).strip().lower()
     status_label = str(tool_record.get("status_text", "")).strip() or {"running": "Running", "done": "Done", "error": "Error"}.get(status, status.title() or "Running")
     status_class = {"running": "running", "done": "done", "error": "error", "interrupted": "interrupted"}.get(status, "running")
@@ -1893,6 +2068,14 @@ def _render_tool_block(tool_record: dict[str, Any], attachment_html: str = "") -
     label_html = html.escape(label).replace("_", "_<wbr>")
     status_html = html.escape(_clean_display_filename(status_label)).replace("_", "_<wbr>")
     request_pending = bool(tool_record.get("request_pending", False))
+    chip = "Python" if name == "wangp_python" else "Tool"
+    progress_html = ""
+    live = tool_record.get("result") if status == "running" and isinstance(tool_record.get("result"), dict) else {}
+    progress = live.get("progress") if isinstance(live.get("progress"), dict) else {}
+    if progress.get("total"):
+        done, total = int(progress.get("done") or 0), int(progress["total"])
+        percent = max(0.0, min(100.0, 100.0 * done / total)) if total > 0 else 0.0
+        progress_html = f"<span class='chat__tool-progress' role='progressbar' aria-valuemin='0' aria-valuemax='{total}' aria-valuenow='{done}'><span style='width:{percent:.1f}%'></span></span>"
     arguments_text = html.escape(json.dumps(tool_record.get("arguments", {}), ensure_ascii=False, indent=2, sort_keys=True))
     result_payload = tool_record.get("result", {})
     result_text = html.escape(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True)) if result_payload is not None else ""
@@ -1900,24 +2083,71 @@ def _render_tool_block(tool_record: dict[str, Any], attachment_html: str = "") -
     result_copy_button = "" if result_payload is None else _render_copy_button("json", "Copy result")
     presentation_html = _render_structured_tool_presentation(tool_record.get("presentation"))
     pending_body = "<div class='chat__disclosure-body'><div class='chat__tool-json chat__tool-pending'>Deepy is preparing the tool request.</div></div>"
-    completed_body = (
-        "<div class='chat__disclosure-body'>"
-        "<div class='chat__tool-grid'>"
-        f"<div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>{html.escape(label)} Arguments</div>{arguments_copy_button}</div><pre class='chat__pre'>{arguments_text}</pre></div>"
-        f"<div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>Result</div>{result_copy_button}</div><pre class='chat__pre'>{result_text or html.escape('Pending...')}</pre></div>"
-        "</div>"
-        f"{presentation_html}"
-        f"{_render_collapse_button('tool')}"
-        "</div>"
-    )
+    if name == "wangp_python" and status == "running" and isinstance(result_payload, dict):  # a running script: its output as text, updated in place
+        arguments_html = f"<div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>{html.escape(label)} Arguments</div>{arguments_copy_button}</div><pre class='chat__pre'>{arguments_text}</pre></div>"
+        static_key = hashlib.sha1(arguments_text.encode("utf-8")).hexdigest()[:12]
+        completed_body = (
+            f"<div class='chat__disclosure-body' data-static-key='{static_key}'>"
+            f"<div class='chat__tool-grid'>{arguments_html}{_render_python_live(result_payload)}</div>"
+            f"{_render_collapse_button('tool')}"
+            "</div>"
+        )
+    elif name == "wangp_python" and isinstance(result_payload, dict) and result_payload and isinstance((tool_record.get("arguments") or {}).get("arguments"), dict) and "code" in tool_record["arguments"]["arguments"]:
+        completed_body = (  # a finished run: its arguments beside its status, printed output and result
+            "<div class='chat__disclosure-body'>"
+            f"<div class='chat__tool-grid'><div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>{html.escape(label)} Arguments</div>{arguments_copy_button}</div><pre class='chat__pre'>{arguments_text}</pre></div>"
+            f"{_render_python_result(result_payload, status)}</div>"
+            f"{presentation_html}"
+            f"{_render_collapse_button('tool')}"
+            "</div>"
+        )
+    else:
+        completed_body = (
+            "<div class='chat__disclosure-body'>"
+            "<div class='chat__tool-grid'>"
+            f"<div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>{html.escape(label)} Arguments</div>{arguments_copy_button}</div><pre class='chat__pre'>{arguments_text}</pre></div>"
+            f"<div class='chat__tool-json'><div class='chat__tool-section-header'><div class='chat__tool-section-title'>Result</div>{result_copy_button}</div><pre class='chat__pre'>{result_text or html.escape('Pending...')}</pre></div>"
+            "</div>"
+            f"{presentation_html}"
+            f"{_render_collapse_button('tool')}"
+            "</div>"
+        )
     details = (
         f"<details class='chat__disclosure chat__disclosure--tool' data-tool-id='{html.escape(str(tool_record.get('id', '')))}'>"
-        f"<summary><span class='chat__tool-title'><span class='chat__tool-chip'>Tool</span><span>{label_html}</span></span><span class='chat__tool-status chat__tool-status--{status_class}'>{status_html}</span></summary>"
+        f"<summary><span class='chat__tool-title'><span class='chat__tool-chip'>{chip}</span><span>{label_html}</span></span><span class='chat__tool-status chat__tool-status--{status_class}'>{status_html}</span>{progress_html}</summary>"
         f"{pending_body if request_pending else completed_body}"
         "</details>"
     )
     block_id = html.escape(str(tool_record.get("id", "")), quote=True)
     return f"<div class='chat__tool-block' data-block-id='{block_id}' data-block-type='tool'>{details}{attachment_html}</div>"
+
+
+def _render_app_attachment(attachment: dict[str, Any]) -> str:
+    """A Play card: the app player opens it in an isolated frame (shared.apps.server). The registration is repeated at each rendering, so the
+    cards of a saved conversation work again after a restart; apps and pages are only shown while web apps are enabled."""
+    from shared.apps import server as apps_server
+    from shared.deepy.config import python_apps_level
+    from shared.utils.downloads import register_file_download
+
+    kind, path = str(attachment["kind"]), Path(str(attachment.get("path") or ""))
+    if kind != "document" and python_apps_level() == "off":
+        return ""
+    try:
+        app_id = apps_server.register_dev(path) if attachment.get("app_kind") == "dev" else apps_server.register_package(path) if kind == "app" else apps_server.register_file(path)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):  # moved or deleted since: no card
+        return ""
+    version = html.escape(str(attachment.get("app_version", "")), quote=True)
+    thumb_path = str(attachment.get("thumb_path") or "")
+    thumb_url = register_file_download(thumb_path)["url"] + f"?v={version}" if thumb_path and os.path.isfile(thumb_path) else ""
+    label = html.escape(str(attachment.get("label") or "Web app"))
+    subtitle = html.escape(str(attachment.get("subtitle") or ""))
+    thumb_html = f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>" if thumb_url else _attachment_icon(kind)
+    download = str(attachment.get("download") or "")
+    download_attributes = f" data-download-url='{html.escape(str(attachment.get('href')), quote=True)}' data-download='{html.escape(download, quote=True)}'" if download else ""
+    play = "<span class='chat__attachment-play' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M8 5v14l11-7z'></path></svg></span>" if kind != "document" else ""
+    subtitle_html = f"<span class='chat__attachment-subtitle'>{subtitle}</span>" if subtitle else ""
+    return (f"<a class='chat__attachment chat__attachment--app' data-media-kind='{kind}' data-app-id='{app_id}' data-app-version='{version}'{download_attributes} href='#' role='button' title='{label}'>"
+            f"{thumb_html}{play}<span class='chat__attachment-meta'><span class='chat__attachment-title'>{label}</span>{subtitle_html}</span></a>")
 
 
 def _render_attachments(attachments: list[dict[str, Any]]) -> str:
@@ -1928,17 +2158,20 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
         href = str(attachment.get("href", "")).strip()
         if len(href) == 0:
             continue
+        if attachment.get("kind") in ("app", "document", "page"):
+            cards.append(_render_app_attachment(attachment))
+            continue
         label = html.escape(str(attachment.get("label", "Open file")))
         subtitle = html.escape(str(attachment.get("subtitle", "")))
         download_name = str(attachment.get("download", "")).strip()
         media_format = os.path.splitext(str(attachment.get('path') or download_name))[1].lower()
         # Reclassify retained attachments too: older conversations stored meshes as generic files.
         kind = '3d' if media_format in MESH_EXTENSIONS else str(attachment.get('kind', 'file'))
-        format_attribute = f" data-media-format='{html.escape(media_format[1:])}'" if kind == '3d' else ''
+        format_attribute = f" data-media-format='{html.escape(media_format[1:])}'{_splat_link_attributes(str(attachment.get('path') or download_name))}" if kind == '3d' else ''
         thumb_url = str(attachment.get("thumb_url", "")).strip()
         subtitle_html = f"<span class='chat__attachment-subtitle'>{subtitle}</span>" if len(subtitle) > 0 else ""
-        thumb_html = (
-            f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>"
+        thumb_html = (  # the typed icon waits beside a preview, which chat.js swaps for it when the preview cannot be made (an unreadable video)
+            f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>{_attachment_icon(kind.strip().lower(), hidden=True)}"
             if len(thumb_url) > 0
             else _attachment_icon(kind.strip().lower())
         )
@@ -1955,3 +2188,16 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
     if len(cards) == 0:
         return ""
     return f"<div class='chat__attachments'>{''.join(cards)}</div>"
+
+
+def _render_pending_upload(media_id: str, attachment: dict[str, Any]) -> str:
+    label = html.escape(attachment["label"])
+    kind = html.escape(attachment["kind"])
+    thumb_url = attachment["thumb_url"]
+    thumb_html = f"<img class='chat__attachment-thumb' src='{html.escape(thumb_url)}' alt=''>{_attachment_icon(attachment['kind'], hidden=True)}" if thumb_url else _attachment_icon(attachment["kind"])
+    return (
+        f"<span class='chat__pending-upload' title='{label}'>"
+        f"<a class='chat__pending-upload-link' data-media-kind='{kind}' href='{html.escape(attachment['href'])}' target='_blank' rel='noopener'>{thumb_html}<span class='chat__attachment-title' hidden>{label}</span></a>"
+        f"<button type='button' data-unattach='{html.escape(media_id)}' aria-label='Remove {label}'>×</button>"
+        "</span>"
+    )

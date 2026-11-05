@@ -304,7 +304,7 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             text_input_ids = text_inputs.input_ids.to(device)
             prompt_masks = text_inputs.attention_mask.to(device).bool()
             with text_encoding_progress(self.text_encoder.model.layers, prompt_count=len(prompts)):
-                prompt_embeds = self.text_encoder(input_ids=text_input_ids, attention_mask=prompt_masks, output_hidden_states=True).hidden_states[-2]
+                prompt_embeds = self.text_encoder.model(input_ids=text_input_ids, attention_mask=prompt_masks, output_hidden_states=True).hidden_states[-2]
             embeddings_list = []
             for i in range(len(prompt_embeds)):
                 embeddings_list.append(prompt_embeds[i][prompt_masks[i]])

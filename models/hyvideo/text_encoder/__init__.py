@@ -197,6 +197,11 @@ class TextEncoder(nn.Module):
             else:
                 self.model= offload.fast_load_transformers_model(self.model_path, modelPrefix="language_model", forcedConfigPath = fl.locate_file("llava-llama-3-8b/config.json"), writable_tensors=False)
                 self.model.final_layer_norm = self.model.model.norm
+            from mmgp import runtime
+            # the 1 GB token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the 1 GB output head, which never runs: the
+            # hidden states come from the base model
+            runtime.lookup_on_cpu(self.model.get_input_embeddings())
+            runtime.unused(self.model.get_output_embeddings())
         
         else:
             self.model= offload.fast_load_transformers_model(fl.locate_file("clip_vit_large_patch14/model.safetensors"), ignore_unused_weights= True, modelClass=CLIPTextModel, forcedConfigPath = fl.locate_file("clip_vit_large_patch14/text_config.json"), writable_tensors=False)
@@ -345,7 +350,7 @@ class TextEncoder(nn.Module):
                         output_hidden_states=output_hidden_states or hidden_state_skip_layer is not None)
             else:
                 with text_encoding_progress(self.model.language_model.model.layers if "i2v" in self.text_encoder_type else self.model.model.layers if "llm" in self.text_encoder_type else self.model.text_model.encoder.layers, prompt_count=batch_encoding["input_ids"].shape[0]):
-                    outputs = self.model(
+                    outputs = (self.model.model if self.text_encoder_type == "llm" else self.model)(
                     input_ids=batch_encoding["input_ids"].to(self.model.device),
                     attention_mask=attention_mask,
                     output_hidden_states=output_hidden_states or hidden_state_skip_layer is not None,)

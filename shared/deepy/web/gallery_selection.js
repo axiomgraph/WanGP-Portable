@@ -5,14 +5,51 @@
     const value = document.querySelector('#wangp-gallery-view textarea')?.value;
     return value ? JSON.parse(value) : null;
   }
-  let sequence = 0, pendingView = null, acceptedView = null;
+  let sequence = 0, pendingView = null, acceptedView = null, viewing = null;
+  // `index`: position in the whole gallery `source`.
+  function request(state, source, index, path) {
+    pendingView = state;
+    window.__wangpAssistantChatNS.setBridgeValue('#wangp-gallery-interaction textarea', JSON.stringify({session: state.session, workspace: state.workspace, source, index, path, sequence: ++sequence}));
+  }
   function select(source, index = null) {
     const state = view();
     if (!state) return;
     const paths = state[source];
     if (index !== null && (index < 0 || index >= paths.length)) return;
-    pendingView = state;
-    window.__wangpAssistantChatNS.setBridgeValue('#wangp-gallery-interaction textarea', JSON.stringify({session: state.session, workspace: state.workspace, source, index: index === null ? null : index + state[source + '_offset'], path: index === null ? null : paths[index], sequence: ++sequence}));
+    request(state, source, index === null ? null : index + state[source + '_offset'], index === null ? null : paths[index]);
+  }
+  function selectedSource() {
+    const tab = document.querySelector('#wangp-gallery-tabs [role=tab][aria-selected=true]');
+    return tab ? tabSource(tab) : 'video';
+  }
+  // Enlarges the gallery once it shows the media requested by view(). Tabs hiding
+  // the gallery are displayed only while it is full screen, without selecting them.
+  function present() {
+    const item = viewing, state = acceptedView || view();
+    if (!item) return;
+    if (state.workspace !== item.workspace || state.video[state.selected] !== item.path) {
+      // Full screen needs the click's user activation, which expires.
+      if (performance.now() - item.requested > 5000) viewing = null;
+      return;
+    }
+    viewing = null;
+    const container = document.querySelector('#gallery .gallery-container');
+    const hosts = [];
+    for (let node = container.parentElement; node; node = node.parentElement) if (node.matches('.tabitem') && getComputedStyle(node).display === 'none') hosts.push(node);
+    hosts.forEach(node => node.classList.add('wangp-gallery-viewer-host'));
+    const focused = document.activeElement;
+    const close = () => {
+      if (document.fullscreenElement === container) return;
+      document.removeEventListener('fullscreenchange', close);
+      hosts.forEach(node => node.classList.remove('wangp-gallery-viewer-host'));
+      window.scrollTo(item.pageX, item.pageY);
+      if (selectedSource() !== item.source) select(item.source);
+      focused?.focus({preventScroll: true});
+      item.onClose();
+    };
+    document.addEventListener('fullscreenchange', close);
+    // The gallery's keyboard navigation listens on its preview, as after a click there.
+    container.requestFullscreen().then(() => container.querySelector('.preview')?.focus({preventScroll: true}), close);
   }
   // A gallery tab (or its entry in Gradio's overflow menu, which has no tab attributes) is identified by its label.
   function tabSource(tab, step = 0) {
@@ -32,7 +69,37 @@
       const accept = state.session !== pendingView?.session || state.workspace !== pendingView?.workspace || state.gallery_sequence >= sequence;
       // Several responses may share one Gradio flush, before its DOM updates.
       if (accept) acceptedView = state;
+      if (accept && viewing) requestAnimationFrame(present);
       return accept;
+    },
+    // Chat media in the gallery's own full-screen viewer: `item` ({workspace, index, path}) is selected as a
+    // thumbnail click would. Leaving full screen restores the page scroll and gallery tab, then calls onClose.
+    view(item, onClose) {
+      const state = view();
+      if (!state || state.workspace !== item.workspace) return false;
+      viewing = {...item, onClose, source: selectedSource(), requested: performance.now(), pageX: window.scrollX, pageY: window.scrollY};
+      if (state.video[state.selected] === item.path) present();
+      else request(state, 'video', item.index, item.path);
+      return true;
+    },
+    // A chat 3D asset in the 3D gallery's viewer (`markup`), full screen. The viewer exists only while it is
+    // full screen: removing it on leaving stops its rendering and releases its WebGL resources.
+    viewMesh(markup, onClose) {
+      const host = document.createElement('div');
+      host.innerHTML = markup;
+      const viewer = host.firstElementChild;
+      viewer.classList.add('wangp-chat-mesh-viewer');
+      const focused = document.activeElement;
+      const close = () => {
+        if (document.fullscreenElement === viewer) return;
+        document.removeEventListener('fullscreenchange', close);
+        viewer.remove();
+        focused?.focus({preventScroll: true});
+        onClose();
+      };
+      document.addEventListener('fullscreenchange', close);
+      document.body.append(viewer);
+      viewer.requestFullscreen().catch(close);
     }
   };
   function indexOf(thumb) {

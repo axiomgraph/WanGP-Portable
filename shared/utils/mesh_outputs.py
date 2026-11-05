@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """3D gallery files and their preview render `<stem>.png`:
-- meshes: GLB with the generation settings in the glTF `asset.extras["wangp"]`;
+- meshes: GLB with the generation settings in the glTF `asset.extras["wangp"]` and, with the Embed Source Images option, the source
+  pictures (lossless, alpha kept) in its binary chunk, listed in `asset.extras["wangp_source_images"]`;
 - Gaussian splats: INRIA 3DGS PLY with the settings in a `comment wangp <json>` header line. Every PLY in the 3D gallery is
   a splat file: mesh PLYs are converted to GLB on import.
 
@@ -8,11 +9,13 @@ The preview is the 3D gallery thumbnail and the image shown where a 3D asset can
 """
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from shared.utils.media_imports import persist_gallery_import
 
 SETTINGS_KEY = "wangp"
+SOURCE_IMAGES_KEY = "wangp_source_images"
 
 
 def preview_path(path):
@@ -43,6 +46,39 @@ def asset_summary(path):
     if animation and animation["frames"]:
         summary.update(frame_count=animation["frames"], fps=round(animation["fps"], 3) if animation["fps"] else None, duration_seconds=round(animation["duration"], 3))
     return summary
+
+
+def first_camera(path):
+    """Camera-to-world matrix (row-major 4x4, in the asset's axes) of the first view of a reconstructed scene, from the `_cameras.json`
+    saved beside it (a list of views, or a record holding them in "cameras"); None for an asset without one."""
+    cameras = Path(path).with_name(f"{Path(path).stem}_cameras.json")
+    if not cameras.is_file():
+        return None
+    views = json.loads(cameras.read_text(encoding="utf-8"))
+    return (views if isinstance(views, list) else views["cameras"])[0]["camera_to_world"]
+
+
+def splat_viewer_options(path):
+    """How the splat viewer opens a file (read once per version of the file): "navigation", the "mesh_navigation" of the model that made
+    it ("walk" for a scene to move through) or "orbit" for a model that declares none and for a file from elsewhere; "walk_start", the
+    first camera as JSON when it has one; "level", true for a file from elsewhere, whose axes nothing vouches for."""
+    version = os.stat(path).st_mtime_ns if os.path.isfile(path) else None
+    return _splat_viewer_options(str(path), version)
+
+
+@lru_cache(maxsize=256)
+def _splat_viewer_options(path, version):
+    from shared.extra_settings import model_def_of_settings
+    model_def = model_def_of_settings(read_mesh_metadata(path)) if version is not None else None
+    camera = first_camera(path)
+    return {"navigation": (model_def or {}).get("mesh_navigation", "orbit"), "walk_start": json.dumps(camera) if camera else None, "level": model_def is None and version is not None}
+
+
+def splat_viewer_attributes(path):
+    """The options of splat_viewer_options as the attributes of a viewer element."""
+    options = splat_viewer_options(path)
+    start = f' data-walk-start="{options["walk_start"]}"' if options["walk_start"] else ""
+    return f' data-navigation="{options["navigation"]}"{start}' + (' data-level="free"' if options["level"] else "")
 
 
 def animation_time(path, frame_no):
@@ -89,17 +125,54 @@ def iter_asset_views(path, angles, resolution, *, chunk, frame_no=None, mode="sh
         yield from (Image.fromarray(array) for array in arrays)  # RGBA or RGB from the channel count
 
 
-def save_mesh_metadata(path, settings):
+def _encoded_image(image):
+    """A source picture as file bytes: a file keeps its own bytes, a PIL image (the one the model received) is stored as a lossless PNG."""
+    if isinstance(image, (str, os.PathLike)):
+        return Path(image).read_bytes()
+    import io
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def save_mesh_metadata(path, settings, images=None):
+    """images: the source pictures by setting name ({"image_refs": [...]}, the Embed Source Images option), stored in a GLB only."""
     if is_splat_file(path):
         from shared.mesh3d.splats import ply_write_comments
         data = ply_write_comments(Path(path).read_bytes(), [f"{SETTINGS_KEY} {json.dumps(settings)}"])
     else:
-        from shared.mesh3d.glb import glb_read_extras, glb_write_extras
+        from shared.mesh3d.glb import glb_add_files, glb_read_extras, glb_write_extras
         data = glb_write_extras(Path(path).read_bytes(), {**glb_read_extras(path), SETTINGS_KEY: settings})
+        files = {name: [_encoded_image(image) for image in (value if isinstance(value, list) else [value]) if image is not None] for name, value in (images or {}).items()}
+        data = glb_add_files(data, files, SOURCE_IMAGES_KEY)
     Path(path).write_bytes(data)
 
 
+def extract_mesh_source_images(path, output_dir=None):
+    """The source pictures embedded in a GLB, written as files: {setting name: [paths]} as video_metadata.extract_source_images, {}
+    without any."""
+    if Path(path).suffix.lower() != ".glb":
+        return {}
+    import tempfile
+    from shared.mesh3d.glb import glb_read_files
+    files = glb_read_files(path, SOURCE_IMAGES_KEY)
+    if not files:
+        return {}
+    output_dir = output_dir or tempfile.mkdtemp()
+    os.makedirs(output_dir, exist_ok=True)
+    extracted = {}
+    for name, contents in files.items():
+        for index, content in enumerate(contents):
+            suffix = ".png" if content.startswith(b"\x89PNG") else ".jpg"
+            target = Path(output_dir) / f"{Path(path).stem}_{name}_{index}{suffix}"
+            target.write_bytes(content)
+            extracted.setdefault(name, []).append(str(target))
+    return extracted
+
+
 def read_mesh_metadata(path):
+    if Path(path).suffix.lower() not in (".glb", ".gltf", ".ply"):
+        return None  # OBJ and STL carry no settings
     if is_splat_file(path):
         from shared.mesh3d.splats import ply_comments
         prefix = SETTINGS_KEY + " "

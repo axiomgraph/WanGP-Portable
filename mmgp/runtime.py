@@ -109,6 +109,41 @@ def execution_device(module):
     return torch.device("cpu") if tensor is None else tensor.device
 
 
+def lookup_on_cpu(*modules):
+    """Mark modules that MMGP computes on the CPU, their weights kept in RAM, never in VRAM: a token table only gathers the rows of a
+    prompt, the same values as on the GPU, without moving the whole table (2 GB for an umT5 or a Gemma 3) at each load. Their tensor
+    inputs go to the CPU and their output comes back to the execution device. Call it on the loaded modules, before the offload
+    profile: a quantized table (a module whose tensors are not plain) keeps the GPU path of its qtype. A module tied to a marked one
+    (a head sharing the table) must be marked too, with unused when it never runs."""
+    for module in modules:
+        module._mm_on_cpu = True
+
+
+def map_in_ram(*modules):
+    """Mark modules whose parameters MMGP keeps in reserved RAM mapped in the GPU's address space, never in VRAM: their kernels read the
+    rows they need in place, over the bus, inside CUDA graphs too and with indices computed on the GPU (a token table read for a few tokens
+    at each step). The parameters stay the modules' own, as CUDA views of their RAM, outside the blocks, base and budgets; the RAM is
+    charged to the reserved RAM while it exists. Parameters of other modules sharing their tensors follow them: never mark a table that a
+    module reads whole at each call (a head tied to it), which would read it over the bus. Call it on the loaded modules, before the offload
+    profile; without CUDA, or without reserved RAM left, the modules keep their usual placement."""
+    for module in modules:
+        module._mm_mapped = True
+
+
+def is_mapped(tensor):
+    """True for a parameter kept in mapped RAM (map_in_ram): a CUDA view of RAM, whose reads cross the bus."""
+    from .mapped import is_mapped
+    return is_mapped(tensor)
+
+
+def unused(*modules):
+    """Mark modules that never run, such as the output head of a language model whose hidden states condition a generator (called through
+    its base model): MMGP keeps their weights in RAM, out of VRAM, pinning and budgets, quantized or not, and raises if one runs. Call it on
+    the loaded modules, before the offload profile."""
+    for module in modules:
+        module._mm_unused = True
+
+
 def ensure_loaded(module):
     """Load a managed model's base/preloaded weights; leave block swapping to MMGP.
 
@@ -119,6 +154,34 @@ def ensure_loaded(module):
     if owner is not None:
         manager, model_id = owner
         manager.ensure_model_loaded(model_id)
+
+
+def state_ring(blocks, name="state", resident=False):
+    """A state ring (mmgp.state_ring.StateRing) for tensors a model computes once per block and reads at every pass (a cached attention
+    prefix), blocks: the model's blocks (a ModuleList, called one by one). Kept in RAM and streamed block by block on the transfer stream of
+    the model's offload object, with the weights, following MMGP's schedule for these blocks (its prefetch window; records locked for the
+    blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
+    ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
+    resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
+    the model then reads the lists store() returns at each pass). resident="dynamic" (where dynamic_state(blocks)): a cache the model
+    computes on the GPU stays in VRAM first, the model's dynamic preload planning it with its weights, and goes to RAM only for the blocks
+    that do not stay there."""
+    from .state_ring import StateRing
+    owner = _owner(blocks)
+    if owner is None:
+        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks)
+    manager, model_id = owner
+    prefix = next(name for name, module in manager.models[model_id].named_modules() if module is blocks) + "."
+    entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
+    return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
+                     resident=resident)
+
+
+def dynamic_state(module):
+    """Whether a state ring of these blocks can place its state dynamically (state_ring(blocks, resident="dynamic")): their model is managed
+    by MMGP with its VRAM allocator, which reports the VRAM shortages."""
+    from . import allocator
+    return _owner(module) is not None and allocator.active == "vmm"
 
 
 def weights_resident(module):
@@ -218,3 +281,67 @@ def requires_layer_offload(module):
     if manager.auto_preload is not None and model_id in manager.auto_preload.plans:
         return True
     return any(name.startswith(model_id + "/") and size for name, size in manager.blocks_of_modules_sizes.items())
+
+
+DISPOSABLE_PRIORITY = 2  # in the VRAM pressure order (mmgp.memory_pressure): after expert copies and ring state (0) and preloaded blocks (1)
+
+
+class Disposable:
+    """VRAM held by a managed model's own code beside its weights (a cache, a workspace) that it can do without and rebuild: see
+    disposable()."""
+
+    def __init__(self, manager, model_id, name, release):
+        self.manager, self.model_id, self.name, self._release = manager, model_id, name, release
+        self.released, self.idle_thread, self.idle_depth = False, None, 0
+        if manager is not None:
+            from . import memory_pressure
+            memory_pressure.register(self, DISPOSABLE_PRIORITY)
+
+    def close(self):
+        """The asset is gone (freed by its owner): no more release."""
+        self.released = True
+        if self.manager is not None:
+            from . import memory_pressure
+            memory_pressure.unregister(self)
+
+    @contextmanager
+    def idle(self):
+        """Its owner does not use it meanwhile (code on this thread that runs other models): MMGP may release it if VRAM runs short."""
+        import threading
+        self.idle_thread, self.idle_depth = threading.get_ident(), self.idle_depth + 1
+        try:
+            yield
+        finally:
+            self.idle_depth -= 1
+
+    def on_pressure(self, need, parked=False):
+        """mmgp.memory_pressure: released when VRAM runs short, while its model's offload object is parked (any thread) or while its owner
+        declared it idle (its thread), never during a CUDA graph capture. Returns the bytes the allocator got back."""
+        import threading
+        from . import allocator
+        if need <= 0 or self.released or torch.cuda.is_current_stream_capturing() or not (parked or self.idle_depth and threading.get_ident() == self.idle_thread):
+            return 0
+        before = allocator.stats()["allocated"]
+        self.close()
+        try:
+            self._release()
+        except Exception as exc:  # the owner's code, inside an allocation: the allocation goes on with what was freed
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short: the release of {self.name} failed: {exc}")
+        freed = max(0, before - allocator.stats()["allocated"])
+        if freed:
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short, {freed / 2**20:0.0f} MB of {self.name} released")
+        return freed
+
+
+def disposable(module, name, release):
+    """Declare VRAM that the code of a managed model holds beside its weights and can do without (e.g. the KV cache of a language model, a
+    workspace): MMGP releases it, calling release(), only when an allocation finds the VRAM short (the automatic preloads of other models do
+    not plan with it), in its pressure order: after the expert copies, the state kept in VRAM and the preloaded blocks, and only while it is
+    not in use, i.e. while the model's offload object is parked (offload.park) or inside the returned Disposable's idle() scope on the
+    owner's thread. release() frees the asset (it may copy it to RAM; it must not allocate VRAM) and runs at most once: the owner checks
+    `released` before its next use and rebuilds it (declaring it again). close() when the owner frees it itself. Unmanaged modules get a
+    Disposable that is never released."""
+    owner = _owner(module)
+    return Disposable(None, None, name, release) if owner is None else Disposable(owner[0], owner[1], name, release)

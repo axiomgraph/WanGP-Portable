@@ -7,7 +7,7 @@ import torch
 from accelerate import init_empty_weights
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
@@ -197,6 +197,10 @@ class model_factory:
             defaultConfigPath=text_encoder_config,
             preprocess_sd=_build_qwen3_state_dict_preprocessor(text_encoder_config),
         )
+        # the token table stays in RAM (mmgp looks up the prompt's rows on the CPU) with the output head tied to it, which never runs:
+        # the hidden states come from the base model
+        runtime.lookup_on_cpu(text_encoder.model.embed_tokens)
+        runtime.unused(text_encoder.lm_head)
 
         # Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)

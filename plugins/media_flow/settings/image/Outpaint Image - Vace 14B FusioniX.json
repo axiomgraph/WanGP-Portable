@@ -37,5 +37,9 @@
     "activated_loras": [],
     "settings_version": 2.61,
     "base_model_type": "vace_14B",
-    "model_type": "vace_14B_fusionix"
+    "model_type": "vace_14B_fusionix",
+    "process": {
+        "task": "outpaint",
+        "summary": "Wan VACE 14B FusioniX."
+    }
 }

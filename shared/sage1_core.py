@@ -6,14 +6,18 @@ from functools import lru_cache
 
 import torch
 
+from shared.kernels.token_mean import token_mean
+
 try:  # SageAttention 2
     from sageattention.triton.quant_per_block_varlen import quant_per_block_int8_kernel
     from sageattention.triton.attn_qk_int8_block_varlen import _attn_fwd
-    _SM_SCALE = {64: 1.0 / 64 ** 0.5, 128: 1.0 / 128 ** 0.5, 256: 1.0 / 256 ** 0.5}  # sageattn_varlen's softmax scales, computed as each version does
+    def _sm_scale(head_dim):  # sageattn_varlen's softmax scale, computed as each version does
+        return 1.0 / head_dim ** 0.5
 except ImportError:  # SageAttention 1.0.6
     from sageattention.quant_per_block_varlen import quant_per_block_int8_kernel
     from sageattention.attn_qk_int8_block_varlen import _attn_fwd
-    _SM_SCALE = {64: 64 ** -0.5, 128: 128 ** -0.5, 256: 256 ** -0.5}
+    def _sm_scale(head_dim):
+        return head_dim ** -0.5
 try:  # compute capability 7.5: the same kernels reading BF16 q, k and v and writing BF16 output as bits (no FP16 copies)
     from .sage1_turing import _attn_fwd as _attn_fwd_bits, quant_per_block_int8_bits_kernel as _quant_bits
 except ImportError:
@@ -21,7 +25,7 @@ except ImportError:
 
 SETTINGS = {"scale_v": False}  # the staged functions take the settings of the staged_* functions of shared.sage2_core: v scaling only here
 SCALED_V_SETTINGS = {"scale_v": True}
-HEAD_DIMS = tuple(_SM_SCALE)  # 256 (not in sageattn_varlen): one pipeline stage, GPUs of compute capability 8.0 or more (head_dims)
+HEAD_DIMS = (64, 128, 256)  # 256 (not in sageattn_varlen): one pipeline stage, GPUs of compute capability 8.0 or more (head_dims)
 _STAGES = {64: 3, 128: 4, 256: 1}
 # The Triton attentions of SageAttention (1, and 2 where its CUDA kernels are not used) add P.V up in fp16 by blocks of 64 keys (p <= 1):
 # the v of some models (model def key sage_v_scaling) overflows them. Their v is divided per head and channel by a power of two that
@@ -70,6 +74,13 @@ def head_dims(device):
     return HEAD_DIMS[:2] if _fp16_required(device) else HEAD_DIMS
 
 
+def padded_head_dim(head_dim, device):
+    """The head_dim the kernels run a head_dim at: the next of head_dims(device), None beyond. attention pads q, k and v with zeros up to
+    it, as SageAttention 2 does: the same q.k products (INT8, summed exactly), INT8 scales and key means, with the softmax scale of the
+    real head_dim; the extra output channels (zero) are dropped."""
+    return next((dim for dim in head_dims(device) if dim >= head_dim), None)
+
+
 def _offsets(batch, length, device):
     """[0, length, 2 length, ...] of the batch items, made on the GPU (a host copy would not be allowed in a CUDA graph)."""
     return torch.arange(0, (batch + 1) * length, length, dtype=torch.int32, device=device)
@@ -113,40 +124,44 @@ def staged_quantize_v(v_list, settings):
     return *fp16_v(v, settings["scale_v"]), None
 
 
-def _quantize_k(k, in_place):
-    """INT8 k minus its mean over the tokens of all batch items, with its scales."""
+def _quantize_k(k, in_place, mean=None):
+    """INT8 k minus its mean over the tokens of all batch items (or mean, (heads, head_dim) FP32: Turing kernel only), with its scales."""
     rows = k.view(-1, *k.shape[2:])
     if _bits_input(k):  # the FP32 mean is subtracted inside the quantization kernel: no FP16 copy, k untouched
-        return _quantize(k, 64, 1.0, torch.mean(rows, dim=0, dtype=torch.float32))
+        return _quantize(k, 64, 1.0, token_mean(rows, 0, fp32=True)[0] if mean is None else mean)
+    if mean is not None:
+        raise ValueError("A given key mean is subtracted by the Turing kernel only")
     if k.dtype == torch.bfloat16 and _fp16_required(k.device):
         k = k.to(torch.float16)  # match pay_attention: convert before smoothing on pre-Ampere GPUs
         rows = k.view(-1, *k.shape[2:])
-    mean = rows.mean(dim=0, keepdim=True)
+    mean = token_mean(rows, 0)
     return _quantize((rows.sub_(mean) if in_place else rows - mean).view(k.shape), 64, 1.0)
 
 
 @torch.compiler.disable
 def staged_quantize_k(k_list, settings):
-    """INT8 k minus its mean over the tokens of all batch items, with its scales; k is released (the mean is subtracted in place)."""
+    """INT8 k minus its mean over the tokens of all batch items, with its scales; k is released (the mean is subtracted in place).
+    settings["k_mean"] (heads, head_dim) FP32, when present, is the mean subtracted instead (a cached prefix's: shared.attention_kit)."""
     k = k_list[0]
     k_list.clear()
-    return _quantize_k(k, True)
+    return _quantize_k(k, True, settings.get("k_mean"))
 
 
 @torch.compiler.disable
-def staged_quantize_q(q, settings):
-    """INT8 q with its scales (the softmax scale, in base 2, goes into them); q is not released (staged_attention can write the output
-    into it)."""
+def staged_quantize_q(q, settings, sm_scale=None):
+    """INT8 q with its scales (the softmax scale, in base 2, goes into them: sm_scale, or that of q's head_dim); q is not released
+    (staged_attention can write the output into it)."""
     if q.dtype == torch.bfloat16 and _fp16_required(q.device) and not _bits_input(q):
         q = q.to(torch.float16)
-    return _quantize(q, 128, _SM_SCALE[q.shape[-1]] * 1.44269504)
+    return _quantize(q, 128, (_sm_scale(q.shape[-1]) if sm_scale is None else sm_scale) * 1.44269504)
 
 
 @torch.compiler.disable
-def staged_attention(out, quantized_list, settings, attn_mask=None):
+def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=False):
     """Attention of the staged [q, k, v], written into out and returned: out has q's shape (batch, tokens, heads, head_dim) and its
     batch items one after another in memory: q itself, or a slice of heads of a larger output. Fewer heads in k/v: grouped query
-    attention."""
+    attention. return_lse (Turing kernel only): (out, lse), lse (batch, heads, tokens) FP32 the base-2 log-sum-exp of each query's
+    scores without the keys' smoothing mean."""
     (q_int8, q_scale, q_offsets, q_scale_offsets), (k_int8, k_scale, k_offsets, k_scale_offsets), (v, v_scale, _) = quantized_list
     quantized_list.clear()
     batch, tokens, heads, head_dim = out.shape
@@ -172,28 +187,78 @@ def staged_attention(out, quantized_list, settings, attn_mask=None):
             mask = attn_mask.view(torch.uint8) if attn_mask.dtype == torch.bool else attn_mask.to(torch.float32)
             mask = mask.expand(batch, heads, tokens, k_int8.shape[0] // batch)
             mask_mode = 1 if attn_mask.dtype == torch.bool else 2
-        # without a mask the kernel still takes a pointer (never read): q_int8 with zero strides
-        _attn_fwd_bits[grid](*args, q_int8 if mask is None else mask, *strides, *(mask.stride() if mask is not None else (0, 0, 0, 0)),
-                             heads, heads // k_int8.shape[1], V_BITS=v_bits, MASK_MODE=mask_mode, **launch)
+        # without a mask the kernel still takes a pointer (never read): q_int8 with zero strides, as Lse without return_lse
+        lse = torch.empty((batch, heads, tokens), dtype=torch.float32, device=out.device) if return_lse else q_int8
+        _attn_fwd_bits[grid](*args, q_int8 if mask is None else mask, lse, *strides, *(mask.stride() if mask is not None else (0, 0, 0, 0)),
+                             heads, heads // k_int8.shape[1], V_BITS=v_bits, MASK_MODE=mask_mode, RETURN_LSE=return_lse, **launch)
     else:
-        if attn_mask is not None:
-            raise ValueError("SageAttention takes an attention mask only on the Turing kernel")
+        if attn_mask is not None or return_lse:
+            raise ValueError("SageAttention takes an attention mask or returns the log-sum-exp only on the Turing kernel")
         _attn_fwd[grid](*args, *strides, heads, heads // k_int8.shape[1], **launch)
     if fp16_output:
         out.copy_(rows.view(out.shape))
-    return out if v_scale is None else scale_output(out, v_scale, 2)
+    out = out if v_scale is None else scale_output(out, v_scale, 2)
+    return (out, lse) if return_lse else out
+
+
+# A cached prefix (shared.attention_kit.cache_prefix) on the Turing kernel: k as staged_quantize_k makes it with the prefix's own mean
+# (prefix_mean), which the keys attended with it subtract too; v stored by the kit and made 16-bit again for each attention.
+def prefix_supported(settings, device, dtype):
+    return _attn_fwd_bits is not None and dtype == torch.bfloat16 and _fp16_required(device)
+
+
+def prefix_settings(settings, device, scale_v):
+    return settings
+
+
+def prefix_fp8_v(settings):
+    return False
+
+
+def prefix_mean(k):
+    """(heads, head_dim) FP32 mean over the tokens of all batch items, rounded to k's dtype as SageAttention 2's prefixes."""
+    return token_mean(k.reshape(-1, *k.shape[2:]), 0)[0].float()
+
+
+def prefix_mean_heads(mean, heads):
+    return mean[heads.start:heads.stop]
+
+
+def prefix_quantize_k(k_list, settings, mean):
+    """A prefix's k (batch, tokens, heads, head_dim, released) quantized with mean: k_int8 (batch, tokens, heads, head_dim) and k_scale
+    (batch, blocks, heads)."""
+    batch, tokens = k_list[0].shape[:2]
+    k_int8, k_scale, _, _ = staged_quantize_k(k_list, {**settings, "k_mean": mean})
+    return k_int8.view(batch, tokens, *k_int8.shape[1:]), k_scale.view(batch, -1, k_scale.shape[-1])
+
+
+def prefix_k(k_int8, k_scale, heads, batch):
+    """The quantized k of staged_attention for the heads of a cached prefix: k_int8 (batch, tokens, heads, head_dim) and k_scale
+    (batch, blocks, heads) as _quantize makes them (batch items one after another), for batch items (one prefix item serves them all)."""
+    k_int8, k_scale = k_int8[:, :, heads.start:heads.stop], k_scale[:, :, heads.start:heads.stop]
+    if k_int8.shape[0] != batch:
+        k_int8, k_scale = k_int8.expand(batch, -1, -1, -1), k_scale.expand(batch, -1, -1)
+    tokens, blocks = k_int8.shape[1], k_scale.shape[1]
+    return (k_int8.reshape(-1, *k_int8.shape[2:]).contiguous(), k_scale.reshape(-1, k_scale.shape[-1]).contiguous(),
+            _offsets(batch, tokens, k_int8.device), _offsets(batch, blocks, k_int8.device))
 
 
 @torch.compiler.disable
-def attention(qkv_list, recycle_q=False, scale_v=False, attention_mask=None):
+def attention(qkv_list, recycle_q=False, scale_v=False, attention_mask=None, sm_scale=None):
     """sageattn_varlen of q, k and v (batch, tokens, heads, head_dim, batch items one after another in memory) handed off in qkv_list,
     every batch item with all its tokens. k and v are not modified (others may hold them); the output is written into q with
     recycle_q. scale_v: v scaled by powers of two (fp16_v). attention_mask: SageAttention's (batch, heads, q, k) layout
-    (shared.attention.sage_attention_mask), Turing kernel only (masks_supported)."""
+    (shared.attention.sage_attention_mask), Turing kernel only (masks_supported). sm_scale: the softmax scale, that of the head_dim by
+    default. A head_dim the kernels do not run is padded with zeros (padded_head_dim)."""
     q, k, v = qkv_list
     qkv_list.clear()
+    head_dim = q.shape[-1]
+    padded, sm_scale = padded_head_dim(head_dim, q.device), _sm_scale(head_dim) if sm_scale is None else sm_scale
+    if padded != head_dim:
+        q, k, v = (torch.nn.functional.pad(tensor, (0, padded - head_dim)) for tensor in (q, k, v))
     settings = SCALED_V_SETTINGS if scale_v else SETTINGS
     quantized = [None, _quantize_k(k, False), staged_quantize_v([v], settings)]
     k = v = None
-    quantized[0] = staged_quantize_q(q, settings)
-    return staged_attention(q if recycle_q else torch.empty_like(q, memory_format=torch.contiguous_format), quantized, settings, attention_mask)
+    quantized[0] = staged_quantize_q(q, settings, sm_scale)
+    out = staged_attention(q if recycle_q else torch.empty_like(q, memory_format=torch.contiguous_format), quantized, settings, attention_mask)
+    return out if padded == head_dim else out[..., :head_dim]

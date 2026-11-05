@@ -20,7 +20,8 @@ own BF16 store does on sm_80+, and with V_BITS v is read as the bits of a BF16 t
 q/k inputs, block scales, tiling and arithmetic are those of the original kernel. shared.sage1_core launches it on such GPUs instead
 of writing an FP16 output and copying it back to BF16, and for short sequences instead of copying v to FP16. MASK_MODE adds an
 attention mask in SageAttention's (batch, heads, q, k) layout (strides, zero for broadcast dimensions): 1 a boolean mask (uint8
-view) whose zero entries get no weight, 2 an additive FP32 mask as SDPA adds it to the scaled scores.
+view) whose zero entries get no weight, 2 an additive FP32 mask as SDPA adds it to the scaled scores. RETURN_LSE also writes the base-2
+log-sum-exp of each query's scores, to merge attentions over separate key sets (a cached prefix, shared.attention_kit).
 """
 import triton
 import triton.language as tl
@@ -75,14 +76,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len,
         K_scale_ptr += H
         V_ptrs += BLOCK_N * stride_vn
         M_ptrs += BLOCK_N * stride_mk
-    return acc, l_i
+    return acc, l_i, m_i
 
 
 @triton.jit
 def _attn_fwd(Q, K, V,
               cu_seqlens_q, cu_seqlens_k,
               Q_scale, K_scale, cu_seqlens_q_scale, cu_seqlens_k_scale,
-              Out, Mask,
+              Out, Mask, Lse,
               stride_qh, stride_qn,
               stride_kh, stride_kn,
               stride_vh, stride_vn,
@@ -94,7 +95,8 @@ def _attn_fwd(Q, K, V,
               BLOCK_N: tl.constexpr,
               STAGE: tl.constexpr,
               V_BITS: tl.constexpr,
-              MASK_MODE: tl.constexpr
+              MASK_MODE: tl.constexpr,
+              RETURN_LSE: tl.constexpr = False
               ):
     start_m = tl.program_id(0)
 
@@ -138,15 +140,17 @@ def _attn_fwd(Q, K, V,
 
     q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
-                               start_m,
-                               H // num_kv_groups,
-                               BLOCK_M, HEAD_DIM, BLOCK_N,
-                               4 - STAGE, offs_m, offs_n, V_BITS, MASK_MODE
-                               )
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
+                                    start_m,
+                                    H // num_kv_groups,
+                                    BLOCK_M, HEAD_DIM, BLOCK_N,
+                                    4 - STAGE, offs_m, offs_n, V_BITS, MASK_MODE
+                                    )
     acc = acc / l_i[:, None]
     # BF16 output written as bits (int16 pointer): one rounding of the FP32 accumulator (round to nearest even)
     tl.store(O_block_ptr, fp32_to_bf16_bits(acc), mask=(offs_m[:, None] < qo_len))
+    if RETURN_LSE:  # base-2 log-sum-exp of the scores (log2 e is folded into q_scale), Lse (batch, heads, tokens) FP32
+        tl.store(Lse + (off_z * H + off_h) * qo_len + offs_m, m_i + tl.math.log2(l_i), mask=offs_m < qo_len)
 
 
 @triton.jit

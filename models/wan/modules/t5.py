@@ -692,7 +692,7 @@ class T5EncoderModel:
                 dtype=dtype,
                 device=device).eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        from mmgp import offload
+        from mmgp import offload, runtime
         offload.load_model_data(
             model,
             checkpoint_path,
@@ -700,6 +700,7 @@ class T5EncoderModel:
             default_dtype=torch.bfloat16,
             preprocess_sd=_preprocess_umt5_state_dict,
         )
+        runtime.lookup_on_cpu(model.token_embedding)  # the 2 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
 
         self.model = model
         self.model.to(self.device)

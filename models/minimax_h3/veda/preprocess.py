@@ -1,5 +1,10 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Fused tile packing, TripPool and compact attention-index construction."""
+"""Fused tile packing, TripPool and compact attention-index construction.
+
+Counts, head-group sizes and tile-derived strides are runtime arguments without value or alignment specialization, so a new resolution,
+video length or Attention Head Split level compiles nothing."""
+import struct
+
 import torch
 import triton
 import triton.language as tl
@@ -7,7 +12,7 @@ import triton.language as tl
 from . import selection
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("elements",))
 def _residual(Projected, Pool, Out, elements, D: tl.constexpr, B: tl.constexpr):
     offset = tl.program_id(0) * B + tl.arange(0, B)
     projected = tl.load(Projected + offset, offset < elements, 0).to(tl.float32)
@@ -21,7 +26,7 @@ def residual(projected, pooled):
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("heads", "video_tiles"))
 def _gather_pool(X, Perm, Heads, Valid, Out, Pool, sxn, sxh, heads, video_tiles, D: tl.constexpr, C: tl.constexpr):
     tile, head, channel = tl.program_id(0), tl.program_id(1), tl.program_id(2) * C + tl.arange(0, C)
     row = tile * 128 + tl.arange(0, 128)
@@ -49,7 +54,7 @@ def gather_pool(x, layout, heads):
     return out, pooled
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("heads", "elements"))
 def _gather(X, Perm, Heads, Out, sxn, sxh, heads, elements, D: tl.constexpr, B: tl.constexpr):
     offset = tl.program_id(0) * B + tl.arange(0, B)
     row, head, channel = offset // (heads * D), offset // D % heads, offset % D
@@ -65,7 +70,7 @@ def gather(x, layout, heads):
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("out_heads", "heads", "elements"))
 def _scatter(X, Perm, Heads, Out, out_heads, heads, elements, D: tl.constexpr, B: tl.constexpr):
     offset = tl.program_id(0) * B + tl.arange(0, B)
     row, head, channel = offset // (heads * D), offset // D % heads, offset % D
@@ -80,7 +85,7 @@ def scatter(out, tiled, layout, heads):
     torch.autograd.graph.increment_version(out)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("elements", "tiles"))
 def _mask_scores(Scores, Valid, elements, tiles, B: tl.constexpr):
     offset = tl.program_id(0) * B + tl.arange(0, B)
     row, col = offset // tiles % tiles, offset % tiles
@@ -91,43 +96,56 @@ def _mask_scores(Scores, Valid, elements, tiles, B: tl.constexpr):
 
 
 @triton.jit
-def _indices(I0, V0, I1, V1, Valid, Index, Count, tiles, video_tiles, split,
-             k0, k1, lo0, lo1, frac0: tl.constexpr, frac1: tl.constexpr, start0,
-             ALL0: tl.constexpr, ALL1: tl.constexpr, SECOND: tl.constexpr,
-             N: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr):
+def _select_ranks(selected, I, V, ranks, k, keep_below, start, c0, C: tl.constexpr, R: tl.constexpr):
+    """Marks the kept ranks (by chunks of R) whose column falls in the chunk starting at c0."""
+    for r0 in range(0, k, R):
+        rank = r0 + tl.arange(0, R)
+        index = tl.load(I + ranks + rank, rank < k, 0).to(tl.int32) + start - c0
+        value = tl.load(V + ranks + rank, rank < k, -float('inf'))
+        keep = (rank < keep_below) & (rank < k) & (value > -float('inf')) & (index >= 0) & (index < C - 1)
+        # Ranks not kept here use the spare last lane; it never holds a column.
+        selected = selected | (tl.histogram(tl.where(keep, index, C - 1), C) > 0).to(tl.int32)
+    return selected
+
+
+@triton.jit(do_not_specialize=("tiles", "video_tiles", "split", "k0", "k1", "lo0", "lo1", "frac0", "frac1", "start0"))
+def _indices(I0, V0, I1, V1, Valid, Index, Count, tiles, video_tiles, split, k0, k1, lo0, lo1, frac0: tl.int64, frac1: tl.int64, start0,
+             ALL0: tl.constexpr, ALL1: tl.constexpr, SECOND: tl.constexpr, C: tl.constexpr, R: tl.constexpr):
+    # Columns by chunks of C lanes holding C - 1 columns, ranks by chunks of R: chunk sizes do not depend on the geometry. frac0 / frac1
+    # are float64 bit patterns: a float argument would be FP32.
     row, head = tl.program_id(0), tl.program_id(1)
-    col = tl.arange(0, N)
-    valid = tl.load(Valid + col, col < tiles, 0) > 0
-    if row < video_tiles:
-        selected = tl.full((N,), 0, tl.int32)
-        if ALL0:
-            selected = tl.where((col >= start0) & (col < split) & valid, 1, selected)
-        else:
-            rank = tl.arange(0, K0)
-            index = tl.load(I0 + (head * video_tiles + row) * k0 + rank, rank < k0, 0).to(tl.int32) + start0
-            value = tl.load(V0 + (head * video_tiles + row) * k0 + rank, rank < k0, -float('inf'))
-            fraction = tl.full((), frac0, tl.float64)
-            extra = tl.floor((row + 1).to(tl.float64) * fraction) > tl.floor(row.to(tl.float64) * fraction)
-            keep = (rank < lo0 + extra) & (rank < k0) & (value > -float('inf'))
-            # Invalid ranks use a spare lane; they never overwrite a valid selected column.
-            selected = selected | (tl.histogram(tl.where(keep, index, N - 1), N) > 0).to(tl.int32)
-        if SECOND:
-            if ALL1:
-                selected = tl.where((col >= split) & (col < video_tiles) & valid, 1, selected)
+    lane = tl.arange(0, C)
+    fraction = frac0.to(tl.float64, bitcast=True)
+    keep0 = lo0 + (tl.floor((row + 1).to(tl.float64) * fraction) > tl.floor(row.to(tl.float64) * fraction))
+    fraction = frac1.to(tl.float64, bitcast=True)
+    keep1 = lo1 + (tl.floor((row + 1).to(tl.float64) * fraction) > tl.floor(row.to(tl.float64) * fraction))
+    total = tl.full((), 0, tl.int32)
+    for c0 in range(0, tiles, C - 1):
+        col = c0 + lane
+        real = (lane < C - 1) & (col < tiles)
+        valid = tl.load(Valid + col, real, 0) > 0
+        if row < video_tiles:
+            selected = tl.full((C,), 0, tl.int32)
+            if ALL0:
+                selected = tl.where((col >= start0) & (col < split) & valid, 1, selected)
             else:
-                rank = tl.arange(0, K1)
-                index = tl.load(I1 + (head * video_tiles + row) * k1 + rank, rank < k1, 0).to(tl.int32) + split
-                value = tl.load(V1 + (head * video_tiles + row) * k1 + rank, rank < k1, -float('inf'))
-                fraction = tl.full((), frac1, tl.float64)
-                extra = tl.floor((row + 1).to(tl.float64) * fraction) > tl.floor(row.to(tl.float64) * fraction)
-                keep = (rank < lo1 + extra) & (rank < k1) & (value > -float('inf'))
-                selected = selected | (tl.histogram(tl.where(keep, index, N - 1), N) > 0).to(tl.int32)
-        selected = tl.where(col >= video_tiles, valid.to(tl.int32), selected)
-    else:
-        selected = valid.to(tl.int32)
-    positions = tl.cumsum(selected) - 1
-    tl.store(Index + (head * tiles + row) * tiles + positions, col, selected > 0)
-    tl.store(Count + head * tiles + row, tl.sum(selected))
+                selected = _select_ranks(selected, I0, V0, (head * video_tiles + row) * k0, k0, keep0, start0, c0, C, R)
+            if SECOND:
+                if ALL1:
+                    selected = tl.where((col >= split) & (col < video_tiles) & valid, 1, selected)
+                else:
+                    selected = _select_ranks(selected, I1, V1, (head * video_tiles + row) * k1, k1, keep1, split, c0, C, R)
+            selected = tl.where(real, tl.where(col >= video_tiles, valid.to(tl.int32), selected), 0)
+        else:
+            selected = valid.to(tl.int32)
+        positions = total + tl.cumsum(selected) - 1
+        tl.store(Index + (head * tiles + row) * tiles + positions, col, selected > 0)
+        total += tl.sum(selected)
+    tl.store(Count + head * tiles + row, total)
+
+
+def _float64_bits(value):
+    return struct.unpack("<q", struct.pack("<d", value))[0]
 
 
 def indices(scores, layout, blocks):
@@ -147,6 +165,6 @@ def indices(scores, layout, blocks):
     index = torch.empty((scores.shape[0], layout.n_tiles, layout.n_tiles), device=scores.device, dtype=torch.int32)
     count = torch.empty((scores.shape[0], layout.n_tiles), device=scores.device, dtype=torch.int32)
     _indices[(layout.n_tiles, scores.shape[0])](first[0], first[1], second[0], second[1], layout.valid_count, index, count,
-        layout.n_tiles, layout.n_video_tiles, blocks[0].stop, first[2], second[2], first[3], second[3], first[4], second[4], blocks[0].start,
-        ALL0=first[5], ALL1=second[5], SECOND=len(blocks) == 2, N=triton.next_power_of_2(layout.n_tiles + 1), K0=triton.next_power_of_2(first[2]), K1=triton.next_power_of_2(second[2]), enable_fp_fusion=False)
+        layout.n_tiles, layout.n_video_tiles, blocks[0].stop, first[2], second[2], first[3], second[3], _float64_bits(first[4]), _float64_bits(second[4]),
+        blocks[0].start, ALL0=first[5], ALL1=second[5], SECOND=len(blocks) == 2, C=256, R=256, enable_fp_fusion=False)
     return index, count

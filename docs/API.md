@@ -4,7 +4,7 @@
 
 The main goal is to let third-party code call WanGP directly, keep the last loaded model alive across requests, receive structured progress updates, and still capture the same stdout/stderr output that would normally go to the console.
 
-This same API can be used directly from a WanGP PlugIn and uses WanGP Web Queue to process the requested Jobs of called from a Third Party App (for instance https://github.com/deepbeepmeep/LTX-Desktop-WanGP).
+This same API can be used directly from a WanGP Plugin and uses WanGP Web Queue to process the requested Jobs of called from a Third Party App (for instance https://github.com/deepbeepmeep/LTX-Desktop-WanGP).
 
 **Please note that use of the WanGP API is subject to the WanGP Terms and Conditions. Any product that integrates WanGP should clearly disclose that it uses WanGP in both its user interface and its documentation.**
 
@@ -95,12 +95,12 @@ To use existing LoRA collections, add `"--lora-config", "C:/WanGP/lora_paths.jso
 
 - Standalone / CLI-style third-party app or Python script:
   - yes, call `init(...)`
-- WanGP plugin tab receiving an injected `api_session` in `create_config_ui(...)`:
+- WanGP Plugin tab receiving an injected `api_session` in `create_config_ui(...)`:
   - no, do not call `init(...)`
   - use the injected `api_session` directly
 - Low-level in-process integration inside WanGP with direct access to the live Gradio `state`:
   - possible with `init(webui_state=state, ...)`
-  - this is an advanced/internal path, not the normal plugin entrypoint
+  - this is an advanced/internal path, not the normal Plugin entrypoint
 
 ## `init(...)` Parameters
 
@@ -151,12 +151,12 @@ session = init(
   - Optional live WanGP WebUI state dictionary.
   - When provided, submitted tasks target the existing WanGP Gradio queue instead of calling the headless generation path directly.
   - This is mainly a low-level internal / advanced integration hook.
-  - Normal WanGP plugins should use the injected `api_session` instead of calling `init(...)` themselves.
+  - Normal WanGP Plugins should use the injected `api_session` instead of calling `init(...)` themselves.
   - In this mode, `output_dir` is ignored and `on_stream(...)` is not expected because the WebUI queue path is probe-based rather than stdout-capture based.
 
 ### WebUI Queue Mode
 
-This is the WebUI-backed queue mode used by WanGP plugin integrations.
+This is the WebUI-backed queue mode used by WanGP Plugin integrations.
 
 If you are implementing a low-level in-process integration and explicitly need to bind the API to WanGP's live Gradio queue yourself, pass the current `state` dict to `init(...)`:
 
@@ -189,25 +189,25 @@ Differences versus standalone / CLI-style mode:
 
 ### Plugin Tab API Object
 
-For WanGP plugins, a WebUI-backed session can be injected directly into the tab constructor.
+For WanGP Plugins, a WebUI-backed session can be injected directly into the tab constructor.
 
-If a plugin tab constructor accepts one extra positional argument, WanGP now passes a session-shaped API object there:
+If a Plugin tab constructor accepts one extra positional argument, WanGP now passes a session-shaped API object there:
 
 ```python
 def create_config_ui(self, api_session):
     ...
 ```
 
-That object behaves like a normal `WanGPSession`. In a WanGP plugin tab, the WebUI queue integration stays inside the injected session object, so plugin code can keep using the same `submit_task(...)`, `job.result()`, and `job.cancel()` pattern as CLI code.
+That object behaves like a normal `WanGPSession`. In a WanGP Plugin tab, the WebUI queue integration stays inside the injected session object, so Plugin code can keep using the same `submit_task(...)`, `job.result()`, and `job.cancel()` pattern as CLI code.
 
 Plugin-specific difference:
 
-- in a plugin tab, you normally do **not** call `init(...)`
+- in a Plugin tab, you normally do **not** call `init(...)`
 - WanGP creates and injects the WebUI-backed session object for you
-- plugin code should treat `api_session` as the API entrypoint
-- this is the normal WebUI/API path for WanGP plugins
+- Plugin code should treat `api_session` as the API entrypoint
+- this is the normal WebUI/API path for WanGP Plugins
 
-Minimal plugin pattern:
+Minimal Plugin pattern:
 
 ```python
 def create_config_ui(self, api_session):
@@ -237,7 +237,7 @@ def create_config_ui(self, api_session):
             job.cancel()
 ```
 
-In a plugin tab, callback methods like `on_status(...)` and `on_progress(...)` can safely update a local `gr.Progress(...)` while the job itself still runs through WanGP's main WebUI queue.
+In a Plugin tab, callback methods like `on_status(...)` and `on_progress(...)` can safely update a local `gr.Progress(...)` while the job itself still runs through WanGP's main WebUI queue.
 
 ## Model Metadata
 
@@ -323,7 +323,7 @@ At task normalization, WanGP fills missing media-mode flags when the supplied mo
 
 API and MCP tasks may provide `video_length` as a seconds string such as `"10s"`. WanGP uses a numeric `force_fps` when supplied, otherwise the model FPS, and converts the duration to a frame count allowed by the model's frame minimum, step, and offset. Frame counts, given in frames or seconds, are rounded up to the next allowed count, so a video is never shorter than requested: a speech or song driving it keeps its last words.
 
-Useful `SessionJob` handles for plugin authors:
+Useful `SessionJob` handles for Plugin authors:
 
 - `job.result(timeout=None) -> GenerationResult`
   - Waits for completion and returns generated files, errors, and any requested returned media artifacts.
@@ -440,6 +440,10 @@ wangp_list_gallery(media_type="3d", selected_only=True)
 
 Gallery discovery includes 3D assets in `all`, supports `media_type="3d"`, and preserves 3D selections in MCP v2/v2.1 and Prime. Deepy Zero's Get Selected Media and Resolve Media also support `3d`; selecting `all` includes the 3D gallery. Directory listings can likewise filter by `3d`.
 
+Worlds of interactive world models are listed the same way for MCP clients and Prime: `all` includes the Worlds gallery, `media_type="world"` lists only worlds, with their resolution, duration, perspective and style, and `wangp_io(action="info")` on a world's `media_id` returns each segment's time range, description, actions and camera keys. Each world's video is in the image/video gallery (`video_filename`), where the media tools apply. `wangp_templates(task="gen_world")` returns the world templates and `wangp_models` finds world models with `filters.main_output="world"`, and models that continue a world list `world` among their inputs (`filters.inputs="world"`). A generation with a world model takes `world_output`: `"world"` (the default: the world alone, without decoding a video), `"world_video"` or `"video"`; its prompt may follow the world description with exploration instructions, one move per line (`[Forward]`, `[Look_Left]`, `[Event] a deer crosses the trail`), and `custom_guide` set to a world's `media_id` continues that world, in which case instructions alone are a valid prompt. Interactive exploration is done by the user, in the Worlds gallery.
+
+`wangp_templates(task="gen_3d")` returns the main recipes that make a 3D asset from one picture of an object in `image_refs` (TRELLIS.2 Shape with SUPRA-Tex by default, Hunyuan3D 2.1 with its Paint Texturer, Pixal3D with SUPRA-Tex, with or without the Hi3D Refiner), so a request in words first generates that picture with a `gen_image` template. `wangp_templates(task="texture_3d")` textures a mesh of the 3D gallery given as `custom_guide`, with its object picture in `image_refs` (SUPRA-Tex by default, Hunyuan3D 2.1 Paint, or Hi3D refinement then SUPRA-Tex). Other 3D models (untextured shapes, parts, Gaussian splats, segmentation, animation, reconstruction) are found with `wangp_models` and run with their defaults. The `gen_world`, `gen_3d` and `texture_3d` tasks are for Deepy Prime and MCP clients.
+
 File-producing media toolbox actions accept an optional `name` for their output file, without extension or folder; WanGP numbers it when the name exists, and actions writing several files prefix each one with it. Automatic generation file names omit window commands such as `[/duration=5s]`; set the `output_filename` setting for a chosen name. Gallery records label outputs created by external MCP clients with `source="MCP"`.
 
 #### Preflight and safe retries
@@ -499,6 +503,10 @@ Names are lowercase hyphenated slugs of at most 64 characters. Front matter must
 
 User skills are stored in `user_skills/<name>/SKILL.md` under the WanGP installation and persist across sessions and restarts. They are shared across its workspaces and external/Prime connections, and appear on the next resource browse without reconnecting. Existing pagination cursors continue their original snapshot; start a fresh browse to see changes. Shipped skills cannot be overwritten through this action. Refer to current model metadata and templates instead of copying a model catalogue, full settings, temporary media IDs or session-specific paths into a skill.
 
+#### Lip sync check
+
+External MCP and Deepy Prime expose `wangp_toolbox(action="check_lip_sync", arguments={...})`. Pass the video as `media_id`, optionally `start_s` and `duration_s` (one shot, at most 60 seconds), and `voice_id` for a separate recording of the voice (a vocal stem or the line that drove the shot) with `voice_start_s` for where the shot begins in it. The result gives `verdict` (`follows`, `may_not_follow` or `not_measurable`), `face_height_px`, `face_seen`, `voice_present`, `correlation_at_0`, `best_correlation` and `best_lag_s`, positive when the mouth comes after the voice. It compares when the mouth opens with when the voice is loud, not mouth shapes, and is less reliable on small faces: treat `may_not_follow` as a moment to watch.
+
 #### Audio inspection
 
 External MCP and Deepy Prime expose `wangp_toolbox(action="inspect_audio", arguments={...})`. Pass `media_id`, optionally a 1-based `audio_track_no`, `start_s` and `duration_s`. Measurements use CPU FFmpeg and streaming samples: sample rate/channels, per-channel peak and RMS, full-scale sample counts, EBU R128 integrated loudness/true peak and silence intervals. Coverage and thresholds are returned; at most 200 silence intervals are listed while aggregate counts/duration cover the whole analyzed range. `window_s` (0.1 to 600 seconds, at most 600 windows) adds an `envelope`: lists of RMS, peak and loudest momentary loudness per window (window i starts at `start_s + i * window_s`), to locate climaxes, gaps or a balance problem in one call.
@@ -543,7 +551,7 @@ python -m shared.mcp --mcp-api-version 1
 
 V1 preserves historical names, schemas, defaults, results, errors and execution behavior. V2 uses compact toolbox definitions and deferred action contracts. Underlying operations are shared; aliases are normalized internally rather than advertising both syntaxes. Deepy Prime pins v2.1 independently of this external-server setting; Deepy Zero keeps its historical internal API.
 
-V2 toolboxes use progressive discovery for advanced operations: omit `action` and `arguments` to list actions; supply `action` with absent/null `arguments` to read its contract; supply an `arguments` object to execute. `{}` executes an action with defaults. Arguments without an action are rejected. Declared shortcuts and known contracts execute directly without repeated discovery. `wangp_model` actions only read the chosen model, so they run when `arguments` is omitted; its discovery lists their optional arguments. `wangp_model` additionally requires `model_type`; `wangp_postprocess` requires `media` (image/video/audio or a concrete Gallery ID/authorized path). Post-processing execution requires concrete media. A contract read for a concrete image or video gives each upscaler's `approximate_output_dimensions` per multiplier; spatial and temporal treatments of a video copy its soundtracks and text subtitle tracks. Deepy Prime and external v2.1 expose `remux_media` in place of `replace_audio`: pass `audio_ids` and optionally `video_id`. One audio input plus a video replaces its soundtrack; multiple inputs mix by default. `mode="multitrack"` retains separate selectable streams. To add selectable subtitles, pass `video_id` and `subtitle_tracks`, each with an authorized SRT/VTT/ASS/SSA file `path` and optional ISO 639 `language`, `title`, and `default`. With no `audio_ids`, existing audio streams are copied when compatible with the output container; incompatible streams use the configured video audio codec. Existing video subtitles are retained by default; `include_video_subtitles=false` removes them. MP4/MOV use `mov_text`; MKV copies compatible subtitle streams or converts unsupported ones. Audio-only mixes use the configured standalone WAV or MP3 format by default. When requested, `output_extension` can select WAV, MP3, FLAC or M4A for a mix, or MP4, MOV or MKV for a video output. Audio-only multitrack files use M4A because WAV and MP3 cannot hold separate streams. M4A copies AAC/ALAC streams and converts other streams to lossless ALAC; multitrack video uses MKV and copies audio streams. Video soundtrack replacement copies compatible audio streams and otherwise uses the configured video audio codec. Mixing re-encodes the combined result. External MCP V1 and V2 retain `replace_audio`.
+V2 toolboxes use progressive discovery for advanced operations: omit `action` and `arguments` to list actions; supply `action` with absent/null `arguments` to read its contract; supply an `arguments` object to execute. `{}` executes an action with defaults. Arguments without an action are rejected. Declared shortcuts and known contracts execute directly without repeated discovery. `wangp_model` actions only read the chosen model, so they run when `arguments` is omitted; its discovery lists their optional arguments. `wangp_model` additionally requires `model_type`; `wangp_postprocess` requires `media` (image/video/audio/3d or a concrete Gallery ID/authorized path; meshes take the 3D Refiner and Texturer, Gaussian splats have no treatment). Post-processing execution requires concrete media. A contract read for a concrete image or video gives each upscaler's `approximate_output_dimensions` per multiplier; spatial and temporal treatments of a video copy its soundtracks and text subtitle tracks. Deepy Prime and external v2.1 expose `remux_media` in place of `replace_audio`: pass `audio_ids` and optionally `video_id`. One audio input plus a video replaces its soundtrack; multiple inputs mix by default. `mode="multitrack"` retains separate selectable streams. To add selectable subtitles, pass `video_id` and `subtitle_tracks`, each with an authorized SRT/VTT/ASS/SSA file `path` and optional ISO 639 `language`, `title`, and `default`. With no `audio_ids`, existing audio streams are copied when compatible with the output container; incompatible streams use the configured video audio codec. Existing video subtitles are retained by default; `include_video_subtitles=false` removes them. MP4/MOV use `mov_text`; MKV copies compatible subtitle streams or converts unsupported ones. Audio-only mixes use the configured standalone WAV or MP3 format by default. When requested, `output_extension` can select WAV, MP3, FLAC or M4A for a mix, or MP4, MOV or MKV for a video output. Audio-only multitrack files use M4A because WAV and MP3 cannot hold separate streams. M4A copies AAC/ALAC streams and converts other streams to lossless ALAC; multitrack video uses MKV and copies audio streams. Video soundtrack replacement copies compatible audio streams and otherwise uses the configured video audio codec. Mixing re-encodes the combined result. External MCP V1 and V2 retain `replace_audio`.
 
 For a named model, use `wangp_models(query="SenseNova")` directly. The case-insensitive substring search covers name, ID, family and description; it needs no wildcard. Omit all arguments for discovery. For advanced filters, use `action="search", arguments={"query":"SenseNova","filters":{"main_output":"image"}}`; do not combine the shortcut with action/arguments. String filters match whole values, with optional `*` and `?` globs. An incomplete shortcut result includes a `next_call` recipe for continuation. Results name each model's specialities; `action="specialities"` lists their aliases. `templates` lists the ready-made recipes built on a model as `task: template`, marked `(default)` for a task's default; read one with `wangp_templates(task=..., template=...)`.
 
@@ -592,6 +600,7 @@ Explicit MCP v2 retains `wangp_deepy_templates(tool_id="gen_image")`, which retu
 | Media utilities / previous generation settings | `wangp_toolbox` / discovered action or `media_settings` |
 | File navigation, search, text edits, archives | `wangp_io` / `list`, `rg`, `read_text`, `info`, `edit`, `append_text`, `write_text`, etc. |
 | Jobs, notifications, HTTP Gallery transfers | `wangp_session` / `get_job`, `cancel_job`, `list_queue`, `cancel_queue_task`, `notify`, `create_gallery_upload`, `create_gallery_download` (`list_queue` and `cancel_queue_task` are external-only) |
+| Plugin workflows (such as Media Flow batches) | `wangp_plugins` (v2.1, when enabled Plugins declare a toolbox) / `plugin`, then a discovered action; `wait=false` runs it as a job |
 | Documentation | Standard MCP resources; Prime and external v2.1 expose `mcp_resource` |
 
 Example v2.1 calls:
@@ -633,11 +642,11 @@ IO `rg` adds this pagination around ripgrep; it is not a native rg option. Names
 
 When the folder is named, list it directly, for example `wangp_io(action="list", arguments={"path":"@outputs/selection"})`. Avoid paging through its parent first. For a recursive filename search inside such folders, use `command="--files -g '**/selection/**' -- @outputs"`; `-g '*selection*'` matches basenames, not every descendant of the folder. `-i` changes text matching, not glob casing.
 
-`wangp://guides/workflows` is an index of about 3 KB: one line per workflow section (templates, model limits, media inputs, post-processing and utilities, long video, prompt files and editing) with the URI that reads that section alone, such as `wangp://guides/workflows/long-video-and-sliding-windows`. `mcp_resource` searches and section reads on `wangp://guides/workflows` still cover the whole guide. External v2.1 agents also get a one-line call per action when they list a toolbox's actions, so most calls need no contract read; contracts keep the rules, defaults and examples. Detailed procedural guidance is loaded on demand. Explicit external v1/v2 selection retains its previous filesystem scope. External v2.1 adds the workspace and readable output directories described above; plugin filesystem access remains tied to explicit read permission.
+`wangp://guides/workflows` is an index of about 3 KB: one line per workflow section (templates, model limits, media inputs, post-processing and utilities, long video, prompt files and editing) with the URI that reads that section alone, such as `wangp://guides/workflows/long-video-and-sliding-windows`. `mcp_resource` searches and section reads on `wangp://guides/workflows` still cover the whole guide. External v2.1 agents also get a one-line call per action when they list a toolbox's actions, so most calls need no contract read; contracts keep the rules, defaults and examples. Detailed procedural guidance is loaded on demand. Explicit external v1/v2 selection retains its previous filesystem scope. External v2.1 adds the workspace and readable output directories described above; Plugin filesystem access remains tied to explicit read permission.
 
 In Prime, prefer the session workspace for experiments and editable drafts. Filesystem tools manage that workspace freely. With write access they can create new files in configured output folders and their subfolders, but cannot change, overwrite, delete, rename or move existing output files. Other authorized folders retain their R/RW permissions; deleting or moving an external source removes its vanished-path Gallery entry. This policy does not change generation, post-processing, MCP v1 or Zero contracts.
 
-All product manuals under `docs/` are available as complete MCP resources, including installation, configuration, troubleshooting, model selection, plugins and API integration. Each document ends with a compact `Applies to` note describing its scope for readers. The current server uses that footer as its resource description; Prime and external v2.1 also include it as `applicability` metadata with document reads, section reads and search results, including continuation pages. The scope is therefore available from the first response without reading to the end. Section indexing excludes the footer so its keywords are not attributed to the final section; full-document reads retain it. Interface-specific examples are labelled within mixed documents. This documentation policy does not change filesystem permissions or Deepy Zero's routing.
+All product manuals under `docs/` are available as complete MCP resources, including installation, configuration, troubleshooting, model selection, Plugins and API integration. Each document ends with a compact `Applies to` note describing its scope for readers. The current server uses that footer as its resource description; Prime and external v2.1 also include it as `applicability` metadata with document reads, section reads and search results, including continuation pages. The scope is therefore available from the first response without reading to the end. Section indexing excludes the footer so its keywords are not attributed to the final section; full-document reads retain it. Interface-specific examples are labelled within mixed documents. This documentation policy does not change filesystem permissions or Deepy Zero's routing.
 
 The current workflow resource uses `wangp://guides/workflows`, without a version label in normal discovery or agent instructions. Its previous version-labelled URI is retained as an unlisted read alias. New documents are published automatically and must include an `Applies to` footer describing their subject, audience and relevant platform or interface limits; review tool examples, links and setting semantics before adding them. Product-help documents explain the UI and configuration; current callable contracts govern Deepy's actual tool execution.
 
@@ -692,7 +701,7 @@ Resources:
 - `wangp://skills/long-generation-prompts`
   - Workflow for prompts longer than 4096 characters or tokens, including blank-line-separated sliding windows. Exposed under the same conditions as `long-story-writing`.
 
-Older bundles could also include artifact-based `large-artifact-workflows` and `long-form-story` skills. Those historical names are not a promise of availability: use the connected server's resource listing. Skill exposure follows workspace support; the tool signatures below remain specific to external MCP v1.
+Skill exposure follows workspace support; the tool signatures below remain specific to external MCP v1.
 
 Tools:
 
@@ -712,9 +721,7 @@ Tools:
 - `wangp_get_media_settings(media_id=None, path=None)`
   - Returns the generation settings stored in or extracted from exactly one media file. Use `media_id` with a value returned by `wangp_list_gallery`; use the mutually exclusive `path` input only when filesystem reads are enabled.
 - `wangp_io(action=None, arguments=None)`
-  - With no action, returns the compact allowed action list and accessible roots; pass one action without arguments for its schema, then pass arguments to execute it. Actions cover listing, metadata, ranged UTF-8 reading, text search, literal text writing, finalized-artifact text export, directory creation, copying, moving, permanent deletion, safe ZIP creation/extraction, and downloads. `read_text` accepts only its declared line-range arguments and returns `eof` plus `next_line`; unsupported byte-offset parameters are rejected. `write_artifact_text` requires a finalized `$artifact` reference, renders it directly to the destination, rejects literal content, and returns structural/hash verification with `readback_required=false`. ZIP extraction rejects traversal and symlink entries and does not replace existing files unless `overwrite=true`. Directory listings accept an implicit-extension `media_type` filter (`all`, `image`, `video`, `audio`, `txt`, or `other`) in addition to `pattern`; typed filters return files only, while `other` excludes supported media and `.txt` files. Listings return `has_more` and `next_offset`; repeat the same list call with `offset=next_offset` to continue. Deepy may shorten a requested page to keep its tool result within the active context-safe output budget. For a list that will be processed rather than merely displayed, pass `store_artifact=true` and optionally `artifact_id`/`artifact_title`; the exact returned page is stored and the tool returns compact artifact metadata instead of repeating every entry. Move and delete accept writable paths only, and deleting a non-empty directory requires `recursive=true`. Deepy's scoped mode uses `@alias/path` and resolves plain paths from `@outputs`; standalone MCP `--mcp-allow-read-file-system` permits absolute reads.
-- `wangp_artifact(action=None, arguments=None)`
-  - Manages session-scoped `record_set` collections and mutable `ledger` project memory. Omitting both parameters returns the inline thresholds (10 items and approximately 2,048 payload tokens), actions, limits, and skill resources; pass an action without arguments for its schema, then repeat the top-level action with a separate top-level arguments object to execute it. Omitting the action while passing `arguments={}` directly lists existing artifacts. A complete call accidentally nested as `{action, arguments}` inside `arguments` is normalized, while other missing-action payloads fail explicitly instead of silently returning discovery. Actions are `create`, `list`, `prepare`, `append`, `commit_item`, `query`, `status`, `update_records`, `update_ledger`, `finalize`, and `delete`. Mutations support optimistic `expected_revision` checks and idempotent `operation_id` values. A record set may opt into a ledger-linked sequential workflow; managed results expose a cursor, phase, and binding `next_required_action`. Each iteration is `prepare` followed by one atomic `commit_item`, which stores the exact item, applies its compact ledger delta, and advances the cursor together. `prepare` returns bounded context plus exact queries for authoritative older data; it does not load the complete project. Finalization can validate item count, required fields, uniqueness, contiguous numbering, and a numeric total. Record sets must be finalized before another tool consumes them; ledgers remain mutable.
+  - With no action, returns the compact allowed action list and accessible roots; pass one action without arguments for its schema, then pass arguments to execute it. Actions cover listing, metadata, ranged UTF-8 reading, text search, literal text writing, directory creation, copying, moving, permanent deletion, safe ZIP creation/extraction, and downloads. `read_text` accepts only its declared line-range arguments and returns `eof` plus `next_line`; unsupported byte-offset parameters are rejected. ZIP extraction rejects traversal and symlink entries and does not replace existing files unless `overwrite=true`. Directory listings accept an implicit-extension `media_type` filter (`all`, `image`, `video`, `audio`, `txt`, or `other`) in addition to `pattern`; typed filters return files only, while `other` excludes supported media and `.txt` files. Listings return `has_more` and `next_offset`; repeat the same list call with `offset=next_offset` to continue. Deepy may shorten a requested page to keep its tool result within the active context-safe output budget. Move and delete accept writable paths only, and deleting a non-empty directory requires `recursive=true`. Deepy's scoped mode uses `@alias/path` and resolves plain paths from `@outputs`; standalone MCP `--mcp-allow-read-file-system` permits absolute reads.
 - `wangp_create_gallery_upload(filename)` *(HTTP transports only)*
   - Creates a short-lived HTTP PUT URL. A successful upload returns the new Gallery record and selects it.
 - `wangp_create_gallery_download(media_id)` *(HTTP transports only)*
@@ -726,28 +733,15 @@ Tools:
 - `wangp_postprocess(media_id=None, path=None, process=None, parameters=None)`
   - Provide exactly one source: `media_id` for Gallery media, or `path` for a server file when filesystem reads are enabled. With no process, discovers compatible post-processing operations. With a returned process id, queues the operation through WanGP and returns a job id.
 - `wangp_toolbox(action=None, arguments=None)`
-  - With no action, returns a compact utility list; pass one action without arguments for its exact schema, then pass arguments to execute it. Supports adding authorized image/video/audio files to its Gallery, joint visual inspection of up to five images or video frames, extraction, transcription, resize/crop, audio replacement, video merging, media-detail, and documentation operations using media IDs. Its nested arguments accept compact `$artifact` references. `add_to_gallery` accepts one `path` or up to 50 `paths`, including `output_file` values returned by other toolbox actions; it applies visible-history retention once per Gallery before the batch, keeps the entire batch, selects existing items without duplication, does not rewrite source metadata, and does not create generated-media chat cards. Direct paths require filesystem-read permission.
+  - With no action, returns a compact utility list; pass one action without arguments for its exact schema, then pass arguments to execute it. Supports adding authorized image/video/audio files to its Gallery, joint visual inspection of up to five images or video frames, extraction, transcription, resize/crop, audio replacement, video merging, media-detail, and documentation operations using media IDs. `add_to_gallery` accepts one `path` or up to 50 `paths`, including `output_file` values returned by other toolbox actions; it applies visible-history retention once per Gallery before the batch, keeps the entire batch, selects existing items without duplication, does not rewrite source metadata, and does not create generated-media chat cards. Direct paths require filesystem-read permission.
 - `wangp_generate(source, wait=False, timeout_s=None, event_limit=20)`
-  - Starts a job from a settings dict, task dict, manifest dict, or task list. Media fields accept media IDs returned by `wangp_list_gallery`; direct paths require filesystem-read permission. Any nested value may be a compact `$artifact` reference, which is resolved server-side before validation/submission. Terminal results include matching compact `gallery_items` records.
+  - Starts a job from a settings dict, task dict, manifest dict, or task list. Media fields accept media IDs returned by `wangp_list_gallery`; direct paths require filesystem-read permission. Terminal results include matching compact `gallery_items` records.
 - `wangp_get_job(job_id, event_limit=20)`
   - Polls progress/events/result.
 - `wangp_cancel_job(job_id)`
   - Requests cancellation.
 
 Deepy's in-process MCP exposes only the three compact model-data tools above. Standalone MCP clients retain the legacy granular endpoints (`wangp_list_models`, `wangp_search_models`, `wangp_list_model_defs`, `wangp_get_model`, `wangp_get_model_metadata`, `wangp_get_model_availability`, `wangp_list_model_availability`, `wangp_get_default_settings`, and `wangp_get_model_schema`) for compatibility.
-
-An artifact reference is a JSON object with `$artifact` set to an artifact ID. Optional `where` filters records, `select` extracts one dotted field, and `offset`/`limit` select a range. `template` formats every object record, while `join` joins the selected/formatted values into one string; `prefix` and `suffix` apply to each joined value. Without `join`, selection returns an array. References may appear recursively in `wangp_io` and `wangp_toolbox` arguments and in `wangp_generate` source values. For example:
-
-```json
-{
-  "$artifact": "artifact_0123456789ab",
-  "where": [{"field": "approved", "op": "eq", "value": true}],
-  "template": "[/duration={duration_seconds}s] {prompt}",
-  "join": "\n\n"
-}
-```
-
-Supported filter operators are `eq`, `ne`, `contains`, `starts_with`, `ends_with`, `in`, `gt`, `gte`, `lt`, and `lte`. Artifact storage is bounded to 32 artifacts, 10,000 items, and 8 MiB per artifact; query pages are capped at 500 records.
 
 ## Getting Outputs In Memory
 
@@ -879,13 +873,13 @@ Convenience helpers are available for the common edit task shapes:
 
 #### Image And Video Postprocessing
 
-`submit_media_postprocessing(...)` accepts one media source plus any combination of temporal upsampling, spatial upsampling, and film grain:
+`submit_media_postprocessing(...)` accepts one media source plus any combination of temporal upsampling, spatial upsampling, and film grain. Meshes take a 3D Refiner (`spatial_upsampling`) and a Texturer (`temporal_upsampling`):
 
 ```python
 job = session.submit_media_postprocessing(
     r"C:\media\input.mp4",
     spatial_upsampling="h3facerefine",
-    spatial_upsampler_param=2,
+    spatial_postprocessing_parameters={"face_count": 2},
     return_media=True,
 )
 
@@ -895,9 +889,10 @@ print(result.generated_files)
 
 Postprocessing values use the registered postprocessor value strings:
 
-- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4`. Temporal upsampling is video-only.
-- `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiner `h3facerefine`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
-- Method-specific values use the flat parameter ids returned by postprocessing discovery. For example, H3 accepts `spatial_upsampler_prompt`, `spatial_upsampler_reference_images`, and `spatial_upsampler_param`.
+- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` and `pixal3d_texture` for meshes. For native Pixal3D, `postprocessing_reference_images` accepts one matching image or four views ordered front, right, back, left.
+- `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiners `h3facerefine` and `taomatefvsr`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
+- `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`, TaoMate-FVSR `face_count`, `face_strength` and `follow_audio`, both taking `postprocessing_reference_images` as face references; the texturers accept `texture_size` and `texture_max_faces`.
+- `postprocessing_reference_images`: the reference images shared by both processors: H3's face references, or the object image of Hi3D and the texturers (their `reference_images` parameter).
 - `film_grain_intensity` / `film_grain_saturation`: late film grain settings. Film grain is active when intensity is greater than `0`.
 
 At least one postprocessing operation must be selected.
@@ -956,7 +951,7 @@ Common built-in standalone audio methods:
 
 #### Raw Edit Tasks
 
-All helper calls build normal task settings, so plugins, Deepy, saved queues, manifests, and MCP clients can submit edit tasks directly through `submit_task(...)`, `submit_manifest(...)`, or `wangp_generate(...)`.
+All helper calls build normal task settings, so Plugins, Deepy, saved queues, manifests, and MCP clients can submit edit tasks directly through `submit_task(...)`, `submit_manifest(...)`, or `wangp_generate(...)`.
 
 ```python
 settings = {
@@ -964,8 +959,6 @@ settings = {
     "video_source": r"C:\media\input.mp4",
     "temporal_upsampling": "rife*4",
     "spatial_upsampling": "lanczos*2",
-    "spatial_upsampler_param": 1,
-    "spatial_upsampler_param2": 1,
     "_api": {"return_media": True},
 }
 
@@ -976,7 +969,7 @@ Raw task modes:
 
 | Mode | Source field | Processor fields |
 | --- | --- | --- |
-| `edit_postprocessing` | `video_source` | `temporal_upsampling`, `spatial_upsampling`, flat `spatial_upsampler_*` method parameters, `film_grain_intensity`, `film_grain_saturation` |
+| `edit_postprocessing` | `video_source` | `temporal_upsampling`, `spatial_upsampling`, `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters` (each processor's options by id), `postprocessing_reference_images`, `film_grain_intensity`, `film_grain_saturation` |
 | `edit_remux` | `video_source` | `postprocess_audio`, `audio_source`, `postprocess_audio_prompt`, `postprocess_audio_neg_prompt`, `replace_voice_sample`, `replace_voice_sample2` |
 | `edit_audio` | `audio_source` | `postprocess_audio`, `replace_voice_sample`, `replace_voice_sample2` |
 
@@ -1389,7 +1382,7 @@ Cancellation is cooperative and forwards WanGP's normal abort signal to the acti
 
 `wangp_workspace()` returns the connection's current assignment. With **MCP Agent Workspace** set to **Create a Workspace per Agent** in Configuration / Agents, each connection gets its own persistent gallery workspace, using the storage mode selected in Outputs. `action="list"` lists the workspaces the agent may use; optional `query`, `limit` and `offset` narrow the results without changing the visible gallery. **Workspaces Agents Can See** in Configuration / Agents sets which ones: their own (the context's workspace and the workspaces it created), their own and the user's ordinary workspaces (the default), or all of them, including Deepy conversation workspaces and other agents' workspaces. The same choice governs `attach`. `wangp_validate` also takes `agent_context`, so it checks media from the agent's workspace. In **Use Selected Workspace** mode, the reply of `wangp_workspace()` for the shared context says so in `assignment`. `action="create", name="Project"` creates an independent agent context. `action="attach", workspace_id="..."` creates a context for an existing collection.
 
-Keep the returned `agent_context`. Pass it on `wangp_generate`, `wangp_postprocess`, `wangp_toolbox`, `wangp_list_gallery`, `wangp_io` and `wangp_session` calls to resume after reconnecting or to run several logical agents over one connection. Pass it to `wangp_workspace` to inspect that assignment. For example:
+Keep the returned `agent_context`. Pass it on `wangp_generate`, `wangp_postprocess`, `wangp_toolbox`, `wangp_plugins`, `wangp_list_gallery`, `wangp_io` and `wangp_session` calls to resume after reconnecting or to run several logical agents over one connection. Pass it to `wangp_workspace` to inspect that assignment. For example:
 
 ```python
 wangp_workspace(action="list", query="Film")

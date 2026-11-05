@@ -1,0 +1,20 @@
+EVOKE-Turbo world model adapted from Alaya-EVOKE:
+https://github.com/AlayaLab/Evoke (revision 1d271be45128bbda4263e9e3c7dfc8f6ba260492)
+https://huggingface.co/AlayaLab/Evoke-Turbo
+Copyright 2025 The Helios Team and The HuggingFace Team, Copyright 2026 The Evoke Team.
+The inference code and the Evoke-Turbo weights are licensed under Apache-2.0 (LICENSE in this folder).
+The WanGP checkpoint stores the transformer in BF16 with the modules the source keeps in FP32 at inference
+(time embedder, modulation tables, the affine cross-attention norm) in FP32, under WanGP's Wan module names.
+
+The world memory's depth model is ViGeo1.1:
+https://github.com/aigc3d/ViGeo (code, commit 78100ce), Apache-2.0
+https://huggingface.co/pkqbajng/ViGeo1.1 (weights)
+Its DINOv2 layers are Copyright (c) Meta Platforms, Inc. and affiliates, Apache-2.0.
+
+THE ViGeo1.1 WEIGHTS ARE LICENSED UNDER CC-BY-NC-4.0 (Creative Commons Attribution-NonCommercial 4.0,
+https://creativecommons.org/licenses/by-nc/4.0/): they may not be used for commercial purposes. EVOKE worlds
+need them for their memory, so generating or exploring an EVOKE world is subject to this restriction; users
+are responsible for meeting it. The WanGP file keeps the trunk and decoder projections in FP16 and the rest in
+FP32, without the heads EVOKE does not read (ray, normal, mask, confidence, camera).
+
+The Wan2.1 VAE and the UMT5-XXL text encoder are WanGP's existing Wan2.1 components (Apache-2.0).

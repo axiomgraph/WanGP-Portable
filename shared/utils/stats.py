@@ -87,6 +87,17 @@ def init_gpu_backend():
 
 gpu_backend = init_gpu_backend()
 
+
+def live_stats():
+    """The whole GPU's VRAM use and load (when a GPU backend is available), the system's and WanGP's RAM, in GB."""
+    ram = psutil.virtual_memory()
+    stats = {"ram_used_gb": round((ram.total - ram.available) / 2**30, 1), "ram_total_gb": round(ram.total / 2**30, 1),
+             "process_ram_gb": round(psutil.Process().memory_info().rss / 2**30, 1)}
+    if gpu_backend is not None:
+        load, used, total = gpu_backend.query()
+        stats.update(gpu_load=load, vram_used_gb=round(used / 2**30, 1), vram_total_gb=round(total / 2**30, 1))
+    return stats
+
 class SystemStatsApp:
     def __init__(self):
         self.running = True

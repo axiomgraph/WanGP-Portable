@@ -27,6 +27,10 @@ except Exception:  # pragma: no cover
     llamacpp_gguf_cuda = None
 from shared.kernels import bf16_bits, dispatch
 from ..utils.context import get_context
+from . import kv_formats as kvf
+from . import attention_mixed
+
+_MIXED_KERNELS = True  # mixed layouts use the Triton kernels of attention_mixed where available (else the dense fallbacks)
 
 _DEFAULT_FLASH_ATTN_VARLEN_FUNC = flash_attn_varlen_func
 _DEFAULT_FLASH_ATTN_WITH_KVCACHE = flash_attn_with_kvcache
@@ -495,6 +499,107 @@ def _flash_attention_fallback_speculative(
     return _sdpa_attention(q.transpose(0, 1).unsqueeze(0), keys, values, scale, num_key_value_groups, attention_bias=bias, is_causal=False).squeeze(0).transpose(0, 1)
 
 
+if triton is not None:
+    @triton.jit
+    def _store_group(x, data_ptr, scale_ptr, min_ptr, BITS: tl.constexpr, ASYM: tl.constexpr):
+        """One group of 32 values quantized to the format (kv_formats) and stored: data at data_ptr, FP16 scale and min at their pointers."""
+        if BITS == 8:
+            scale = tl.maximum(tl.max(tl.abs(x), axis=0) * (1.0 / 127.0), 1e-8)  # as PyTorch: a scalar divisor multiplies by its reciprocal, elementwise divisions are exact
+            tl.store(data_ptr + tl.arange(0, 32), tl_libdevice.nearbyint(tl.div_rn(x, scale)).to(tl.int8))
+            tl.store(scale_ptr, scale.to(tl.float16))
+        else:
+            lanes = tl.arange(0, 32)
+            if ASYM:
+                lo = tl.min(x, axis=0)
+                d = (tl.max(x, axis=0) - lo) * (1.0 / 15.0)
+                inverse = tl.where(d > 0, tl.div_rn(1.0, d), 0.0)
+                q = tl.minimum(tl.maximum(tl_libdevice.nearbyint((x - lo) * inverse), 0.0), 15.0).to(tl.int32)
+                tl.store(scale_ptr, d.to(tl.float16))
+                tl.store(min_ptr, lo.to(tl.float16))
+            else:
+                HALF: tl.constexpr = 1 << (BITS - 1)
+                largest = tl.max(tl.abs(x), axis=0)
+                first = tl.min(tl.where(tl.abs(x) == largest, lanes, 32), axis=0)  # the first extreme, as llama.cpp and torch.argmax
+                extreme = tl.sum(tl.where(lanes == first, x, 0.0), axis=0)
+                d = extreme * (-1.0 / HALF)
+                inverse = tl.where(d != 0, tl.div_rn(1.0, d), 0.0)
+                q = tl.minimum(tl.maximum(tl_libdevice.nearbyint(x * inverse) + HALF, 0.0), 2.0 * HALF - 1.0).to(tl.int32)
+                tl.store(scale_ptr, d.to(tl.float16))
+            first, second = tl.split(tl.trans(tl.reshape(q, (2, 16))))  # values 0..15 and 16..31
+            tl.store(data_ptr + tl.arange(0, 16), ((first & 15) | ((second & 15) << 4)).to(tl.uint8))
+            if BITS == 6:
+                high = tl.reshape(q >> 4, (2, 4, 4))  # (half, r, b)
+                plane = tl.sum(high << (2 * tl.arange(0, 4))[None, :, None], axis=1)  # (half, b)
+                tl.store(data_ptr + 16 + tl.arange(0, 8), tl.reshape(plane, (8,)).to(tl.uint8))
+
+
+    @triton.jit
+    def store_mixed_kvcache_kernel(
+        key_ptr, key_stride_token, key_stride_head, value_ptr, value_stride_token, value_stride_head,
+        k_body_ptr, v_body_ptr, k_scale_ptr, v_scale_ptr, k_min_ptr, v_min_ptr,
+        k_overlay_ptr, v_overlay_ptr, k_overlay_scale_ptr, v_overlay_scale_ptr, slot_mapping_ptr, overlay_mapping_ptr,
+        H: tl.constexpr, D: tl.constexpr, QB: tl.constexpr, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
+        OVERLAY: tl.constexpr, BF16_BITS: tl.constexpr = False,
+    ):
+        """A token's key and value group into the body in its formats and, for a token with an overlay row, into the exact Q8 overlays."""
+        idx = tl.program_id(0)
+        token_idx = idx // (H * QB)
+        head_block_idx = idx % (H * QB)
+        head_idx = head_block_idx // QB
+        quant_block_idx = head_block_idx % QB
+        slot = tl.load(slot_mapping_ptr + token_idx)
+        if slot == -1: return
+        offsets = quant_block_idx * 32 + tl.arange(0, 32)
+        key = _load_fp32(key_ptr + token_idx * key_stride_token + head_idx * key_stride_head + offsets, BF16_BITS)
+        value = _load_fp32(value_ptr + token_idx * value_stride_token + head_idx * value_stride_head + offsets, BF16_BITS)
+        K_BYTES: tl.constexpr = 32 * K_BITS // 8
+        V_BYTES: tl.constexpr = 32 * V_BITS // 8
+        scale_offset = (slot * H + head_idx) * QB + quant_block_idx
+        _store_group(key, k_body_ptr + (slot * H + head_idx) * (QB * K_BYTES) + quant_block_idx * K_BYTES, k_scale_ptr + scale_offset, k_min_ptr + scale_offset, K_BITS, K_ASYM)
+        _store_group(value, v_body_ptr + (slot * H + head_idx) * (QB * V_BYTES) + quant_block_idx * V_BYTES, v_scale_ptr + scale_offset, v_min_ptr + scale_offset, V_BITS, V_ASYM)
+        if OVERLAY:
+            row = tl.load(overlay_mapping_ptr + token_idx)
+            if row >= 0:
+                overlay_scale = (row * H + head_idx) * QB + quant_block_idx
+                _store_group(key, k_overlay_ptr + (row * H + head_idx) * D + quant_block_idx * 32, k_overlay_scale_ptr + overlay_scale, k_min_ptr, 8, False)
+                _store_group(value, v_overlay_ptr + (row * H + head_idx) * D + quant_block_idx * 32, v_overlay_scale_ptr + overlay_scale, v_min_ptr, 8, False)
+
+
+def _store_mixed(key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale, k_min, v_min, k_overlay, v_overlay, k_overlay_scale, v_overlay_scale, overlay_mapping, layout, use_triton):
+    N, num_heads, head_dim = key.shape
+    quant_blocks = head_dim // _Q8_KV_BLOCK_SIZE
+    overlay = k_overlay is not None and overlay_mapping is not None
+    if use_triton and key.is_cuda:
+        bits = key.dtype == torch.bfloat16 and not dispatch.triton_dtype_supported(key.device, torch.bfloat16)
+        dummy = k_scale
+        store_mixed_kvcache_kernel[(N * num_heads * quant_blocks,)](
+            key.view(torch.int16) if bits else key, key.stride(0), key.stride(1), value.view(torch.int16) if bits else value, value.stride(0), value.stride(1),
+            k_cache, v_cache, k_scale, v_scale, dummy if k_min is None else k_min, dummy if v_min is None else v_min,
+            k_overlay if overlay else k_cache, v_overlay if overlay else v_cache, k_overlay_scale if overlay else k_scale, v_overlay_scale if overlay else v_scale,
+            slot_mapping, overlay_mapping if overlay else slot_mapping,
+            num_heads, head_dim, quant_blocks, layout.k.bits, layout.k.asymmetric, layout.v.bits, layout.v.asymmetric, overlay, BF16_BITS=bits)
+        torch.autograd.graph.increment_version(tuple(t for t in (k_cache, v_cache, k_scale, v_scale, k_min, v_min, k_overlay, v_overlay, k_overlay_scale, v_overlay_scale) if t is not None))
+        return
+    valid = slot_mapping >= 0
+    capturing = slot_mapping.is_cuda and torch.cuda.is_current_stream_capturing()
+    if not capturing and not bool(torch.any(valid)):
+        return
+    slots = slot_mapping.long() if capturing else slot_mapping[valid].long()
+    for x, fmt, body, scale, minimum in ((key, layout.k, k_cache, k_scale, k_min), (value, layout.v, v_cache, v_scale, v_min)):
+        data, scales, mins = kvf.quantize_heads(x if capturing else x[valid], fmt)
+        body.reshape(-1, num_heads, body.shape[-1]).index_copy_(0, slots, data)
+        scale.reshape(-1, num_heads, quant_blocks).index_copy_(0, slots, scales)
+        if minimum is not None:
+            minimum.reshape(-1, num_heads, quant_blocks).index_copy_(0, slots, mins)
+    if overlay:
+        rows = overlay_mapping if capturing else overlay_mapping[valid]
+        rows = torch.where(rows >= 0, rows, torch.full_like(rows, k_overlay.shape[0] - 1)).long()  # the scratch row takes the tokens without overlay
+        for x, body, scale in ((key, k_overlay, k_overlay_scale), (value, v_overlay, v_overlay_scale)):
+            data, scales, _ = kvf.quantize_heads(x if capturing else x[valid], kvf.Q8)
+            body.reshape(-1, num_heads, head_dim).index_copy_(0, rows, data)
+            scale.reshape(-1, num_heads, quant_blocks).index_copy_(0, rows, scales)
+
+
 def store_kvcache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -504,8 +609,21 @@ def store_kvcache(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     use_triton_kv_cache: bool | None = None,
+    *,
+    k_min: torch.Tensor | None = None,
+    v_min: torch.Tensor | None = None,
+    k_overlay: torch.Tensor | None = None,
+    v_overlay: torch.Tensor | None = None,
+    k_overlay_scale: torch.Tensor | None = None,
+    v_overlay_scale: torch.Tensor | None = None,
+    overlay_mapping: torch.Tensor | None = None,
+    layout=None,
 ):
     assert slot_mapping.numel() == key.shape[0]
+    if use_triton_kv_cache is None:
+        use_triton_kv_cache = _USE_TRITON_KV_CACHE
+    if layout is not None and layout.mixed:
+        return _store_mixed(key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale, k_min, v_min, k_overlay, v_overlay, k_overlay_scale, v_overlay_scale, overlay_mapping, layout, use_triton_kv_cache)
     quantized = k_cache.dtype == torch.int8
     if quantized and (k_scale is None or v_scale is None):
         raise RuntimeError("INT8 KV cache requires key and value scales.")
@@ -570,6 +688,27 @@ def _dequantize_kvcache(cache: torch.Tensor, scale: torch.Tensor, dtype: torch.d
     return cache.reshape(*cache.shape[:-1], scale.shape[-1], _Q8_KV_BLOCK_SIZE).to(dtype).mul_(scale.to(dtype).unsqueeze(-1)).reshape_as(cache)
 
 
+def _dense_body(cache: torch.Tensor, scale: torch.Tensor, minimum: torch.Tensor | None, fmt, dtype: torch.dtype) -> torch.Tensor:
+    """The whole paged body dequantized to [pages, page, H, D] in dtype."""
+    return _dequantize_kvcache(cache, scale, dtype) if fmt.q8 else kvf.dequantize_heads(cache, scale, minimum, fmt, dtype)
+
+
+def _apply_overlays(dense: torch.Tensor, overlay: torch.Tensor, overlay_scale: torch.Tensor, context, layout, dtype: torch.dtype) -> None:
+    """The exact Q8 overlay rows of every sequence written over its sink and ring positions of the dense cache (fallback paths only)."""
+    page = int(dense.shape[1])
+    sink, recent = layout.sink_tokens(page), layout.recent_tokens
+    lengths = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]) if context.context_lens is None else context.context_lens
+    for index, (base, start, length) in enumerate(zip(context.overlay_base.tolist(), context.ring_start.tolist(), lengths.tolist())):
+        if base < 0:
+            continue
+        positions = torch.cat((torch.arange(0, min(length, sink), device=dense.device), torch.arange(min(start, length), length, device=dense.device)))
+        if positions.numel() == 0:
+            continue
+        rows = base + torch.where(positions < sink, positions, sink + (positions & (recent - 1)))
+        pages = context.block_tables[index][positions // page].long()
+        dense[pages, positions % page] = _dequantize_kvcache(overlay[rows], overlay_scale[rows], dtype)
+
+
 def _q8_paged_prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, k_scale: torch.Tensor, v_scale: torch.Tensor, context, softmax_scale: float) -> torch.Tensor:
     output = torch.empty_like(q)
     query_lengths = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
@@ -580,7 +719,7 @@ def _q8_paged_prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
             q, k_cache, v_cache, k_scale, v_scale, context.block_tables, context.cu_seqlens_q, context.cu_seqlens_k, output,
             q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             k_scale.stride(0), k_scale.stride(1), k_scale.stride(2), context.block_tables.stride(0), output.stride(0), output.stride(1), softmax_scale,
-            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=2,
+            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=_Q8_EXACT_PREFILL_STAGES,
         )
         return output
     q8_paged_prefill_kernel[grid](
@@ -612,17 +751,20 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.flash_attn_varlen_func = _DEFAULT_FLASH_ATTN_VARLEN_FUNC
         self.flash_attn_with_kvcache = _DEFAULT_FLASH_ATTN_WITH_KVCACHE
+        # the LM features' Triton switch: each call then takes the Triton kernels the GPU runs for q's dtype (native, or BF16 read as bits on Turing)
         self.use_triton_kv_cache = _DEFAULT_USE_TRITON_KV_CACHE
-        self.efficient_prefill = False  # set by the model on GPUs without FlashAttention: one memory-efficient FP32 SDPA per sequence
-        self.use_bf16_bits = False  # set by models on GPUs that run Triton without BF16 conversions: Q8 decode/verification of shared.kernels.bf16_bits
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
         self._q8_speculative_metadata = {}
+        self.kv_layout = None  # kv_formats.KVCacheLayout of a quantized cache (set by the runner)
+        self.k_min = self.v_min = None  # FP16 minimums of asymmetric body formats
+        self.k_overlay = self.v_overlay = None  # exact Q8 overlays (sink and recent ring) of a mixed layout, [rows, H, D]
+        self.k_overlay_scale = self.v_overlay_scale = None
 
     def prepare_speculative_metadata(self, max_query_count: int, max_num_blocks: int) -> None:
         if self.k_cache.dtype != torch.int8 or not self.k_cache.is_cuda or _Q8_PAGED_ATTENTION is None:
             return
-        if self.use_triton_kv_cache and triton is not None and self.head_dim in (32, 64, 128, 256):
+        if self.use_triton_kv_cache and triton is not None and self.head_dim in (32, 64, 128, 256) and dispatch.triton_dtype_supported(self.k_cache.device, torch.bfloat16):
             return
         # Allocate before graph-state registration; eager and captured calls share fixed-width tables.
         self._q8_speculative_metadata = {
@@ -638,19 +780,32 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if not cache_written and k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, self.k_scale, self.v_scale, use_triton_kv_cache=self.use_triton_kv_cache)
-        quantized_cache = k_cache.dtype == torch.int8
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, self.k_scale, self.v_scale, use_triton_kv_cache=self.use_triton_kv_cache,
+                          k_min=self.k_min, v_min=self.v_min, k_overlay=self.k_overlay, v_overlay=self.v_overlay, k_overlay_scale=self.k_overlay_scale,
+                          v_overlay_scale=self.v_overlay_scale, overlay_mapping=context.overlay_mapping, layout=self.kv_layout)
+        quantized_cache = k_cache.dtype in (torch.int8, torch.uint8)
+        mixed = quantized_cache and self.kv_layout is not None and self.kv_layout.mixed
+        q8_kernels = quantized_cache and not mixed  # the Q8 kernels never read a mixed body: attention_mixed or the dense fallbacks do
         reads_cache = context.speculative_verify or not context.is_prefill or context.block_tables is not None
-        q8_attention = _Q8_PAGED_ATTENTION if quantized_cache and not context.speculative_verify and not context.is_prefill else None
-        use_triton = self.use_triton_kv_cache and triton is not None
-        q8_grouped = quantized_cache and use_triton and self.head_dim in (32, 64, 128, 256) and (context.speculative_verify or not context.is_prefill)
-        q8_prefill = quantized_cache and context.is_prefill and context.block_tables is not None and use_triton
-        q8_speculative = quantized_cache and context.speculative_verify and _Q8_PAGED_ATTENTION is not None
-        if self.use_bf16_bits and quantized_cache and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
+        q8_attention = _Q8_PAGED_ATTENTION if q8_kernels and not mixed and not context.speculative_verify and not context.is_prefill else None
+        use_triton = self.use_triton_kv_cache and triton is not None and dispatch.triton_dtype_supported(q.device, q.dtype)
+        bits = self.use_triton_kv_cache and triton is not None and bf16_bits.applies(q)  # Turing: the kernels reading BF16 q as bits
+        q8_grouped = q8_kernels and use_triton and self.head_dim in (32, 64, 128, 256) and (context.speculative_verify or not context.is_prefill)
+        q8_prefill = q8_kernels and context.is_prefill and context.block_tables is not None and use_triton
+        q8_speculative = q8_kernels and not mixed and context.speculative_verify and _Q8_PAGED_ATTENTION is not None
+        if bits and quantized_cache and not mixed and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
             _log_kv_attention_backend_once("bf16_bits_q8", "[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention for Turing (BF16 read as bits, FP16 tensor cores, FP32 accumulation).")
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = bf16_bits.q8_paged_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output if context.speculative_verify else output.unsqueeze(1)
+        if mixed and _MIXED_KERNELS and (use_triton or bits) and attention_mixed.available(q, self, prefill=context.is_prefill and not context.speculative_verify):
+            if context.speculative_verify or not context.is_prefill:
+                _log_kv_attention_backend_once("mixed_grouped", f"[Deepy][KV cache] decode/verification backend=grouped paged attention over the {self.kv_layout.value} cache (Triton, FP32 accumulation).")
+                output = attention_mixed.grouped_attention(q, self, context, self.scale)
+                return output if context.speculative_verify else output.unsqueeze(1)
+            if context.block_tables is not None:
+                _log_kv_attention_backend_once("mixed_prefill", f"[Deepy][KV cache] prefix prefill backend=exact integer paged attention over the {self.kv_layout.value} cache (Triton).")
+                return attention_mixed.prefill(q, self, context, self.scale)
         if (q8_attention is not None or q8_grouped or q8_prefill or q8_speculative) and q.is_cuda and q.is_contiguous() and q.dtype in (torch.float16, torch.bfloat16) and self.head_dim <= 256 and self.head_dim % _Q8_KV_BLOCK_SIZE == 0:
             dtype_name = "BF16" if q.dtype == torch.bfloat16 else "FP16"
             if q8_grouped:
@@ -674,17 +829,20 @@ class Attention(nn.Module):
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = q8_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output.squeeze(1) if context.speculative_verify else output
-        if (self.efficient_prefill and context.is_prefill and not context.speculative_verify
-                and self.flash_attn_varlen_func is None):
+        # GPUs without BF16 arithmetic (pre-Ampere NVIDIA) and without FlashAttention: one memory-efficient FP32 SDPA per sequence
+        if (context.is_prefill and not context.speculative_verify and self.flash_attn_varlen_func is None
+                and q.is_cuda and not dispatch.triton_dtype_supported(q.device, q.dtype)):
             # Gather occupied pages before dequantizing on the hardware-selected
             # SDPA route, rather than expanding the entire reserved Q8 cache.
+            if mixed:
+                dense_k, dense_v = self._dense_caches(torch.float32, context)
+                return _flash_attention_fallback_prefill(q, k, v, self.scale, self.num_heads // self.num_kv_heads, context, dense_k, dense_v, efficient=True)
             return _flash_attention_fallback_prefill(
                 q, k, v, self.scale, self.num_heads // self.num_kv_heads, context, k_cache, v_cache,
                 efficient=True,
                 k_scale=self.k_scale if quantized_cache else None, v_scale=self.v_scale if quantized_cache else None,
             )
-        attention_k_cache = _dequantize_kvcache(k_cache, self.k_scale, q.dtype) if quantized_cache and reads_cache else k_cache
-        attention_v_cache = _dequantize_kvcache(v_cache, self.v_scale, q.dtype) if quantized_cache and reads_cache else v_cache
+        attention_k_cache, attention_v_cache = self._dense_caches(q.dtype, context) if quantized_cache and reads_cache else (k_cache, v_cache)
         # AMD Triton FA2 exposes the FlashAttention functions, but rejects their
         # block_table argument. Import success does not imply paged-cache support.
         # Keep ordinary (non-paged) FlashAttention prefill available on HIP.
@@ -751,6 +909,18 @@ class Attention(nn.Module):
                     attention_v_cache,
                 )
         return o
+
+    def _dense_caches(self, dtype: torch.dtype, context) -> tuple[torch.Tensor, torch.Tensor]:
+        """The quantized cache as dense [pages, page, H, D] tensors for the SDPA / FlashAttention paths, exact overlays applied."""
+        layout = self.kv_layout
+        if layout is None or not layout.mixed:
+            return _dequantize_kvcache(self.k_cache, self.k_scale, dtype), _dequantize_kvcache(self.v_cache, self.v_scale, dtype)
+        dense_k = _dense_body(self.k_cache, self.k_scale, self.k_min, layout.k, dtype)
+        dense_v = _dense_body(self.v_cache, self.v_scale, self.v_min, layout.v, dtype)
+        if layout.overlay and self.k_overlay is not None and context.overlay_base is not None and context.block_tables is not None:
+            _apply_overlays(dense_k, self.k_overlay, self.k_overlay_scale, context, layout, dtype)
+            _apply_overlays(dense_v, self.v_overlay, self.v_overlay_scale, context, layout, dtype)
+        return dense_k, dense_v
 
     def forward_list(self, qkv_list: list[torch.Tensor], *, cache_written=False):
         q, k, v = qkv_list
@@ -849,3 +1019,6 @@ if triton is not None and tl is not None:
         if BF16_BITS:
             return bf16_bits.bf16_bits_to_fp32(tl.load(pointer))
         return tl.load(pointer).to(tl.float32)
+
+    # Triton 3.2 aborts when pipelining the exact Q8 prefill kernel's rank-three loads.
+    _Q8_EXACT_PREFILL_STAGES = 1 if triton.__version__.split(".")[:2] == ["3", "2"] else 2

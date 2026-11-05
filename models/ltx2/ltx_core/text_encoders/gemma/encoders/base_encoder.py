@@ -6,7 +6,7 @@ import torch
 from einops import rearrange
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor, Gemma3ForCausalLM
 
-from mmgp import offload
+from mmgp import offload, runtime
 from ....loader.module_ops import ModuleOps
 from ..embeddings_connector import Embeddings1DConnector
 from ..feature_extractor import GemmaFeaturesExtractorProjLinear
@@ -472,6 +472,9 @@ def build_gemma_text_encoder(
         default_dtype=default_dtype,
         ignore_unused_weights=gemma4,
     )
+    # the 1.9 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU; its tied head never runs
+    runtime.lookup_on_cpu(text_encoder.model.model.embed_tokens)
+    runtime.unused(text_encoder.model.lm_head)
     text_encoder.tokenizer = LTXVGemmaTokenizer(tokenizer_path, 1024, fix_mistral_regex=gemma4)
     text_encoder._gemma_root = side_files_root
 

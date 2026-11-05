@@ -64,7 +64,8 @@ gradio-app {
 }
 .wangp-settings-actions,
 .wangp-media-actions {
-    z-index: 20;
+    /* above Gradio's block titles (--layer-4), below popups and menus */
+    z-index: 45;
     flex: 0 0 auto !important;
     padding: 8px;
     box-sizing: border-box;
@@ -842,6 +843,9 @@ user-select: text;
 .deepy-prime-recommendation .prose p {
     margin: 0 !important;
 }
+.deepy-prime-recommendation .prose p + p {
+    margin-top: calc(6px * var(--wangp-ui-scale)) !important;
+}
 
 .toast-wrap { max-width: min(920px, calc(100vw - 2rem)) !important; }
 .toast-wrap > div, .toast-wrap .toast-body, .gradio-container [role="alert"] { max-width: 100% !important; }
@@ -860,11 +864,6 @@ user-select: text;
 .resolution-picker-toggle:hover, .resolution-picker-toggle:focus-visible { background: var(--background-fill-secondary) !important; }
 .resolution-picker-toggle::after { content: "Switch between Presets and Megapixels"; position: absolute; left: 0; top: calc(100% + 6px); z-index: 100; padding: 6px 9px; border-radius: 4px; background: var(--body-text-color); color: var(--background-fill-primary); font-size: var(--text-sm); font-weight: normal; white-space: nowrap; pointer-events: none; opacity: 0; visibility: hidden; }
 .resolution-picker-toggle:hover::after, .resolution-picker-toggle:focus-visible::after { opacity: 1; visibility: visible; transition: opacity 0.15s 2s, visibility 0s 2s; }
-
-.wangp-reset-settings { position: relative; flex: 0 0 36px !important; width: 36px !important; min-width: 36px !important; height: 36px !important; padding: 0 !important; font-size: 0 !important; column-gap: 0 !important; overflow: visible !important; }
-.wangp-reset-settings::before { width: 18px !important; height: 18px !important; flex-basis: 18px !important; }
-.wangp-reset-settings::after { content: "Reset Settings"; position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 100; padding: 6px 9px; border-radius: 4px; background: var(--body-text-color); color: var(--background-fill-primary); font-size: var(--text-sm); font-weight: normal; white-space: nowrap; pointer-events: none; opacity: 0; visibility: hidden; }
-.wangp-reset-settings:hover::after, .wangp-reset-settings:focus-visible::after { opacity: 1; visibility: visible; transition: opacity 0.15s 2s, visibility 0s 2s; }
 
 .gr-group:has(> .styler > .wangp-input-mode-row), .styler:has(> .wangp-input-mode-row) { overflow: visible !important; }
 .wangp-input-mode-row > .form { flex-wrap: nowrap !important; align-items: center; gap: 10px !important; min-width: 0 !important; padding: 8px; background: var(--studio-surface, var(--block-background-fill)) !important; border-radius: 8px; overflow: visible !important; }
@@ -902,7 +901,7 @@ user-select: text;
 
 .wangp-settings-tools { container-type: inline-size; }
 .wangp-settings-file-actions { align-items: center; flex-wrap: nowrap !important; gap: clamp(4px, .8cqw, 8px) !important; }
-.wangp-settings-file-actions > button:not(.wangp-reset-settings), .wangp-lora-download-row > button {
+.wangp-settings-file-actions > button, .wangp-lora-download-row > button {
     padding: var(--button-small-padding) !important;
     min-height: 0 !important;
     border-radius: var(--button-small-radius);
@@ -911,16 +910,16 @@ user-select: text;
     column-gap: 6px;
     white-space: nowrap;
 }
-.wangp-settings-file-actions > .wangp-reset-settings { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; height: auto !important; padding: var(--button-small-padding) !important; }
-.wangp-settings-file-actions > .wangp-reset-settings::before { width: 12px !important; height: 1lh !important; flex-basis: 12px !important; font-size: var(--button-small-text-size); }
+.wangp-settings-file-actions > button { flex: 1 1 0% !important; width: auto !important; min-width: 0 !important; }
 .wangp-settings-file-actions > .wangp-settings-include-media { flex: 0 0 auto !important; width: max-content !important; }
 .wangp-settings-include-media label { white-space: nowrap; }
-.wangp-settings-file-actions.is-compact > :is(.wangp-settings-default, .wangp-settings-export) { font-size: 0 !important; }
+.wangp-settings-file-actions.is-compact > :is(.wangp-settings-default, .wangp-reset-settings, .wangp-settings-export) { font-size: 0 !important; }
 .wangp-settings-file-actions.is-compact > .wangp-settings-default::after { content: "Set Default"; font-size: var(--button-small-text-size); }
+.wangp-settings-file-actions.is-compact > .wangp-reset-settings::after { content: "Reset"; font-size: var(--button-small-text-size); }
 .wangp-settings-file-actions.is-compact > .wangp-settings-export::after { content: "Export"; font-size: var(--button-small-text-size); }
 .wangp-lora-download-row { flex-wrap: nowrap !important; align-items: center; gap: 8px !important; }
 .wangp-lora-download-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
-.wangp-lora-download-row .compact_text { padding: 0 !important; }
+.wangp-lora-download-row .compact_text { padding: 1px !important; }
 .wangp-lora-download-row textarea { padding: var(--button-small-padding) !important; font-size: var(--button-small-text-size) !important; line-height: var(--line-md); }
 .wangp-lora-download-row > button { flex: 0 0 auto !important; font-size: 0 !important; }
 /* Keep this action's literal caption instead of Gradio's translated label. */
@@ -929,3 +928,10 @@ user-select: text;
 .wangp-prompt-enhancer-row, .wangp-prompt-enhancer-row > .form { flex-wrap: nowrap !important; }
 .wangp-prompt-enhancer-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
 .wangp-prompt-enhancer-row > .btn_centered, .wangp-prompt-enhancer-row > .form > :is(.cbx_centered, .cbx_bottom) { flex: 0 0 auto !important; min-width: 0 !important; }
+
+/* Shared inputs of the post-processing parameters: two per line, whichever of them the selected processors show. */
+/* a post-processing slot: its selector and its processor's parameters, set apart from the other slot */
+div.wangp-postprocessing-slot:not(.postprocess *) { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
+.wangp-postprocessing-parameters, .wangp-postprocessing-parameters > .form { flex-wrap: wrap !important; }
+.wangp-postprocessing-parameters > .form { flex: 1 1 100% !important; }
+.wangp-postprocessing-parameters .wangp-postprocessing-parameter { flex: 1 1 calc(50% - var(--layout-gap)) !important; min-width: calc(50% - var(--layout-gap)) !important; }

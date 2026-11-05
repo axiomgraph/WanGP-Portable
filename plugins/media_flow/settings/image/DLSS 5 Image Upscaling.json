@@ -6,5 +6,9 @@
   "image_mode": 1,
   "spatial_upsampling_method": "dlss5",
   "target_ratio": "dlss5*1",
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "NVIDIA DLSS 5 neural rendering: refines at x1, upscales above; needs Windows and a compatible RTX GPU."
+  }
 }

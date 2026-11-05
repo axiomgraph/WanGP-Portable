@@ -11,8 +11,12 @@
 .wangp-workspaces button:disabled {opacity:.45; cursor:wait;}
 .wangp-workspaces svg {width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round;}
 #wangp-gallery-tabs [role=tablist] {flex-wrap:nowrap; align-items:center; min-width:0;}
+/* Keep one baseline across the tabs and workspace controls at either height. */
+#wangp-gallery-tabs > .tab-wrapper {height:auto; align-items:flex-end;}
+#wangp-gallery-tabs > .tab-wrapper::after {content:""; position:absolute; left:0; right:0; bottom:var(--size-2); height:1px; background:var(--border-color-primary); pointer-events:none;}
+#wangp-gallery-tabs > .tab-wrapper > .tab-container::after {display:none;}
 @keyframes wangp-workspace-ready {from {opacity:.99;} to {opacity:1;}}
-.wangp-workspace-tools {display:flex;align-items:center;flex-shrink:0;animation:wangp-workspace-ready 1ms;}
+.wangp-workspace-tools {display:flex;align-items:center;flex-shrink:0;position:relative;top:-1px;animation:wangp-workspace-ready 1ms;}
 .wangp-workspace-tools[hidden] {display:none;}
 .wangp-workspace-toggle {display:none;}
 .wangp-workspace-tools .wangp-workspaces {padding-left:6px;}

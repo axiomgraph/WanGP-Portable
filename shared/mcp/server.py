@@ -21,7 +21,9 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.utils.gallery_sources import GALLERY_SOURCES, MESH_EXTENSIONS, source_for_kind
+from postprocessing import parameter_ui
+from shared.mesh3d.glb import MESH_EXTENSIONS
+from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
 from shared.utils.setting_names import settings_error, split_settings
 from shared.mcp.config import DEFAULT_PORT, server_port
@@ -47,11 +49,11 @@ _TRANSPORT_ALIASES = {
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
-_MESH_EXTENSIONS = set(MESH_EXTENSIONS)
+_MESH_EXTENSIONS = set(MESH_EXTENSIONS)  # every mesh format the loader reads; the 3D gallery itself stores GLB and splat PLY
 _AGENT_GUIDE_PATH = Path(__file__).resolve().parents[2] / "wangp-agent" / "SKILL.md"
 _AGENT_INSTRUCTIONS_HEADER = ("WanGP MCP API 2.1: generate and edit images, video, audio and 3D assets with WanGP's models, post-processing and media tools. "
                               "These instructions are also readable as wangp://guides/agent; wangp://guides/workflows indexes workflow sections to read on demand.")
-_AGENT_SKILLS_DIR = _AGENT_GUIDE_PATH.parent / "skills"
+_AGENT_SKILLS_DIR = Path(__file__).resolve().parents[1] / "deepy" / "skills"
 _DOCS_DIR = Path(__file__).resolve().parents[2] / "docs"
 _DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech", "gen_video_with_refs"}
 _DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech", "gen_video_with_refs"}
@@ -65,10 +67,12 @@ _TOOLBOX_ACTIONS = {
     "inspect_media",
     "inspect_video",
     "inspect_audio",
+    "check_lip_sync",
     "extract_image",
     "extract_video",
     "extract_audio",
     "transcribe_media",
+    "advanced_transcription",
     "mute_video",
     "remove_vocals",
     "replace_audio",
@@ -87,10 +91,12 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "inspect_video": ("media_id",),
     "view_media": ("media_ids",),
     "inspect_audio": ("media_id",),
+    "check_lip_sync": ("media_id", "voice_id"),
     "extract_image": ("media_id",),
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
     "transcribe_media": ("media_id",),
+    "advanced_transcription": ("media_id",),
     "mute_video": ("media_id",),
     "remove_vocals": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
@@ -112,8 +118,9 @@ _MCP_MEDIA_SETTING_KEYS = {
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
     "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source",
     "audio_guide", "audio_guide2", "audio_guide3", "audio_source",
-    "replace_voice_sample", "replace_voice_sample2", "custom_guide",
+    "replace_voice_sample", "replace_voice_sample2", "custom_guide", parameter_ui.IMAGES_SETTING,
 }
+NESTED_SETTINGS = {"custom_settings", *parameter_ui.SETTINGS.values()}  # the settings holding dictionaries
 _GALLERY_LOCK = threading.RLock()
 
 
@@ -125,6 +132,9 @@ def _read_markdown_section(path: Path, start_heading: str, end_heading: str) -> 
 
 
 def _register_documentation_resources(mcp, file_access_policy=None, long_text_active: bool = False, api_version: str | int = 1) -> None:
+    from shared.deepy.config import python_apps_level
+    from shared.deepy.web_search import enabled as web_search_enabled
+
     from .skills import skill_metadata
 
     api_version = str(api_version)
@@ -149,20 +159,32 @@ def _register_documentation_resources(mcp, file_access_policy=None, long_text_ac
 
     for path in sorted(_AGENT_SKILLS_DIR.glob("*/SKILL.md")):
         skill_name = path.parent.name
-        if api_version != "1" and skill_name in {"large-artifact-workflows", "long-form-story"}:
-            continue
         if skill_name in {"long-story-writing", "long-generation-prompts"} and not long_text_active:
             continue
-        if file_access_policy is not None and api_version == "1":
-            from shared.deepy.long_text import legacy_skill_hidden
-
-            if legacy_skill_hidden(skill_name, file_access_policy):
-                continue
+        if skill_name in ("web-research", "lora-search") and not web_search_enabled():
+            continue
+        if skill_name == "web-apps" and python_apps_level() == "off" or skill_name == "progression-design" and python_apps_level() == "off" and not long_text_active:
+            continue
         resource_uri = f"wangp://skills/{skill_name}"
         read_skill = document_reader(path)
         read_skill.__name__ = f"read_{skill_name.replace('-', '_')}_skill"
         description = skill_metadata(read_skill(), skill_name)["description"]
         mcp.resource(resource_uri, name=skill_name, title=skill_name.replace("-", " ").title(), description=description, mime_type="text/markdown")(read_skill)
+
+    from shared.utils.plugins import get_deepy_plugin_skill, get_deepy_plugin_skills
+    plugin_skills = get_deepy_plugin_skills()
+    for skill in plugin_skills:  # the enabled plugins' general skills are listed with WanGP's own
+        if skill.routing:
+            read_skill = document_reader(Path(skill.path))
+            read_skill.__name__ = f"read_{skill.name.replace('-', '_')}_skill"
+            mcp.resource(skill.uri, name=skill.name, title=skill.name.replace("-", " ").title(), description=skill.description, mime_type="text/markdown")(read_skill)
+    if any(not skill.routing for skill in plugin_skills):
+        @mcp.resource("wangp://skills/{plugin}/{name}", name="plugin_toolbox_skill", description="A skill of an enabled plugin's toolbox: the toolbox discovery (wangp_plugins with plugin) names them.", mime_type="text/markdown")
+        def read_plugin_toolbox_skill(plugin: str, name: str) -> str:
+            skill = get_deepy_plugin_skill(f"wangp://skills/{plugin}/{name}")
+            if skill is None:
+                raise ValueError(f"Unknown plugin skill: wangp://skills/{plugin}/{name}.")
+            return Path(skill.path).read_text(encoding="utf-8")
 
     @mcp.resource("wangp://docs/settings/prompt-flags", name="prompt_flags", title="WanGP Prompt-Type Flags", description="Exact image_prompt_type, video_prompt_type, and audio_prompt_type flag definitions.", mime_type="text/markdown")
     def read_prompt_flags() -> str:
@@ -275,7 +297,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _gallery_media_type(path: str, gallery: str) -> str:
-    if gallery in ("audio", "3d"):
+    if gallery in ("audio", "3d", "world"):
         return gallery
     suffix = Path(path).suffix.lower()
     if suffix in _IMAGE_EXTENSIONS:
@@ -336,8 +358,8 @@ def _prune_deleted_gallery_files(session, source: Path, assistant_session) -> bo
 def _gallery_records(session, media_type: str = "all", limit: int = 50, *, viewed: bool = False) -> list[dict[str, Any]]:
     """viewed registers only the selection of the gallery shown in WanGP: the user's, for an agent recording elsewhere."""
     requested_type = str(media_type or "all").strip().lower()
-    if requested_type not in {"all", "image", "video", "audio", "3d"}:
-        raise ValueError("media_type must be all, image, video, audio, or 3d")
+    if requested_type not in {"all", "image", "video", "audio", "3d", "world"}:
+        raise ValueError("media_type must be all, image, video, audio, 3d, or world")
     limit = max(1, min(int(limit), 500))
     gen = session._state["gen"]
     current_records = []
@@ -421,6 +443,11 @@ def _compact_gallery_stats(media_type: str, path: str) -> dict[str, Any]:
 
         summary = asset_summary(path)
         return {key: value for key, value in summary.items() if key != "frame_count" or value > 1}
+
+    if media_type == "world":
+        from shared.utils.world_outputs import world_summary
+
+        return world_summary(path, segments=False)
 
     from shared.deepy.filesystem import file_info
 
@@ -604,17 +631,10 @@ def _deepy_ui_settings(session) -> dict[str, Any]:
 
 
 def _deepy_template_defaults(session) -> dict[str, str]:
+    from shared.deepy import ui_settings as deepy_ui_settings
+
     settings = _deepy_ui_settings(session)
-    return {
-        "gen_image": settings["image_generator_variant"],
-        "edit_image": settings["image_editor_variant"],
-        "gen_video": settings["video_generator_variant"],
-        "gen_video_with_speech": settings["video_with_speech_variant"],
-        "gen_song": settings["song_variant"],
-        "gen_video_with_refs": settings["with_refs_variant"],
-        "gen_speech_from_description": settings["speech_from_description_variant"],
-        "gen_speech_from_sample": settings["speech_from_sample_variant"],
-    }
+    return {tool: settings[key] for tool, key in deepy_ui_settings.TEMPLATE_TOOL_UI_KEY.items()}
 
 
 def _deepy_template_catalog(session, tool_id: str | None = None) -> list[dict[str, Any]]:
@@ -710,7 +730,8 @@ def _deepy_template_settings(session, tool_id: str, template: str) -> dict[str, 
     requested_template = str(template or "").strip()
     resolved_template = catalog["default_template"] if requested_template.casefold() == "default" else deepy_tool_settings.find_tool_variant(tool_id, requested_template, current_variant=catalog["default_template"])
     if resolved_template is None:
-        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'.")
+        owners = [tool for tool in deepy_tool_settings.GENERATION_TOOL_IDS if deepy_tool_settings.find_tool_variant(tool, requested_template)]
+        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'." + (f" It belongs to {owners[0]}: write '{owners[0]}/{requested_template}'." if owners else ""))
     template_settings = session.merge_settings_with_defaults(deepy_tool_settings.clone_tool_preset(tool_id, resolved_template))
     general_properties = _deepy_general_properties(session)
     effective_settings = session.prepare_settings_for_export(template_settings)
@@ -747,6 +768,8 @@ def _mcp_media_type(path: str) -> str:
         return "audio"
     if suffix in _MESH_EXTENSIONS:
         return "3d"
+    if suffix in WORLD_EXTENSIONS:
+        return "world"
     return ""
 
 
@@ -847,7 +870,8 @@ def _validate_generation_media(session, settings, model_type, path):
     for key in sorted(supplied & checks.keys()):
         supported, active, required = checks[key]
         if not supported:
-            reject(key, "input is unsupported in this model/output mode")
+            reference = key in ("image_start", "image_end", "image_guide") and reference_choices and "image_refs" not in supplied
+            reject(key, "input is unsupported in this model/output mode" + ("; this model takes its picture in image_refs" if reference else ""))
         if not active:
             reject(key, f"input would be ignored; requires {required}")
     if "image_refs" in supplied:
@@ -865,6 +889,10 @@ def _validate_generation_media(session, settings, model_type, path):
             from postprocessing.audio_processors import method_metadata
             if image_output or not method_metadata(effective.get(method_key, ""))[capability]:
                 reject(key, f"input requires a {method_key} processor that uses it")
+    if parameter_ui.IMAGES_SETTING in supplied:  # read by the post-processors declaring an images parameter (a 3D refiner's or texturer's Object Image)
+        methods = {slot: parameter_ui.method_of(slot, effective.get("spatial_upsampling" if slot == parameter_ui.SPATIAL else "temporal_upsampling", "")) for slot in parameter_ui.SETTINGS}
+        if parameter_ui.images_parameter(*(parameter_ui.slot_parameters(slot, method) for slot, method in methods.items())) is None:
+            reject(parameter_ui.IMAGES_SETTING, "input requires a spatial or temporal post-processor that uses reference images")
 
 
 def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool, file_access_policy=None):
@@ -903,10 +931,6 @@ def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, A
     return resolved
 
 
-def _resolve_artifact_references(value: Any, artifact_workspace, *, require_finalized: bool = True) -> Any:
-    return artifact_workspace.resolve_references(copy.deepcopy(value), require_finalized=require_finalized)
-
-
 def _register_gallery_media(session, path: str) -> dict[str, Any]:
     from shared.utils.workspace_storage import background_workspace, host_for_gen, recording_gallery
 
@@ -936,6 +960,10 @@ def _register_gallery_media(session, path: str) -> dict[str, Any]:
             from shared.utils.mesh_outputs import asset_stats
 
             asset_stats(resolved_path)
+        elif media_type == "world":
+            from shared.utils.world_outputs import read_manifest
+
+            read_manifest(resolved_path)
         else:
             from shared.utils.audio_video import get_audio_file_sample_rate
 
@@ -1126,10 +1154,10 @@ def _build_mcp_postprocessing_task(source_path: str, process: dict[str, Any], pa
         task.update({"mode": "edit_audio", "audio_source": source_path, "postprocess_audio": process_id})
     parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
     spatial_parameter_names = set()
-    if process_type == postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING:
-        spatial_parameters = {name: value for name, value in parameters.items() if name != "multiplier"}
+    if process_type in (postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING, postprocessing_catalog.PROCESS_TYPE_TEMPORAL_UPSAMPLING):
+        spatial_parameters = {name: value for name, value in parameters.items() if name not in ("multiplier", "seed")}
         spatial_parameter_names.update(spatial_parameters)
-        task.update(spatial_parameters)
+        task.update(postprocessing_catalog.task_parameters(process, spatial_parameters))
     path_task_keys = {"audio_path": "audio_source", "voice_sample_path": "replace_voice_sample", "voice_sample2_path": "replace_voice_sample2"}
     for parameter_name, task_key in path_task_keys.items():
         if parameter_name in parameters:
@@ -1302,11 +1330,8 @@ def _run_io_action(session, file_access_policy, action: str, arguments: dict[str
         return file_access_policy.virtualize_result(filesystem.read_text(file_access_policy, arguments["path"], start_line=arguments.get("start_line", 1), end_line=arguments.get("end_line"), encoding=arguments.get("encoding", "utf-8-sig")))
     if action == "search_text":
         return file_access_policy.virtualize_result(filesystem.search_text(file_access_policy, arguments["path"], arguments["query"], pattern=arguments.get("pattern", "*"), recursive=arguments.get("recursive", False), regex=arguments.get("regex", False), case_sensitive=arguments.get("case_sensitive", False), limit=arguments.get("limit", 100)))
-    if action in {"write_text", "write_artifact_text"}:
-        text = arguments["text"] if action == "write_text" else arguments["artifact"]
-        if not isinstance(text, str):
-            raise TypeError("write_artifact_text requires an artifact reference that resolves to text; use select or template with join when rendering record sets.")
-        return file_access_policy.virtualize_result(filesystem.write_text(file_access_policy, arguments["path"], text, mode=arguments.get("mode", "create"), encoding=arguments.get("encoding", "utf-8")))
+    if action == "write_text":
+        return file_access_policy.virtualize_result(filesystem.write_text(file_access_policy, arguments["path"], arguments["text"], mode=arguments.get("mode", "create"), encoding=arguments.get("encoding", "utf-8")))
     if action == "mkdir":
         return file_access_policy.virtualize_result(filesystem.make_directory(file_access_policy, arguments["path"]))
     if action == "copy":
@@ -1378,10 +1403,19 @@ class _JobRecord:
         self.progress: dict[str, Any] | None = None
         self.result: dict[str, Any] | None = None
         self._lock = threading.Lock()
+        self._done = threading.Event()
         self._watcher = threading.Thread(target=self._watch, daemon=True, name=f"wangp-mcp-job-{job_id}")
 
     def start(self) -> None:
         self._watcher.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def wait(self, timeout: float | None = None) -> None:
+        if not self._done.wait(timeout):
+            raise TimeoutError("WanGP job result timed out")
 
     def _watch(self) -> None:
         for event in self.job.events.iter(timeout=0.2):
@@ -1393,23 +1427,20 @@ class _JobRecord:
                 self.updated_at = time.time()
                 if event.kind == "progress":
                     self.progress = event_dict["data"]
-                if event.kind == "completed" and type(event.data).__name__ == "GenerationResult" and self.result is None:
-                    self.result = self._completed_result(event.data)
-        self._capture_result_if_done()
+        # Only the watcher builds the result. Media analysis must not hold the
+        # snapshot lock or run on a polling request's thread.
+        try:
+            result = self._completed_result(self.job.result(timeout=0))
+        except Exception as error:
+            result = {"error": str(error)}
+        with self._lock:
+            self.result = result
+            self.updated_at = time.time()
+            self._done.set()
         if self.state is not None:
             saved = self.snapshot(event_limit=0)
+            saved["status"] = _compact_job_snapshot(saved)["status"]
             self.state.save_job(self.job_id, saved)
-
-    def _capture_result_if_done(self) -> None:
-        with self._lock:
-            if not self.job.done or self.result is not None:
-                return
-            try:
-                completed = self.job.result(timeout=0)
-            except Exception:
-                return
-            self.result = self._completed_result(completed)
-            self.updated_at = time.time()
 
     def _completed_result(self, completed) -> dict[str, Any]:
         result = _result_to_dict(completed, self.file_store, self.job_id)
@@ -1444,7 +1475,6 @@ class _JobRecord:
         return result
 
     def snapshot(self, event_limit: int = 20) -> dict[str, Any]:
-        self._capture_result_if_done()
         event_limit = 20 if event_limit is None else event_limit
         event_limit = max(0, min(int(event_limit), _MAX_STORED_EVENTS))
         with self._lock:
@@ -1456,7 +1486,7 @@ class _JobRecord:
             "job_id": self.job_id,
             "workspace_id": getattr(self.session, '_workspace_id', None),
             "agent_context": getattr(self.session, '_agent_context', None),
-            "done": self.job.done,
+            "done": result is not None,
             "cancel_requested": self.job.cancel_requested,
             "webui_submission_ready": self.job.webui_submission_ready,
             "webui_load_queue_token": self.job.webui_load_queue_token if self.job.webui_submission_ready else "",
@@ -1471,11 +1501,12 @@ class _JobRecord:
 class _ToolJob:
     """A toolbox action running in the background, followed with get_job / wait_jobs like a generation job."""
 
-    def __init__(self, action: str, run) -> None:
+    def __init__(self, action: str, run, cancel: threading.Event | None = None, progress: dict[str, Any] | None = None) -> None:
         self.job_id, self.action = uuid.uuid4().hex, action
         self.created_at = self.updated_at = time.time()
         self.result: dict[str, Any] | None = None
         self.error: str | None = None
+        self._cancel, self._progress = cancel, progress  # a plugin action stops on cancel and reports its progress there
         self._done = threading.Event()
         threading.Thread(target=self._run, args=(run,), daemon=True, name=f"wangp-mcp-tool-{self.job_id}").start()
 
@@ -1496,8 +1527,14 @@ class _ToolJob:
             self.updated_at = time.time()
             self._done.set()
 
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel is not None and self._cancel.is_set()
+
     def cancel(self) -> None:
-        raise ValueError(f"The {self.action} toolbox job cannot be cancelled; it runs to completion.")
+        if self._cancel is None:
+            raise ValueError(f"The {self.action} toolbox job cannot be cancelled; it runs to completion.")
+        self._cancel.set()
 
     def snapshot(self, event_limit: int = 0) -> dict[str, Any]:
         done = self.done
@@ -1505,7 +1542,9 @@ class _ToolJob:
         if done:
             snapshot["result"] = {"error": self.error} if self.error is not None else self.result
         else:
-            snapshot["progress"] = {"status": f"Running {self.action}", "elapsed_seconds": round(time.time() - self.created_at, 1)}
+            snapshot["progress"] = {"status": f"Running {self.action}", **(self._progress or {}), "elapsed_seconds": round(time.time() - self.created_at, 1)}
+            if self.cancel_requested:
+                snapshot["cancel_requested"] = True
         return snapshot
 
 
@@ -1538,8 +1577,8 @@ class _JobStore:
         record.start()
         return record
 
-    def start_tool(self, action: str, run) -> _ToolJob:
-        record = _ToolJob(action, run)
+    def start_tool(self, action: str, run, *, cancel: threading.Event | None = None, progress: dict[str, Any] | None = None) -> _ToolJob:
+        record = _ToolJob(action, run, cancel, progress)
         with self._lock:
             self._jobs[record.job_id] = record
         return record
@@ -1612,7 +1651,7 @@ def _config_file_from_arg(value: str | None) -> str | None:
     return str(path)
 
 
-def build_server_for_session(session, settings: dict[str, Any] | None = None, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, http_media_transfer: bool = False, compact_model_tools: bool = False, file_access_policy=None, io_downloads: bool = False, artifact_workspace=None, api_version: str | int = "2.1", allow_async: bool = False, defer_wait: bool = False):
+def build_server_for_session(session, settings: dict[str, Any] | None = None, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, http_media_transfer: bool = False, compact_model_tools: bool = False, file_access_policy=None, io_downloads: bool = False, api_version: str | int = "2.1", allow_async: bool = False, defer_wait: bool = False, python_sandbox=None):
     api_version = str(api_version)
     if api_version not in {"1", "2", "2.1"}:
         raise ValueError("MCP API version must be 1, 2, or 2.1.")
@@ -1623,12 +1662,15 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     jobs = _JobStore(session)
     agent_instructions = None
+    plugin_instructions = ""
     if api_version == "2.1":
+        from .plugin_toolbox import instructions as plugin_toolbox_instructions
         from .skills import SkillMCP
 
+        plugin_instructions = plugin_toolbox_instructions()  # routing declared by the enabled plugins, for Prime and external agents alike
         if not compact_model_tools:  # Prime already carries these rules in its system prompt
             from shared.deepy import load_agent_instructions
-            agent_instructions = f"{_AGENT_INSTRUCTIONS_HEADER}\n\n{load_agent_instructions()}"
+            agent_instructions = "\n\n".join(part for part in (_AGENT_INSTRUCTIONS_HEADER, load_agent_instructions(), plugin_instructions) if part)
         mcp = SkillMCP("WanGP", instructions=agent_instructions, skills_root=session._root / "user_skills", **dict(settings or {}))
     else:
         mcp = FastMCP("WanGP", **dict(settings or {}))
@@ -1645,9 +1687,6 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     long_text_active = deepy_long_text.long_text_tools_active(file_access_policy) and deepy_long_text.workspace_mount(file_access_policy) is not None
     _register_documentation_resources(mcp, file_access_policy, long_text_active=long_text_active, api_version=api_version)
-    if artifact_workspace is None:
-        from shared.deepy.artifacts import ArtifactWorkspace
-        artifact_workspace = ArtifactWorkspace()
     allow_read_file_system = file_access_policy.read_enabled
     if api_version == "2.1":
         from .state import MCPState
@@ -1775,9 +1814,9 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         if agent_instructions:
             return agent_instructions
         if api_version != "1":
-            return f"WanGP MCP API {api_version}. Use toolbox descriptions to choose a domain. Use declared shortcuts and known call recipes directly; otherwise discover actions, read the selected contract, then execute. Reuse known contracts. Specialized workflows are available in wangp://guides/workflows."
-        guide = _AGENT_GUIDE_PATH.read_text(encoding="utf-8")
-        return deepy_long_text.hide_legacy_artifact_guidance(guide) if long_text_active else guide
+            guide = f"WanGP MCP API {api_version}. Use toolbox descriptions to choose a domain. Use declared shortcuts and known call recipes directly; otherwise discover actions, read the selected contract, then execute. Reuse known contracts. Specialized workflows are available in wangp://guides/workflows."
+            return f"{guide}\n\n{plugin_instructions}" if plugin_instructions else guide
+        return _AGENT_GUIDE_PATH.read_text(encoding="utf-8")
 
     def legacy_model_tool(function):
         return function if compact_model_tools or api_version != "1" else mcp.tool()(function)
@@ -1903,24 +1942,6 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
         return _media_settings(session, media_id=media_id, path=path, allow_read_file_system=allow_read_file_system, file_access_policy=file_access_policy)
 
-    def wangp_artifact(action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Manage external working collections and persistent project ledgers. Pass action and arguments as separate top-level tool parameters. Omit both for discovery; pass action alone for its schema. Prefer inline work for at most 10 simple items and about 2,048 payload tokens."""
-
-        from shared.deepy.artifacts import ARTIFACT_ACTIONS, ARTIFACT_INLINE_ITEM_THRESHOLD, ARTIFACT_INLINE_TOKEN_THRESHOLD, ARTIFACT_LIMITS, normalize_artifact_invocation, run_artifact_action
-
-        action_name, arguments = normalize_artifact_invocation(action, arguments)
-        if not action_name:
-            actions = [{"name": name, "description": definition["description"]} for name, definition in ARTIFACT_ACTIONS.items()]
-            return {"status": "discovery", "actions": actions, "count": len(actions), "inline_threshold": {"items": ARTIFACT_INLINE_ITEM_THRESHOLD, "tokens": ARTIFACT_INLINE_TOKEN_THRESHOLD}, "limits": dict(ARTIFACT_LIMITS), "skills": ["wangp://skills/large-artifact-workflows", "wangp://skills/long-form-story"], "next": "Choose an action. Pass action alone for its schema, then repeat that top-level action with a top-level arguments object to execute it."}
-        if action_name not in ARTIFACT_ACTIONS:
-            raise ValueError(f"Artifact action '{action_name}' is unavailable. Call without action to list actions.")
-        if arguments is None:
-            return {"status": "schema", "action": {"name": action_name, **copy.deepcopy(ARTIFACT_ACTIONS[action_name])}, "next": f"Repeat top-level action='{action_name}' and pass a separate top-level arguments object matching action.parameters. Payload size does not change this call shape."}
-        return run_artifact_action(artifact_workspace, action_name, dict(arguments))
-
-    if not long_text_active and api_version == "1":
-        mcp.tool()(wangp_artifact)
-
     if long_text_active:
         @api_tool()
         def rg(arguments: str) -> dict[str, Any]:
@@ -1948,21 +1969,6 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
         action_name = str(action or "").strip()
         actions = available_io_actions(file_access_policy, downloads_enabled=io_downloads)
-        if long_text_active:
-            sanitized_actions = []
-            for candidate in actions:
-                if candidate["name"] == "write_artifact_text":
-                    continue
-                candidate = copy.deepcopy(candidate)
-                if candidate["name"] == "list":
-                    for parameter in ("store_artifact", "artifact_id", "artifact_title"):
-                        candidate["parameters"]["properties"].pop(parameter, None)
-                elif candidate["name"] == "write_text":
-                    candidate["description"] = "Create, overwrite, or append literal UTF-8 text already present in the request."
-                elif candidate["name"] == "zip":
-                    candidate["parameters"]["properties"]["sources"] = {"type": "array", "items": {"type": "string"}, "description": "Authorized paths or Gallery media ids."}
-                sanitized_actions.append(candidate)
-            actions = sanitized_actions
         if not action_name:
             compact = [{"name": candidate["name"], "description": candidate["description"]} for candidate in actions]
             roots = [root["path"] for root in file_access_policy.roots()] if file_access_policy.read_enabled else []
@@ -1972,46 +1978,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             raise ValueError(f"IO action '{action_name}' is unavailable. Call without action to list allowed actions.")
         if arguments is None:
             return {"status": "schema", "action": action_defs[0]}
-        action_arguments = dict(arguments)
-        if long_text_active and action_name == "list" and any(name in action_arguments for name in ("store_artifact", "artifact_id", "artifact_title")):
-            raise ValueError("Artifact-backed file listings are unavailable while the long-text experiment is active.")
-        if long_text_active and action_name == "zip" and isinstance(action_arguments.get("sources"), dict):
-            raise ValueError("Artifact-backed ZIP sources are unavailable while the long-text experiment is active.")
-        store_artifact, target_artifact_id, artifact_title = False, "", ""
-        if action_name == "list":
-            store_artifact = bool(action_arguments.pop("store_artifact", False))
-            target_artifact_id = str(action_arguments.pop("artifact_id", "") or "").strip()
-            artifact_title = str(action_arguments.pop("artifact_title", "") or "").strip()
-        exported_artifact_id = ""
-        exported_artifact_reference = None
-        if action_name == "write_artifact_text":
-            artifact_reference = action_arguments.get("artifact")
-            if not isinstance(artifact_reference, dict) or not str(artifact_reference.get("$artifact", "") or "").strip():
-                raise TypeError("write_artifact_text requires an artifact reference; literal text is not accepted.")
-            exported_artifact_id = str(artifact_reference["$artifact"]).strip()
-            exported_artifact_reference = copy.deepcopy(artifact_reference)
-        action_arguments = _resolve_artifact_references(action_arguments, artifact_workspace, require_finalized=action_name != "write_artifact_text")
-        result = _run_io_action(session, file_access_policy, action_name, action_arguments, io_downloads)
-        if exported_artifact_id:
-            result["artifact_id"] = exported_artifact_id
-            verification = artifact_workspace.reference_status(exported_artifact_reference)
-            verification.update({key: result[key] for key in ("characters_written", "lines_written", "line_count", "markdown_heading_count", "first_markdown_heading", "last_markdown_heading", "sha256", "size_bytes") if key in result})
-            verification["partial_export"] = verification["kind"] == "record_set" and not verification["finalized"]
-            if verification.get("expected_items") is not None:
-                verification["remaining_items"] = max(0, int(verification["expected_items"]) - int(verification.get("source_items", 0)))
-            verification["readback_required"] = False
-            result["verification"] = verification
-        if action_name != "list" or not store_artifact:
-            return result
-        entries = list(result.get("entries", []) or [])
-        if target_artifact_id:
-            artifact = artifact_workspace.append(target_artifact_id, entries, operation_id=f"io-list:{result.get('path', '')}:{action_arguments.get('pattern', '*')}:{action_arguments.get('media_type', 'all')}:{int(result.get('offset', 0))}") if entries else artifact_workspace.status(target_artifact_id)
-        else:
-            schema = {"type": "object", "required": ["name", "path", "type"], "properties": {"name": {"type": "string"}, "path": {"type": "string"}, "type": {"type": "string"}}}
-            artifact = artifact_workspace.create(title=artifact_title or f"Files from {result.get('path', '@outputs')}", schema=schema, initial_items=entries)
-        compact = {key: value for key, value in result.items() if key != "entries"}
-        compact.update(artifact=artifact, stored_count=len(entries), preview=[{key: entry.get(key) for key in ("name", "path", "type")} for entry in entries[:3]])
-        return compact
+        return _run_io_action(session, file_access_policy, action_name, copy.deepcopy(arguments), io_downloads)
 
     @api_tool()
     def wangp_notify(message: str, title: str = "Deepy notification") -> dict[str, Any]:
@@ -2056,6 +2023,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         media_type = _mcp_media_type(source_path)
         if not media_type:
             raise ValueError(f"Unsupported media file extension: {Path(source_path).suffix}")
+        if media_type == "3d":
+            from shared.utils.mesh_postprocessing import is_mesh_file
+            if not is_mesh_file(source_path):
+                raise ValueError("Gaussian splats can not be post-processed: only meshes can be refined or textured.")
         processes = postprocessing_catalog.query_processes(media_type)
         discovered_processes = _mcp_postprocessing_processes(media_type, allow_read_file_system, processes)
         process_id = str(process or "").strip()
@@ -2096,7 +2067,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         action_name = str(action or "").strip()
         actions = _toolbox_discovery(sandbox_toolbox, allow_read_file_system)
         if api_version != "2.1":
-            actions = [action for action in actions if action["name"] != "inspect_audio"]
+            actions = [action for action in actions if action["name"] not in ("inspect_audio", "check_lip_sync")]
         if not action_name:
             compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions]
             return {"status": "discovery", "actions": compact_actions, "count": len(compact_actions), "next": "Call again with one action and omit arguments to get its exact schema."}
@@ -2107,8 +2078,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             raise ValueError(f"Toolbox action '{action_name}' is unavailable in this WanGP runtime.")
         if arguments is None:
             return {"status": "schema", "action": action_defs[0]}
-        artifact_arguments = _resolve_artifact_references(dict(arguments or {}), artifact_workspace, require_finalized=True)
-        resolved_arguments = _resolve_toolbox_arguments(session, sandbox_toolbox, action_name, artifact_arguments, allow_read_file_system, file_access_policy)
+        resolved_arguments = _resolve_toolbox_arguments(session, sandbox_toolbox, action_name, copy.deepcopy(arguments), allow_read_file_system, file_access_policy)
         validation_error = sandbox_toolbox.validate_tool_call(action_name, resolved_arguments)
         if validation_error:
             raise ValueError(validation_error)
@@ -2118,7 +2088,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         if not isinstance(source, (dict, list)):
             raise TypeError("source must be a settings dict, task dict, manifest dict, or task list")
         _gallery_records(session, limit=500)
-        resolved_source = _resolve_artifact_references(source, artifact_workspace, require_finalized=True)
+        resolved_source = copy.deepcopy(source)
         if api_version != "1":
             source = resolved_source
             manifest = isinstance(source, dict) and "tasks" in source
@@ -2138,9 +2108,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(settings, dict):
                     raise ValueError(f"{path} must be a settings object. Nothing was submitted.")
                 defaults_call = f' See wangp_model(model_type="{settings.get("model_type") or "<model_type>"}", action="defaults", arguments={{}}) for setting names and value formats.'
-                nested = [key for key, value in settings.items() if isinstance(value, dict) and key != "custom_settings" or key == "resolution" and not isinstance(value, str)]
+                # nested values: the model's custom_settings and the post-processing slots' parameter dictionaries
+                nested = [key for key, value in settings.items() if isinstance(value, dict) and key not in NESTED_SETTINGS or key == "resolution" and not isinstance(value, str)]
                 if nested:
-                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value, not an object; only custom_settings holds nested values"
+                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value; only custom_settings and *_postprocessing_parameters hold objects"
                     raise ValueError(f"{path}.{nested[0]} {expected}.{defaults_call} Nothing was submitted.")
                 if str(settings.get("mode", "") or "").startswith("edit_"):
                     continue
@@ -2149,6 +2120,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(model_type, str) or not model_type.strip():
                     template_hint = "" if api_version == "1" else ', or the settings must name a template ("template": "<task>")'
                     raise ValueError(f"{path}.{model_key} must be a non-empty string for generation{template_hint}. Nothing was submitted.")
+                if session.get_model_metadata(model_type.strip()) is None:  # a retired model type becomes its new type (settings converted in place)
+                    model_type = session._ensure_runtime().module.convert_retired_model_type(settings)
                 if session.get_model_metadata(model_type.strip()) is None:
                     template_call = 'wangp_templates(task="...", template="default")' if api_version == "2.1" else 'wangp_deepy_templates(tool_id="...")'
                     known = [str(item.get("model_type") or "") for item in session.list_model_defs()]
@@ -2176,7 +2149,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 properties = _deepy_general_properties(session)
                 outputs = (session.get_model_metadata(model_type.strip()) or {}).get("main_output", [])
                 defaults = {"seed": properties["seed"], "multi_prompts_gen_type": _deepy_prompt_mode(session, model_type.strip())}
-                if "image" in outputs or "video" in outputs:
+                if ("image" in outputs or "video" in outputs) and "world" not in outputs:  # a world's size and length are its model's own
                     defaults["resolution"] = f"{properties['width']}x{properties['height']}"
                     if "video" in outputs and settings.get("image_mode", 0) not in (1, 2):
                         defaults["video_length"] = properties["num_frames"]
@@ -2201,7 +2174,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
         record = jobs.submit(prepare_generation(source))
         if wait:
-            record.job.result(timeout=timeout_s)
+            record.wait(timeout=timeout_s)
         return record.snapshot(event_limit=default_job_event_limit if event_limit is None else event_limit)
 
     @api_tool()
@@ -2231,7 +2204,11 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     if api_version != "1":
         from .v2 import register_v2
-        register_v2(mcp, session, implementations, jobs, file_access_policy, get_toolbox, downloads=io_downloads, allow_async=allow_async, defer_wait=defer_wait, deepy_help=compact_model_tools, extended=api_version == "2.1")
+        if api_version == "2.1" and python_sandbox is None and hasattr(toolbox, "publish_sandbox_media"):
+            python_sandbox = _build_python_sandbox(session, toolbox, file_access_policy, lambda name, arguments: call_tool_inline(mcp, name, arguments))
+        mcp._wangp_python_sandbox = python_sandbox
+        mcp._wangp_web_search = _build_web_search(session, file_access_policy) if api_version == "2.1" else None
+        register_v2(mcp, session, implementations, jobs, file_access_policy, get_toolbox, downloads=io_downloads, allow_async=allow_async, defer_wait=defer_wait, deepy_help=compact_model_tools, extended=api_version == "2.1", python_sandbox=python_sandbox, web_search=mcp._wangp_web_search)
 
     from shared.utils.plugins import get_deepy_prime_plugin_tools
 
@@ -2246,8 +2223,65 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
     return mcp
 
 
-def build_inprocess_server(session, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, file_access_policy=None, artifact_workspace=None, api_version: str | int = "2.1", allow_async: bool = False):
-    return build_server_for_session(session, toolbox=toolbox, default_job_event_limit=default_job_event_limit, allow_read_file_system=allow_read_file_system, compact_model_tools=True, file_access_policy=file_access_policy, io_downloads=True, artifact_workspace=artifact_workspace, api_version=api_version, allow_async=allow_async, defer_wait=True)
+def build_inprocess_server(session, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, file_access_policy=None, api_version: str | int = "2.1", allow_async: bool = False, python_sandbox=None):
+    return build_server_for_session(session, toolbox=toolbox, default_job_event_limit=default_job_event_limit, allow_read_file_system=allow_read_file_system, compact_model_tools=True, file_access_policy=file_access_policy, io_downloads=True, api_version=api_version, allow_async=allow_async, defer_wait=True, python_sandbox=python_sandbox)
+
+
+def _build_web_search(session, file_access_policy):
+    """The session's web toolbox (wangp_web_search) when the configuration enables it: downloads and cookies live in the web folder of the agent's documents workspace (without a workspace, search and open only); LoRA search and installation use the session's model catalog and LoRA folders."""
+    from shared.deepy.config import get_civitai_api_key, get_huggingface_token
+    from shared.deepy.web_search import WebSearch, enabled
+
+    if not enabled():
+        return None
+    hub = {"catalog": session.list_model_metadata, "lora_dir": session.get_lora_dir, "civitai_key": get_civitai_api_key, "hf_token": get_huggingface_token} if hasattr(session, "get_lora_dir") else {}
+    if file_access_policy.workspace is None:
+        return WebSearch(**hub)
+    return WebSearch(file_access_policy.workspace / "web", cookie_file=file_access_policy.workspace.parent / "web_cookies.json",  # beside the workspace, out of every readable folder
+                     resolve_path=lambda reference: str(file_access_policy.require_read(reference, file=True)), virtualize=file_access_policy.virtualize_path, **hub)
+
+
+def call_tool_inline(mcp, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Run one of this server's tools on the current thread with its argument validation (for sandbox scripts: the MCP request loop is busy running the script that asks)."""
+    tool = mcp._tool_manager.get_tool(name)
+    if tool is None:
+        raise ValueError(f"Unknown tool: {name}")
+    try:
+        validated = tool.fn_metadata.arg_model.model_validate(arguments)
+        result = tool.fn(**validated.model_dump_one_level())
+    except Exception as error:
+        return {"status": "error", "tool": name, "error": str(error)}
+    if not isinstance(result, dict):
+        return {"status": "done", "content": result}
+    result.setdefault("status", "done")
+    return result
+
+
+def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
+    """The session's Python sandbox (toolbox wangp_python) when the configuration enables it: its folder lies in the agent's documents workspace; call_tool(name, arguments) serves scripts' WanGP tool calls."""
+    from shared.deepy import media_registry
+    from shared.deepy.config import DEEPY_PYTHON_SANDBOX_DEFAULT, DEEPY_PYTHON_SANDBOX_KEY, get_deepy_config_value, normalize_deepy_python_sandbox, python_apps_level
+    from shared.deepy.python_sandbox import PythonSandbox
+
+    if normalize_deepy_python_sandbox(get_deepy_config_value(DEEPY_PYTHON_SANDBOX_KEY, DEEPY_PYTHON_SANDBOX_DEFAULT)) != "enabled" or file_access_policy.workspace is None:
+        return None
+
+    def resolve_path(reference):
+        record = media_registry.get_media_record(toolbox.session, reference)
+        if record is not None:
+            return _resolve_existing_path(record["path"], "ref")
+        return _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy)
+
+    def compact(record):
+        return None if record is None else _output_record(_compact_gallery_record(record), record["path"])
+
+    apps = None
+    if python_apps_level() != "off":
+        from shared.apps.dev import AppWorkshop
+        apps = AppWorkshop(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_app=lambda package, description: compact(toolbox.publish_sandbox_app(package, description)), virtualize=file_access_policy.virtualize_path)
+    return PythonSandbox(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_media=lambda path, description: compact(toolbox.publish_sandbox_media(path, description)),
+                         publish_frames=lambda frames, fps, name, description: compact(toolbox.publish_sandbox_frames(frames, fps, name, description)), virtualize=file_access_policy.virtualize_path,
+                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True), apps=apps)
 
 
 def _http_settings(transport: str, host: str | None, port: int | None, oauth) -> dict[str, Any]:

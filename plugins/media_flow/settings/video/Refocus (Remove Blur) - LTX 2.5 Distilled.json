@@ -13,5 +13,10 @@
   "loras_multipliers": "1",
   "activated_loras": [
     "https://huggingface.co/DeepBeepMeep/LTX-2/resolve/main/ltx-2.5-22b-ic-lora-deblur-0.9.safetensors"
-  ]
+  ],
+  "process": {
+    "task": "refocus",
+    "summary": "LTX-2.5 22B distilled with the deblur IC-LoRA.",
+    "recommended": true
+  }
 }

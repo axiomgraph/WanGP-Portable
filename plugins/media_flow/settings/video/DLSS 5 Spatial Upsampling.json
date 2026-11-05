@@ -5,5 +5,9 @@
   "target_ratio": "dlss5*1",
   "chunk_size_seconds": 3.0,
   "sliding_window_overlap": 0,
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "NVIDIA DLSS 5 neural rendering: refines at x1, upscales above; needs Windows and a compatible RTX GPU."
+  }
 }

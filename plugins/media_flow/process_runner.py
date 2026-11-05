@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import gradio as gr
@@ -12,7 +12,7 @@ from PIL import Image
 
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG
 from shared.utils.utils import has_image_file_extension
-from postprocessing.spatial_upsamplers import PARAMETER_PREFIX
+from postprocessing import parameter_ui
 
 from .chunk_executor import ChunkExecutor, ChunkProgress, ProcessContext, build_task_settings
 from . import batch_queue
@@ -86,7 +86,7 @@ class RunRequest:
             sliding_window_overlap=sliding_window_overlap,
             start_seconds="" if start_seconds in (None, "") else str(start_seconds),
             end_seconds="" if end_seconds in (None, "") else str(end_seconds),
-            spatial_upsampler_parameters={str(key): value for key, value in dict(spatial_upsampler_parameters or {}).items() if str(key).startswith(PARAMETER_PREFIX)},
+            spatial_upsampler_parameters={parameter_ui.LEGACY_NAMES.get(str(key), str(key)): value for key, value in dict(spatial_upsampler_parameters or {}).items()},
         )
 
 
@@ -101,8 +101,52 @@ class ProcessRunResult:
     chunks_total: int = 0
 
 
+def plugin_active_job(plugin) -> dict:
+    """The one job state of the plugin, shared by its tab and its agent actions so that a single process runs at a time; made on first use."""
+    if getattr(plugin, "active_job", None) is None:
+        plugin.active_job = {"job": None, "running": False, "batch_running": False, "cancel_requested": False, "write_state": None, catalog.PRESERVE_ARTIFACTS_STORAGE_KEY: catalog.PRESERVE_ARTIFACTS_DEFAULT,
+                             catalog.PREVIEW_OUTPUT_STORAGE_KEY: catalog.PREVIEW_OUTPUT_DEFAULT, "generated_artifact_paths": []}
+    return plugin.active_job
+
+
+def remember_status(active_job: dict, status, batch_status) -> None:
+    """Keep the values of the last rendered statuses, for agents asking how the running process (from the tab or an agent) is going."""
+    if hasattr(status, "fields"):
+        active_job["status_fields"] = status.fields
+    if hasattr(batch_status, "fields"):
+        active_job["batch_fields"] = batch_status.fields
+
+
+def reset_live_chunk_status(state: dict) -> None:
+    gen = state.get("gen") if isinstance(state, dict) else None
+    if not isinstance(gen, dict):
+        return
+    gen["status"] = ""
+    gen["status_display"] = False
+    gen["progress_args"] = None
+    gen["progress_phase"] = None
+    gen["progress_status"] = ""
+    gen["preview"] = None
+
+
+def request_stop(active_job: dict) -> bool:
+    """Stop the running process after its current chunk (a later run with Continue resumes it); True when a process was running."""
+    active_job["cancel_requested"] = True
+    write_state = active_job.get("write_state")
+    if write_state is not None:
+        write_state.stopped = True
+    job = active_job.get("job")
+    if job is not None and not job.done:
+        try:
+            job.cancel()
+        except RuntimeError as exc:
+            print(f"[MediaFlow] Stop requested; WanGP abort bridge was not available: {exc}")
+        return True
+    return bool(active_job.get("running") or active_job.get("batch_running"))
+
+
 class ProcessRunner:
-    def __init__(self, *, plugin, api_session, library, get_model_def, active_job: dict, preview_state: dict, ui_skip, ui_update, info_exit, reset_live_chunk_status) -> None:
+    def __init__(self, *, plugin, api_session, library, get_model_def, active_job: dict, preview_state: dict, ui_skip, ui_update, info_exit, reset_live_chunk_status, remember_ui_settings: bool = True) -> None:
         self.plugin = plugin
         self.api_session = api_session
         self.library = library
@@ -113,6 +157,11 @@ class ProcessRunner:
         self.ui_update = ui_update
         self.info_exit = info_exit
         self.reset_live_chunk_status = reset_live_chunk_status
+        self.remember_ui_settings = remember_ui_settings  # agent runs leave the tab's saved form alone
+
+    def _save_ui_settings(self, settings: dict, media_kind: str, batch_mode: str) -> None:
+        if self.remember_ui_settings:
+            catalog.save_mediaflow_ui_settings(settings, media_kind, batch_mode)
 
     def _record_process_result(self, result: ProcessRunResult) -> ProcessRunResult:
         self.active_job["last_process_result"] = result
@@ -235,7 +284,8 @@ class ProcessRunner:
                 settings["video_guide_outpainting_ratio"] = str(target_ratio or "").strip()
         if not self._is_spatial_upsampling_task(settings):
             settings["resolution"] = output_paths.choose_resolution(output_resolution)
-        settings["spatial_upsampler_parameters"] = dict(spatial_upsampler_parameters)
+        spatial = parameter_ui.SETTINGS[parameter_ui.SPATIAL]  # the process's own values completed with the user's
+        settings[spatial] = {**dict(settings.get(spatial) or {}), **dict(spatial_upsampler_parameters)}
         api_settings = settings.get("_api")
         settings["_api"] = dict(api_settings) if isinstance(api_settings, dict) else {}
         for key in ("return_media", "return_video_uint8", "return_audio", "return_flashvsr_continue_cache", "flashvsr_continue_cache"):
@@ -269,7 +319,7 @@ class ProcessRunner:
         target_output_path = output_paths.resolve_image_output_path(source_path, output_path, process_display_name, default_extension=self._image_output_extension(), notify=common.plugin_info)
         if not batch_internal:
             try:
-                catalog.save_mediaflow_ui_settings({
+                self._save_ui_settings({
                     "process_model_type": str(process_definition["settings"].get("model_type") or ""),
                     "process_name": request.process_name,
                     "source_path": source_path,
@@ -422,6 +472,9 @@ class ProcessRunner:
         if len(items) == 0:
             yield self.info_exit(f"Batch has no source {media_kind}s to process.")
             return
+        batch_process_definition = process_definition if process_definition.get("info", {}).get("use_configured_model") else None
+        if batch_process_definition is not None:
+            request = replace(request, target_ratio=system_handler.normalize_target_control_for_process(request.target_ratio, process_definition["settings"]))
         self._reset_generated_artifacts()
         signature = batch_queue.build_signature(request, items, batch_name=batch_name, process_model_type=model_type, media_kind=media_kind)
         signature_hash = batch_queue.signature_hash(signature)
@@ -432,10 +485,11 @@ class ProcessRunner:
         elif files.batch_name:
             batch_name = files.batch_name
         batch_state = files.state if files.state is not None else batch_queue.make_state(batch_name, signature, items)
+        self.active_job["last_batch"] = {"name": batch_name, "state_file": str(files.state_path), "log_file": str(files.log_path), "state": batch_state}  # updated in place as items finish
         if files.renamed:
             common.plugin_info(f'Batch name "{requested_batch_name}" already has a state file. Using "{batch_name}".')
         try:
-            catalog.save_mediaflow_ui_settings({
+            self._save_ui_settings({
                 "process_model_type": model_type,
                 "process_name": request.process_name,
                 "source_path": source_path,
@@ -541,6 +595,7 @@ class ProcessRunner:
                         batch_source_path=batch_source_path,
                         spatial_upsampler_parameters=request.spatial_upsampler_parameters,
                         batch_internal=True,
+                        batch_process_definition=batch_process_definition,
                     )
                     result = self.active_job.get("last_process_result")
                     if not isinstance(result, ProcessRunResult):
@@ -589,11 +644,11 @@ class ProcessRunner:
         finally:
             self.active_job["batch_running"] = False
 
-    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False):
+    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False, batch_process_definition=None):
         self.active_job[catalog.PREVIEW_OUTPUT_STORAGE_KEY] = catalog.normalize_preview_enabled(preview_enabled)
         if not self._preview_enabled():
             self.preview_state["image"] = None
-        process_definition = self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
+        process_definition = batch_process_definition or self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
         selected_source_path = source_path
         selected_batch_source_path = batch_source_path
         if process_definition is not None and self._process_is_image(process_definition):
@@ -608,6 +663,7 @@ class ProcessRunner:
             return
         if not batch_internal:
             self._reset_generated_artifacts()
+            self.active_job.update(last_batch=None, batch_fields=None)
         self.active_job["last_process_result"] = None
         request = RunRequest.from_gradio(state, process_name, user_refs, selected_source_path, process_strength, output_path, prompt_text, continue_enabled, source_audio_track, output_resolution, target_ratio, chunk_size_seconds, sliding_window_overlap, start_seconds, end_seconds, spatial_upsampler_parameters)
         if process_definition is None:
@@ -679,7 +735,7 @@ class ProcessRunner:
             return
         if not batch_internal:
             try:
-                catalog.save_mediaflow_ui_settings({
+                self._save_ui_settings({
                     "process_model_type": model_type,
                     "process_name": request.process_name,
                     "source_path": source_path,
@@ -746,10 +802,12 @@ class ProcessRunner:
         self.active_job["running"] = True
         try:
             video.clear_process_full_video_source()
+            upsampler_metadata = {"spatial_upsampling": system_target_control} if process_definition.get("info", {}).get("use_configured_model") else {}
             yield self.ui_update(status_ui.render_chunk_status_html(1, 0, 1, "Initializing", "Preparing processing job..."), self.ui_skip, str(time.time_ns()), start_enabled=False, abort_enabled=False)
             started_ui = True
             try:
                 prepared_run = prepare_run(
+                    expected_spatial_upsampling=upsampler_metadata.get("spatial_upsampling", ""),
                     plugin=self.plugin,
                     get_model_def=self.get_model_def,
                     process_name=request.process_name,
@@ -1013,6 +1071,7 @@ class ProcessRunner:
                 "video_length": int(resumed_unique_frames),
                 "frame_count": int(resumed_unique_frames),
                 process_metadata.PROCESS_FULL_VIDEO_METADATA_KEY: {
+                    **upsampler_metadata,
                     "process": process_display_name,
                     "written_unique_frames": int(resumed_unique_frames),
                     "chunks": int(total_chunks_display),
@@ -1192,6 +1251,7 @@ class ProcessRunner:
                     raise gr.Error(f"Final output contains {actual_output_frames} readable frame(s), but {total_written_unique_frames} frame(s) were written.")
             total_generation_time = existing_output_generation_time + process_metadata.read_metadata_generation_time(metadata_source_path) if merged_continuation else process_metadata.read_metadata_generation_time(metadata_source_path)
             output_process_metadata = {
+                **upsampler_metadata,
                 "process": process_display_name,
                 "written_unique_frames": int(total_written_unique_frames),
                 "chunks": int(total_chunks_display),

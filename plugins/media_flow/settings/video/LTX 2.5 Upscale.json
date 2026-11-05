@@ -7,5 +7,9 @@
   "chunk_size_seconds": 3.0,
   "sliding_window_overlap": 17,
   "prompt": "high quality, detailed, sharp, natural textures",
-  "negative_prompt": "blurry, low quality, artifacts, distorted"
+  "negative_prompt": "blurry, low quality, artifacts, distorted",
+  "process": {
+    "task": "upscale",
+    "summary": "LTX-2.5 pixel spatial upscaler x2: preserves motion, conditioned on the source audio."
+  }
 }

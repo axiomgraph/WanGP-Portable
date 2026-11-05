@@ -12,6 +12,7 @@ from shared.deepy.errors import DeepyBusy
 from shared.gradio.form_sync import GradioForm
 from shared.gradio.gallery_frames import bind_gallery_frames
 from shared.gradio.gallery_snapshots import bind_gallery_snapshots
+from shared.gradio.gradio_media_response_patch import allow_listed_media
 from shared.utils.form_sync import Saved
 from shared.utils.gallery_sources import GALLERY_SOURCES, STRIP_SOURCES
 from shared.utils.gallery_view import gallery_offset, gallery_window
@@ -104,6 +105,7 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
             limit = service._deps.get_server_config()['clear_file_list']
             video, selected, video_offset = gallery_window(gen['file_list'], gen['selected'], limit, keep_selected=True)
             if video_offset != gallery_offset(len(gen['file_list']), limit):
+                allow_listed_media(video)
                 updates[outputs.index(gallery)] = gr.update(value=video, selected_index=selected)
             gallery_view = {'session': session, 'revision': current, 'workspace': service.workspace_id, 'sources': [{'id': source.id, 'label': source.tab_label} for source in GALLERY_SOURCES], 'video': video, 'video_offset': video_offset, 'selected': selected}
             for source in STRIP_SOURCES:
@@ -141,8 +143,8 @@ def bind_settings_sync(service, state, ui, dropdown_updates, catalog_event, pref
     revision = gr.State(-1)
     props = [ui.compact_actions, ui.auto_cancel_queue_tasks, ui.separate_requests_with_empty_line, ui.use_template_properties, ui.model_speed, ui.model_size, ui.override_height, ui.override_width, ui.override_num_frames, ui.override_audio_duration, ui.override_seed]
     keys = ['compact_actions', 'auto_cancel_queue_tasks', 'separate_requests_with_empty_line', 'use_template_properties', 'model_speed', 'model_size', 'height', 'width', 'num_frames', 'audio_duration', 'seed']
-    tools = [ui.default_video_generator, ui.default_video_with_speech, ui.default_image_generator, ui.default_image_editor, ui.default_song, ui.default_with_refs, ui.default_speech_from_description, ui.default_speech_from_sample]
-    tool_keys = ['video_generator_variant', 'video_with_speech_variant', 'image_generator_variant', 'image_editor_variant', 'song_variant', 'with_refs_variant', 'speech_from_description_variant', 'speech_from_sample_variant']
+    tools = [control.dropdown for control in ui.template_controls]
+    tool_keys = [ui_settings.TEMPLATE_TOOL_UI_KEY[control.tool_name] for control in ui.template_controls]
     preference_keys = ['multi_session', 'gallery_media_mode']
     all_keys = keys + tool_keys + preference_keys
     components = [*props, *tools, ui.multi_session, ui.session_gallery_media_mode]

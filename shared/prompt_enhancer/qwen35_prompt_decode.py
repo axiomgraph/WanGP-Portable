@@ -5,6 +5,7 @@ from time import perf_counter
 from tqdm import tqdm
 
 from shared.llm_engines.lmgp.engine.block_manager import BlockManager
+from shared.llm_engines.lmgp.layers.kv_formats import overlay_slots
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 from shared.utils.cancellation import check_cancelled
 
@@ -15,7 +16,7 @@ def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think
     llm.model_runner.ensure_runtime_ready()
     llm.reset()
     if llm.config.num_kvcache_blocks > 0 and len(llm.scheduler.block_manager.blocks) != llm.config.num_kvcache_blocks:
-        llm.scheduler.block_manager = BlockManager(llm.config.num_kvcache_blocks, llm.config.kvcache_block_size)
+        llm.scheduler.block_manager = BlockManager(llm.config.num_kvcache_blocks, llm.config.kvcache_block_size, overlay_slots(llm.config))
     llm.model_runner.reset_generation_state()
     llm.model_runner.call("set_sampling_seed", sampling_params.seed)
     llm.add_request(prompt, sampling_params)

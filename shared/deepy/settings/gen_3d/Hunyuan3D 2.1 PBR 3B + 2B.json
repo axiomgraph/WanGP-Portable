@@ -1,0 +1,24 @@
+{
+    "settings_version": 2.82,
+    "model_type": "hunyuan3d_21_shape",
+    "type": "Hunyuan3D 2.1 Shape 3B",
+    "prompt": "",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "batch_size": 1,
+    "remove_background_images_ref": 1,
+    "multi_prompts_gen_type": "FG",
+    "num_inference_steps": 30,
+    "guidance_scale": 5.0,
+    "custom_settings": {
+        "octree_resolution": 256,
+        "max_faces": 0
+    },
+    "temporal_upsampling": "hunyuan3d_paint",
+    "temporal_postprocessing_parameters": {
+        "texture_views": "8_768",
+        "texture_size": 2048,
+        "texture_max_faces": 40000,
+        "texture_guidance": 3.0
+    }
+}

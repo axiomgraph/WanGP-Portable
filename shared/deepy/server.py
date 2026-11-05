@@ -21,9 +21,9 @@ from shared.deepy import chat, session_store
 from shared.deepy.errors import error_payload
 from shared.deepy.gallery import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS
 from shared.deepy.voice import mount_voice_routes, save_upload
-from shared.utils.downloads import _install_routes_on_app
+from shared.utils.downloads import _install_routes_on_app, registered_download_path
 from shared.utils.media_imports import persist_gallery_import
-from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS
+from shared.utils.gallery_sources import MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS
 from shared.utils.mesh_outputs import import_mesh_file
 from shared.authentication import password
 from shared.authentication.web import WebAuthentication, WebAuthMiddleware
@@ -67,10 +67,9 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
     app.add_exception_handler(session_store.SessionStoreError, invalid_value)
     app.add_exception_handler(GradioError, invalid_value)
 
-    @app.get("/", response_class=HTMLResponse)
-    def index():
+    def chat_page(name):
         shell = chat.render_shell_html(service._deps.controller.get_deepy_type())
-        page = (WEB / "app.html").read_text(encoding="utf-8").replace("<!-- CHAT -->", shell).replace("<!-- STATS -->", chat.render_stats_html())
+        page = (WEB / name).read_text(encoding="utf-8").replace("<!-- CHAT -->", shell).replace("<!-- STATS -->", chat.render_stats_html())
         def version_asset(match):
             name = match[1]
             path = WEB.parents[1] / 'gradio' / name if name in {'form_sync.js', 'progress.css', 'image_zoom.js', 'image_zoom.css'} else WEB / name
@@ -82,6 +81,14 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
             page = page.replace("<body data-deepy-app>", f'<body data-deepy-app data-deepy-https-port="{int(https_port)}">')
         return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
+    @app.get("/", response_class=HTMLResponse)
+    def index():
+        return chat_page("app.html")
+
+    @app.get("/window", response_class=HTMLResponse)
+    def window():  # Deepy's chat window as a component, for a plugin's page
+        return chat_page("window.html")
+
     @app.get("/assets/{name}")
     def asset(name: str):
         if name == 'mesh_viewer.js':
@@ -91,7 +98,7 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
             return FileResponse(WEB.parents[1] / 'gradio' / name)
         if name == "icon.png":
             return FileResponse(WEB.parents[2] / "favicon.png")
-        if name not in {"chat.js", "compact_actions.js", "chat.css", "voice.js", "app.js", "app.css", "gradio_transport.js", "manifest.webmanifest", "icon.svg", "transport.js", "hybrid_transport.js", "workspaces.js", "workspaces.css", "media_view.js"}:
+        if name not in {"window.js", "window.css", "chat.js", "compact_actions.js", "chat.css", "voice.js", "app.js", "app.css", "gradio_transport.js", "manifest.webmanifest", "icon.svg", "transport.js", "hybrid_transport.js", "workspaces.js", "workspaces.css", "media_view.js", "app_player.js", "app_player.css"}:
             raise HTTPException(404)
         return FileResponse(WEB / name, media_type="application/manifest+json" if name == "manifest.webmanifest" else None)
 
@@ -271,9 +278,21 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
         with service._mutation_lock:
             return {"id": media_id, "gallery": service.gallery_snapshot()}
 
-    @app.post('/deepy_api/media/unattach-last')
-    def unattach_last(payload: dict):
-        return {'event': service.remove_last_chat_upload(payload.get('chat_session_id'))}
+    @app.post('/deepy_api/media/unattach')
+    def unattach(payload: dict):
+        return {'event': service.remove_chat_upload(payload.get('chat_session_id'), payload.get('media_id'))}
+
+    @app.get("/deepy_api/media/locate")
+    def locate_media(url: str):
+        return service.locate_gallery_media(url)
+
+    @app.get("/deepy_api/media/mesh-viewer")
+    def mesh_viewer(url: str):
+        from shared.gradio.strip_gallery import MeshGallery
+        path = registered_download_path(url)
+        if path is None or Path(path).suffix.lower() not in MESH_EXTENSIONS:
+            raise HTTPException(404, "3D asset not found.")
+        return {"html": MeshGallery.viewer_html(path, url)}
 
     @app.post("/deepy_api/media/{media_id}/select")
     def select(media_id: str):
@@ -309,6 +328,9 @@ def run_server(deps, args):
     service = DeepyService(deps)
     service.configure_workspaces(args.workspaces_dir or service._deps.get_server_config().get('workspaces_dir') or str(WEB.parents[2] / 'workspaces'))
     app = create_app(service, auth=auth, voice_language=args.deepy_voice_language, https_port=https_port)
+    from shared.apps import server as apps_server
+    apps_server.mount(app, auth.public_url)
+    app.add_middleware(apps_server.AppFrameGuard)  # outermost: runs before the authentication
     if https_port is None:
         uvicorn.run(app, host=host, port=port, ssl_certfile=cert, ssl_keyfile=key)
     else:

@@ -1,0 +1,13 @@
+{
+    "settings_version": 2.81,
+    "model_type": "hy_nomas",
+    "type": "Hy-Nomas World Model 8B",
+    "prompt": "",
+    "image_mode": 0,
+    "resolution": "832x480",
+    "video_length": 97,
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "multi_prompts_gen_type": "FG",
+    "world_output": "world"
+}

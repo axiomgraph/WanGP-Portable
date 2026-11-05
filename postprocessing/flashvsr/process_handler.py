@@ -27,25 +27,35 @@ class FlashVSRProcessHandler:
     hide_output_resolution = True
     hide_prompt = True
 
+    def configured_method(self, method: str) -> str:
+        bridge = upsampler_api.require_upsampler_by_method(method)
+        model = bridge.model()
+        two_pass = bridge.is_two_pass_upsampling(method)
+        return next(key for key, version in bridge.METHOD_MODELS.items() if version == model and bridge.is_two_pass_upsampling(key) == two_pass)
+
     @property
     def overlap_frames(self) -> int:
-        """FlashVSR's streaming output has a tail conditioned on repeated source frames (11 frames for v1.1, 19 for FlashVSR+) that
-        must be regenerated with the next source chunk before writing; it follows the model selected in the configuration."""
-        bridge = upsampler_api.find_postprocessing_upsampler(FlashVSRBridge.upsampling_value(2.0))
-        return bridge.overlap_frames() if bridge is not None else 11
+        """Default overlap for the original FlashVSR v1.1 process."""
+        return 11
 
     def get_overlap_frames(self, chunk_frames: int) -> int:
         return max(0, min(int(self.overlap_frames), int(chunk_frames) - 1))
+
+    def get_overlap_frames_for_target(self, chunk_frames: int, target_control: str) -> int:
+        split = FlashVSRBridge.split_value(target_control)
+        if split is None:
+            return self.get_overlap_frames(chunk_frames)
+        overlap = upsampler_api.require_upsampler_by_method(split[0]).overlap_frames(target_control)
+        return max(0, min(overlap, int(chunk_frames) - 1))
 
     def normalize_target_control(self, value: str | None) -> str:
         value = str(value or "").strip()
         scale = scale_for_lanczos(value)
         if scale is not None:
             return upsampling_value("lanczos", scale)
-        scale = FlashVSRBridge.scale_for_upsampling(value)
-        if scale is not None:
-            method = FlashVSRBridge.UPSAMPLING_TWO_PASS_VALUE_PREFIX if FlashVSRBridge.is_two_pass_upsampling(value) else FlashVSRBridge.UPSAMPLING_VALUE_PREFIX
-            return upsampling_value(method, scale)
+        split = FlashVSRBridge.split_value(value)
+        if split is not None:
+            return upsampling_value(*split)
         scale = scale_for_any(value)
         return FlashVSRBridge.upsampling_value(scale) if scale is not None else self.default_target_control
 
@@ -63,7 +73,8 @@ class FlashVSRProcessHandler:
     def output_resolution_token(self, value: str | None) -> str:
         value = self.normalize_target_control(value)
         scale = scale_for_lanczos(value) or FlashVSRBridge.scale_for_upsampling(value) or 2.0
-        prefix = "lanczos-" if value.startswith("lanczos") else ("flashvsr2pass-" if FlashVSRBridge.is_two_pass_upsampling(value) else "")
+        method = "lanczos" if value.startswith("lanczos") else FlashVSRBridge.split_value(value)[0]
+        prefix = "" if method == FlashVSRBridge.UPSAMPLING_VALUE_PREFIX else f"{method}-"
         return f"{prefix}x{FlashVSRBridge.format_ratio(scale)}"
 
     def build_queue_settings(self, process_settings: dict, *, source_path: str, start_frame: int, frame_count: int, target_control: str, seed: int, continue_cache: Any, audio_track_no: int | None = None) -> dict:
@@ -239,14 +250,13 @@ def scale_for_any(value: str | None) -> float | None:
 def upsampling_prefix_for_process(process_settings: dict | None) -> str:
     settings = process_settings if isinstance(process_settings, dict) else {}
     method = str(settings.get("spatial_upsampling_method") or "").strip().lower()
-    if method in ("lanczos", FlashVSRBridge.UPSAMPLING_VALUE_PREFIX, FlashVSRBridge.UPSAMPLING_TWO_PASS_VALUE_PREFIX):
+    if method == "lanczos" or method in FlashVSRBridge.METHOD_MODELS:
         return method
     target = str(settings.get("target_ratio") or "").strip().lower()
     if target.startswith("lanczos"):
         return "lanczos"
-    if target.startswith(FlashVSRBridge.UPSAMPLING_TWO_PASS_VALUE_PREFIX):
-        return FlashVSRBridge.UPSAMPLING_TWO_PASS_VALUE_PREFIX
-    return FlashVSRBridge.UPSAMPLING_VALUE_PREFIX
+    split = FlashVSRBridge.split_value(target)
+    return split[0] if split is not None else FlashVSRBridge.UPSAMPLING_VALUE_PREFIX
 
 
 def upsampling_value(prefix: str, scale: float) -> str:

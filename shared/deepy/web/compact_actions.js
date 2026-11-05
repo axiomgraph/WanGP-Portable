@@ -294,6 +294,7 @@
   };
   WAC.applyDisplaySettings = values => {
     if (compactByDefault !== values.compact_actions) WAC.setCompactActions(values.compact_actions);
+    WAC.galleryMediaViewer = values.gallery_media_viewer;
   };
   const consume = WAC.consumePayload;
   WAC.consumePayload = function (payload) {

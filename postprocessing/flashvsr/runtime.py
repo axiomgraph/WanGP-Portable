@@ -538,11 +538,10 @@ class FlashVSRRuntime:
         return self.vae.decode_to_cpu_uint8([latents], tile_size, **decode_kwargs)[0]
 
     @controlled_model_loading
-    def load(self, paths: FlashVSRPaths, variant: str, profile, init_pipe, model: str = FLASHVSR_MODEL_V11, preload_mode: str = "default") -> None:
+    def load(self, paths: FlashVSRPaths, variant: str, profile, init_pipe, model: str = FLASHVSR_MODEL_V11) -> None:
         require_sparge_attention()
         variant = variant or FLASHVSR_VARIANT_TINY_LONG
-        if model in FLASHVSR_PLUS_MODELS:
-            profile = 0  # the FlashVSR+ models always run with memory profile 0: streamed blocks pinned while they run, dynamic VRAM preload
+        profile = 0
         if self.dit is not None and self.variant == variant and self.profile == profile and self.model == model and self.transformer_path == paths.transformer:
             return
         self.release()
@@ -576,8 +575,6 @@ class FlashVSRRuntime:
             pipe["vae"] = self.vae.model
         kwargs = {"coTenantsMap": FLASHVSR_COTENANTS_MAP}
         profile_no = init_pipe(pipe, kwargs, profile)
-        if profile == 0 and "autoPreload" not in kwargs:  # as WanGP decides it for profile 0: dynamic unless a VRAM preload amount is set
-            kwargs["autoPreload"] = kwargs.get("minimumBudget", 0) <= 0 and preload_mode in ("default", "dynamic")
         kwargs["pinnedMemory"] = False
         self.offloadobj = offload.profile(pipe, loading_callback=loading_callback(), profile_no=profile_no, quantizeTransformer=False, convertWeightsFloatTo=self.dtype, verboseLevel=-1, **kwargs)
         offload_registry.register_offloadobj("FlashVSR", self.offloadobj, self.release)
@@ -964,9 +961,9 @@ def continue_cache_frames(model: str) -> int:
     return FLASHVSR_PLUS_CONTINUE_CACHE_FRAMES if model in FLASHVSR_PLUS_MODELS else FLASHVSR_CONTINUE_CACHE_FRAMES
 
 
-def load_models(paths: FlashVSRPaths, variant: str = FLASHVSR_VARIANT_TINY_LONG, *, init_pipe, profile, model: str = FLASHVSR_MODEL_V11, preload_mode: str = "default", progress_callback=None) -> None:
+def load_models(paths: FlashVSRPaths, variant: str = FLASHVSR_VARIANT_TINY_LONG, *, init_pipe, profile, model: str = FLASHVSR_MODEL_V11, progress_callback=None) -> None:
     _report_progress(progress_callback, "Caching")
-    _RUNTIME.load(paths, variant, profile=profile, init_pipe=init_pipe, model=model, preload_mode=preload_mode)
+    _RUNTIME.load(paths, variant, profile=profile, init_pipe=init_pipe, model=model)
 
 
 @torch.inference_mode()

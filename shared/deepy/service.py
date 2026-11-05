@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import traceback
@@ -10,17 +11,21 @@ import uuid
 from collections import OrderedDict, deque
 
 from shared.deepy import chat, media_registry, session_store, ui_settings
+from shared.deepy.config import DEEPY_GALLERY_MEDIA_VIEWER_DEFAULT, DEEPY_GALLERY_MEDIA_VIEWER_KEY
 from shared.deepy.drivers import AppGallery
 from shared.deepy.errors import DeepyBusy, error_payload
 from shared.deepy.engine import get_or_create_assistant_session
 from shared.deepy.runtime import GenerationRuntime
+from shared.utils.downloads import registered_download_path
 from shared.utils.form_sync import FormRegistry, Saved
+from shared.utils.gallery_sources import VIDEO
 from shared.gradio.progress import WangpProgress
 from functools import partial
 from shared.deepy.workspaces import WorkspaceSupport
+from shared.deepy.plugin_jobs import PluginJobSupport
 
 
-class DeepyService(WorkspaceSupport, GenerationRuntime):
+class DeepyService(WorkspaceSupport, PluginJobSupport, GenerationRuntime):
     workspace_viewer = None
 
     def __init__(self, deps, *, state=None, gallery_factory=AppGallery):
@@ -44,6 +49,10 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
         self._generation_aborting = False
         self._closing = False
         self._restoration = None
+        self._plugin_job = None
+        self._plugin_waiters = deque()
+        self._request_states = {}
+        deps.controller.request_listener = self._plugin_request_event
         self.forms = FormRegistry(self.publish)
         self.forms.register('deepy-web', self._settings_form()['values'], read=lambda: self._settings_form()['values'], scope=lambda: self._session.chat_session_id, lock=self._mutation_lock)
 
@@ -88,7 +97,8 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
         self.publish("sessions", {"sessions": self._deps.controller.list_saved_sessions(), "active_session_id": self._session.storage_session_id, "active_session_title": self._session.storage_title, "multi_session": self._deps.controller.multi_session_enabled()})
 
     def display_settings(self):
-        return {"compact_actions": bool(self._deps.get_server_config().get("deepy_compact_actions", True))}
+        config = self._deps.get_server_config()
+        return {"compact_actions": bool(config.get("deepy_compact_actions", True)), "gallery_media_viewer": bool(config.get(DEEPY_GALLERY_MEDIA_VIEWER_KEY, DEEPY_GALLERY_MEDIA_VIEWER_DEFAULT))}
 
     def update_display_settings(self, values):
         if set(values) != {"compact_actions"} or type(values["compact_actions"]) is not bool:
@@ -125,7 +135,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
         self.publish("settings", result)
         return result
 
-    def submit(self, text, submission_id, *, steering=False):
+    def submit(self, text, submission_id, *, steering=False, media=None, author="You"):
         with self._mutation_lock:
             if self._closing:
                 raise ValueError("Deepy is shutting down.")
@@ -140,7 +150,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
                 queued = bool(self._restoration_submissions or (self._restoration and self._restoration['pending']))
                 if queued:
                     self._restoration_submissions.append(submission_id)
-                self._start_worker(lambda: self._run_request(text, submission_id, steering), [submission_id])
+                self._start_worker(lambda: self._run_request(text, submission_id, steering, media, author), [submission_id])
             return queued
 
     def _start_worker(self, task, acknowledged_ids=()):
@@ -166,7 +176,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
                     if task == self._resume_session and self._restoration["pending"]:
                         self._finish_restoration()
 
-    def _run_request(self, text, submission_id, steering):
+    def _run_request(self, text, submission_id, steering, media=None, author="You"):
         with self._condition:
             self._condition.wait_for(lambda: self._closing or (not (self._restoration and self._restoration['pending']) and (not self._restoration_submissions or self._restoration_submissions[0] == submission_id)))
             queued = submission_id in self._restoration_submissions
@@ -174,7 +184,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
             if self._closing:
                 return
             session_id = self._session.storage_session_id
-            for command, data in self._deps.controller.iter_commands(self._state, text, submission_id, steering):
+            for command, data in self._deps.controller.iter_commands(self._state, text, submission_id, steering, media=media, author=author):
                 if queued:
                     # The controller has accepted this request; subsequent ones can
                     # enter its normal queue/steering path while this turn streams.
@@ -254,6 +264,8 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
     def control(self, action, payload):
         started = time.perf_counter()
         self.require_restored()
+        if action in {"reset", "resume", "delete", "rename"} and self._plugin_job is not None:
+            raise DeepyBusy(f"{self._plugin_job.owner} is using Deepy. Change conversation once it finishes.")
         controller = self._deps.controller
         if action == "abort":
             with self._mutation_lock:
@@ -348,7 +360,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
                 path = self.workspaces.adopt(self.workspace_id, [str(path)])[0]
             result = self.gallery.add_path(str(path))
             record = media_registry.mark_media_access(result["record"], "read")
-            entry = {"media_id": record["settings"]["gallery_media_ids"][0], "title": record["label"], "media_type": record["media_type"]}
+            entry = {"media_id": record["settings"]["gallery_media_ids"][0], "title": record["label"], "media_type": record["media_type"], "path": record["path"]}
             with self._session.turn_lock:
                 pending = self._session.pending_chat_media
                 existing = next((item for item in pending if item['media_id'] == entry['media_id']), None)
@@ -363,7 +375,8 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
             self.save_session()
             return self.gallery.media_id(result["record"]["path"])
 
-    def remove_last_chat_upload(self, chat_session_id):
+    def remove_chat_upload(self, chat_session_id, media_id=None):
+        """Detach the given pending chat upload, or the last one."""
         with self._mutation_lock:
             self.require_restored()
             if chat_session_id != self._session.chat_session_id:
@@ -371,7 +384,7 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
             with self._session.turn_lock:
                 pending = self._session.pending_chat_media
                 for index in range(len(pending) - 1, -1, -1):
-                    if pending[index].get('chat_upload'):
+                    if pending[index].get('chat_upload') and media_id in (None, pending[index]['media_id']):
                         pending.pop(index)
                         break
             event = chat.build_pending_upload_event(self._session)
@@ -393,6 +406,17 @@ class DeepyService(WorkspaceSupport, GenerationRuntime):
             if self.gallery.select(media_id) is None:
                 raise ValueError("Media not found.")
             self.publish("gallery", self.gallery_snapshot())
+
+    def locate_gallery_media(self, url):
+        """Image/video gallery position of a chat media URL (None when its file is not in that gallery), for the gallery's full-screen viewer."""
+        path = registered_download_path(url)
+        if path is None:
+            return None
+        key = os.path.normcase(path)
+        with self._mutation_lock:
+            paths, _ = self.gallery._resolve_lists(VIDEO.id)
+            index = next((index for index, item in enumerate(paths) if os.path.normcase(os.path.abspath(str(item))) == key), None)
+            return None if index is None else {"workspace": self.workspace_id, "index": index, "path": paths[index]}
 
     def save_session(self):
         future = session_store.schedule_autosave(self._session)

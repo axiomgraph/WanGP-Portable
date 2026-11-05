@@ -13,7 +13,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen2VLImageProcessorFast, Qwen2VLProcessor
 from transformers.processing_utils import ProcessorMixin
 
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -670,7 +670,7 @@ def _build_krea2_text_encoder_preprocessor(text_config):
     return preprocess_state_dict
 
 
-def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=False, vision_encoder_filename=None):
+def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=False):
     register_qwen3_vl_config()
     config = Qwen3VLConfig.from_json_file(config_path)
     with init_empty_weights(include_buffers=True):
@@ -685,12 +685,11 @@ def _load_text_encoder(text_encoder_filename, config_path, dtype, with_vision=Fa
         default_dtype=dtype,
         preprocess_sd=_build_krea2_text_encoder_preprocessor(config.text_config),
     )
-    if with_vision:
-        if vision_encoder_filename is None:
-            raise ValueError("Krea2 edit requires a standalone Qwen3-VL vision encoder checkpoint.")
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 0.7 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
+    if with_vision:  # the shared checkpoint holds the vision tower beside the language model
         offload.load_model_data(
             text_encoder.visual,
-            vision_encoder_filename,
+            text_encoder_filename,
             modelPrefix="visual",
             writable_tensors=False,
             default_dtype=dtype,
@@ -726,22 +725,13 @@ class model_factory:
         text_encoder_folder = model_def["text_encoder_folder"]
         text_encoder_config_path = fl.locate_file(os.path.join(text_encoder_folder, "config.json"))
         edit = base_model_type in ("krea2_raw_edit", "krea2_turbo_edit")
-        vision_encoder_filename = None
-        if edit:
-            vision_encoder_filename = fl.locate_file(model_def["vision_encoder_filename"])
-        text_encoder = _load_text_encoder(
-            text_encoder_filename,
-            text_encoder_config_path,
-            dtype,
-            with_vision=edit,
-            vision_encoder_filename=vision_encoder_filename,
-        )
+        text_encoder = _load_text_encoder(text_encoder_filename, text_encoder_config_path, dtype, with_vision=edit)
         tokenizer_config = fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json"))
         fl.locate_file(os.path.join(text_encoder_folder, "tokenizer.json"))
         fl.locate_file(os.path.join(text_encoder_folder, "chat_template.jinja"))
         tokenizer_path = os.path.dirname(tokenizer_config)
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, max_length=512, trust_remote_code=True, extra_special_tokens={})
-        image_processor = Qwen2VLImageProcessorFast.from_pretrained(tokenizer_path)
+        image_processor = Qwen2VLImageProcessorFast.from_pretrained(fl.locate_file(os.path.join(text_encoder_folder, "preprocessor_config.json")))  # located per file: a same-named folder in another checkpoint root must not shadow it
         processor = Krea2Qwen3VLProcessor(image_processor, tokenizer)
         vae = load_vae(model_def, VAE_upsampling)
         self.pipeline = Krea2Pipeline(transformer, vae, Qwen3VLConditioner(text_encoder, tokenizer, processor), dtype=dtype)

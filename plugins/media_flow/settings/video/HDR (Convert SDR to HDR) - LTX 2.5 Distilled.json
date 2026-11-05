@@ -11,5 +11,10 @@
   "image_prompt_type": "V",
   "denoising_strength": 1,
   "loras_multipliers": "1",
-  "activated_loras": []
+  "activated_loras": [],
+  "process": {
+    "task": "hdr",
+    "summary": "LTX-2.5 22B distilled.",
+    "recommended": true
+  }
 }

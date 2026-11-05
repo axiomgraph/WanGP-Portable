@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -26,8 +27,12 @@ DEEPY_TOOL_GEN_SONG_KEY = "deepy_tool_gen_song"
 DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY = "deepy_tool_gen_video_with_refs"
 DEEPY_TOOL_GEN_SPEECH_FROM_DESCRIPTION_KEY = "deepy_tool_gen_speech_from_description"
 DEEPY_TOOL_GEN_SPEECH_FROM_SAMPLE_KEY = "deepy_tool_gen_speech_from_sample"
+DEEPY_TOOL_GEN_WORLD_KEY = "deepy_tool_gen_world"
+DEEPY_TOOL_GEN_3D_KEY = "deepy_tool_gen_3d"
+DEEPY_TOOL_TEXTURE_3D_KEY = "deepy_tool_texture_3d"
 DEEPY_CONTEXT_TOKENS_KEY = "deepy_context_tokens"
 DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
+DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
 DEEPY_REPETITION_PENALTY_KEY = "deepy_repetition_penalty"
@@ -43,6 +48,8 @@ DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY = "deepy_separate_requests_with_empt
 DEEPY_SESSION_RESET_MODE_KEY = "deepy_session_reset_mode"
 DEEPY_SESSION_GALLERY_MEDIA_MODE_KEY = "deepy_session_gallery_media_mode"
 DEEPY_MULTI_SESSION_KEY = "deepy_multi_session"
+DEEPY_GALLERY_MEDIA_VIEWER_KEY = "deepy_gallery_media_viewer"  # chat images and videos open in the gallery's full-screen viewer instead of a new browser tab
+DEEPY_GALLERY_MEDIA_VIEWER_DEFAULT = True
 DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
     DEEPY_TOOL_GEN_IMAGE_KEY: {
         "Qwen Image 2.1 Viggle Turbo 8 Steps": "Qwen Image 2.1 Viggle Turbo v0.2.1 6 Steps",
@@ -52,9 +59,17 @@ DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
     },
     DEEPY_TOOL_GEN_VIDEO_KEY: {
         "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps",
+        "Pika H3 Flex FL2VA 6 Steps": "Pika H3 Flex FL2VA Pruned 6 Steps",  # Pika templates moved to the pruned models (2026-10-31)
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY: {
         "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps With Sound",
+        "Pika H3 Flex Ref2VA 6 Steps With Audio References": "Pika H3 Flex Ref2VA Pruned 6 Steps With Audio References",
+    },
+    DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY: {
+        "Pika H3 Flex Ref2VA 6 Steps": "Pika H3 Flex Ref2VA Pruned 6 Steps",
+    },
+    DEEPY_TOOL_GEN_3D_KEY: {
+        "TRELLIS.2 4B": "TRELLIS.2 + SUPRA-Tex PBR 4B + 2.1B",  # TRELLIS.2 split into a Shape model and a Texturer (2026-10-29)
     },
 }
 
@@ -78,6 +93,9 @@ DEEPY_DEFAULT_GEN_SONG = "ACE-Step 1.5 Turbo LM 1.7B"
 DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS = "MiniMax H3 Ref2VA Pruned PDD 8 Steps"
 DEEPY_DEFAULT_GEN_SPEECH_FROM_DESCRIPTION = "Qwen3 1.7B"
 DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE = "Index TTS 2"
+DEEPY_DEFAULT_GEN_WORLD = "Hy-Nomas World Model 8B"
+DEEPY_DEFAULT_GEN_3D = "TRELLIS.2 + SUPRA-Tex PBR 4B + 2.1B"
+DEEPY_DEFAULT_TEXTURE_3D = "SUPRA-Tex"
 DEEPY_CONTEXT_TOKENS_MIN = 20480  # Deepy Zero's system prompt and tools alone take about 12k tokens
 DEEPY_CONTEXT_TOKENS_MAX = 256000
 DEEPY_CONTEXT_TOKENS_DEFAULT = 20480
@@ -89,6 +107,8 @@ DEEPY_REPETITION_PENALTY_DEFAULT = True
 DEEPY_KV_CACHE_QUANTIZATION_AUTO = "auto"
 DEEPY_KV_CACHE_QUANTIZATION_DEFAULT = DEEPY_KV_CACHE_QUANTIZATION_AUTO
 DEEPY_KV_CACHE_QUANTIZATION_MIN_GGUF_KERNELS_VERSION = "1.0.13"
+DEEPY_KEPT_KV_CACHES_DEFAULT = 2
+DEEPY_KEPT_KV_CACHES_MAX = 4
 DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT = False
 DEEPY_FILE_SYSTEM_ACCESS_DISABLED = "disabled"
 DEEPY_FILE_SYSTEM_ACCESS_READ = "read"
@@ -96,6 +116,27 @@ DEEPY_FILE_SYSTEM_ACCESS_READ_WRITE = "read_write"
 DEEPY_FILE_SYSTEM_ACCESS_DEFAULT = DEEPY_FILE_SYSTEM_ACCESS_DISABLED
 DEEPY_FILE_SYSTEM_PATHS_DEFAULT: list[str] = []
 DEEPY_READ_EVERYWHERE_DEFAULT = False
+DEEPY_PYTHON_SANDBOX_KEY = "deepy_python_sandbox"
+DEEPY_PYTHON_SANDBOX_DEFAULT = "enabled"
+PYTHON_APPS_KEY = "python_apps"  # shared config group of App Development (Advanced): {"development": "off" | "apps" | "plugins"}
+PYTHON_APPS_LEVELS = ("off", "apps", "plugins")
+DEEPY_WEB_SEARCH_KEY = "deepy_web_search"
+DEEPY_WEB_SEARCH_DEFAULT = "disabled"
+DEEPY_ADVANCED_TRANSCRIPTION_KEY = "deepy_advanced_transcription"  # the transcription model of Prime's advanced_transcription toolbox action, or disabled
+DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT = "disabled"
+DEEPY_ADVANCED_TRANSCRIPTION_CHOICES = [
+    ("Use Whisper Only", "disabled"),
+    ("Nemotron INT8 Experts", "nemotron_transcribe"),
+    ("Nemotron Q4 Experts (Recommended)", "nemotron_transcribe_q4"),
+]
+DEEPY_TRANSCRIPTION_TERMS_KEY = "deepy_transcription_terms"  # names and jargon added to every advanced transcription (Nemotron context terms)
+CIVITAI_API_KEY_KEY = "civitai_api_key"  # shared config: Civitai downloads of LoRAs through Deepy's web toolbox (searching needs none); plaintext only when not stored securely
+CIVITAI_API_KEY_SECURE_KEY = "civitai_api_key_secure"  # the key lives in the OS credential manager under the credential id below
+CIVITAI_API_KEY_CREDENTIAL_ID_KEY = "civitai_api_key_credential_id"
+HUGGINGFACE_TOKEN_KEY = "huggingface_token"  # optional: gated or private Hugging Face repositories for Deepy's LoRA hub; public ones need none
+HUGGINGFACE_TOKEN_SECURE_KEY = "huggingface_token_secure"
+HUGGINGFACE_TOKEN_CREDENTIAL_ID_KEY = "huggingface_token_credential_id"
+SECRET_CONFIG_KEYS = {"civitai": (CIVITAI_API_KEY_KEY, CIVITAI_API_KEY_SECURE_KEY, CIVITAI_API_KEY_CREDENTIAL_ID_KEY), "huggingface": (HUGGINGFACE_TOKEN_KEY, HUGGINGFACE_TOKEN_SECURE_KEY, HUGGINGFACE_TOKEN_CREDENTIAL_ID_KEY)}
 DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT = False
 DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT = True
 DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT = True
@@ -209,7 +250,7 @@ def normalize_deepy_tool_gen_video_with_speech(value: Any) -> str:
 
 
 def normalize_deepy_tool_gen_video_with_refs(value: Any) -> str:
-    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS)
+    return _normalize_deepy_variant(value, DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY], DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS)
 
 
 def normalize_deepy_tool_gen_song(value: Any) -> str:
@@ -224,6 +265,18 @@ def normalize_deepy_tool_gen_speech_from_sample(value: Any) -> str:
     return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE)
 
 
+def normalize_deepy_tool_gen_world(value: Any) -> str:
+    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_GEN_WORLD)
+
+
+def normalize_deepy_tool_gen_3d(value: Any) -> str:
+    return _normalize_deepy_variant(value, DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_3D_KEY], DEEPY_DEFAULT_GEN_3D)
+
+
+def normalize_deepy_tool_texture_3d(value: Any) -> str:
+    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_TEXTURE_3D)
+
+
 def normalize_deepy_context_tokens(value: Any) -> int:
     try:
         tokens = int(value or DEEPY_CONTEXT_TOKENS_DEFAULT)
@@ -232,13 +285,51 @@ def normalize_deepy_context_tokens(value: Any) -> int:
     return max(DEEPY_CONTEXT_TOKENS_MIN, min(DEEPY_CONTEXT_TOKENS_MAX, tokens))
 
 
+def normalize_deepy_kept_kv_caches(value: Any) -> int:
+    """How many conversations keep their KV cache in RAM, the current one included, one each; 0 keeps none."""
+    try:
+        return max(0, min(DEEPY_KEPT_KV_CACHES_MAX, int(value)))
+    except (TypeError, ValueError):
+        return DEEPY_KEPT_KV_CACHES_DEFAULT
+
+
 def normalize_deepy_kv_cache_quantization(value: Any) -> str:
+    """"" (BF16), "auto", "int8", or a mixed layout "body[:exact]" in its canonical form (shared.llm_engines.lmgp.layers.kv_formats)."""
     text = str(DEEPY_KV_CACHE_QUANTIZATION_DEFAULT if value is None else value).strip().lower()
-    if text == "int8":
-        return "int8"
     if text == DEEPY_KV_CACHE_QUANTIZATION_AUTO:
         return DEEPY_KV_CACHE_QUANTIZATION_AUTO
-    return ""
+    if text == "":
+        return ""
+    from shared.llm_engines.lmgp.layers.kv_formats import is_layout_value, parse_layout
+    return parse_layout(text).value if is_layout_value(text) else ""
+
+
+def split_deepy_kv_cache_quantization(value: Any) -> tuple[str, str]:
+    """(body choice, exact-overlay choice) of a config value for the two dropdowns; the exact part is the default for non-mixed values."""
+    from shared.llm_engines.lmgp.layers.kv_formats import DEFAULT_EXACT
+    body, _, exact = normalize_deepy_kv_cache_quantization(value).partition(":")
+    return body, exact or DEFAULT_EXACT
+
+
+def join_deepy_kv_cache_quantization(body: Any, exact: Any) -> str:
+    body = str(body or "").strip().lower()
+    if body in ("", "int8", DEEPY_KV_CACHE_QUANTIZATION_AUTO):
+        return normalize_deepy_kv_cache_quantization(body)
+    return normalize_deepy_kv_cache_quantization(f"{body}:{str(exact or '').strip().lower()}")
+
+
+def deepy_kv_cache_quantization_is_mixed(value: Any) -> bool:
+    return normalize_deepy_kv_cache_quantization(value) not in ("", "int8", DEEPY_KV_CACHE_QUANTIZATION_AUTO)
+
+
+def describe_deepy_kv_cache_quantization(mode: str) -> str:
+    """Short label of a resolved mode: BF16, INT8, or the body formats of a mixed layout."""
+    if not mode:
+        return "BF16"
+    from shared.llm_engines.lmgp.layers.kv_formats import parse_layout
+    layout = parse_layout(mode)
+    names = {"q8": "INT8", "q6_0": "Q6", "q4_1": "Q4.1", "q4_0": "Q4"}
+    return names[layout.k.name] if layout.k == layout.v else f"{names[layout.k.name]}/{names[layout.v.name]}"
 
 
 @lru_cache(maxsize=1)
@@ -247,6 +338,19 @@ def get_gguf_kernels_version() -> str:
         return version("llamacpp-gguf-cuda")
     except PackageNotFoundError:
         return ""
+
+
+@lru_cache(maxsize=1)
+def deepy_lower_kv_cache_supported() -> bool:
+    """A KV cache below INT8 reads through Triton kernels, on NVIDIA GPUs with native BF16 conversions; elsewhere it would go through the dense paths."""
+    from importlib.util import find_spec
+
+    import torch
+
+    if find_spec("triton") is None or not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    from shared.kernels.dispatch import triton_dtype_supported
+    return triton_dtype_supported(0, torch.bfloat16)
 
 
 def resolve_deepy_kv_cache_quantization(value: Any) -> tuple[str, str]:
@@ -258,6 +362,9 @@ def resolve_deepy_kv_cache_quantization(value: Any) -> tuple[str, str]:
         supported = bool(installed_version) and Version(installed_version) >= Version(DEEPY_KV_CACHE_QUANTIZATION_MIN_GGUF_KERNELS_VERSION)
     except InvalidVersion:
         supported = False
+    if supported and deepy_lower_kv_cache_supported():
+        from shared.llm_engines.lmgp.layers.kv_formats import DEFAULT_EXACT
+        return f"q4:{DEFAULT_EXACT}", f"Q4 KV Cache quantization enabled automatically because GGUF kernels {installed_version} and the Triton kernels were found."
     if supported:
         return "int8", f"Fast KV Cache quantization enabled automatically because GGUF kernels {installed_version} were found."
     found = f" {installed_version}" if installed_version else ""
@@ -428,6 +535,48 @@ def normalize_deepy_read_everywhere(value: Any) -> bool:
     return bool(value)
 
 
+def normalize_deepy_python_sandbox(value: Any) -> str:
+    if isinstance(value, bool):
+        return "enabled" if value else "disabled"
+    return "disabled" if str(value or "").strip().lower() in {"disabled", "off", "false", "0", "no"} else "enabled"
+
+
+def normalize_python_apps(value: Any) -> dict[str, Any]:
+    group = dict(value) if isinstance(value, dict) else {}
+    level = str(group.get("development") or "off").strip().lower()
+    group["development"] = level if level in PYTHON_APPS_LEVELS else "off"
+    return group
+
+
+def python_apps_level() -> str:
+    """App Development (Advanced): "off", "apps" (web apps) or "plugins"; always "off" while the Python sandbox is disabled."""
+    if normalize_deepy_python_sandbox(get_deepy_config_value(DEEPY_PYTHON_SANDBOX_KEY, DEEPY_PYTHON_SANDBOX_DEFAULT)) != "enabled":
+        return "off"
+    return normalize_python_apps(get_deepy_config_value(PYTHON_APPS_KEY))["development"]
+
+
+def normalize_deepy_web_search(value: Any) -> str:
+    if isinstance(value, bool):
+        return "enabled" if value else "disabled"
+    return "enabled" if str(value or "").strip().lower() in {"enabled", "on", "true", "1", "yes"} else "disabled"
+
+
+def normalize_deepy_advanced_transcription(value: Any) -> str:
+    value = str(value or "").strip()
+    return value if value in {choice for _label, choice in DEEPY_ADVANCED_TRANSCRIPTION_CHOICES} else DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT
+
+
+def advanced_transcription_model() -> str:
+    """The model type of Prime's advanced transcription, or "" while the user has not enabled it."""
+    model_type = normalize_deepy_advanced_transcription(get_deepy_config_value(DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT))
+    return "" if model_type == DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT else model_type
+
+
+def advanced_transcription_terms() -> str:
+    """The user's names and jargon for every advanced transcription, comma- or line-separated."""
+    return str(get_deepy_config_value(DEEPY_TRANSCRIPTION_TERMS_KEY, "") or "").strip()
+
+
 def normalize_deepy_mcp_auto_discover_paths(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "on", "yes"}
@@ -476,9 +625,14 @@ def estimate_deepy_kv_cache_mb(enhancer_enabled: Any, context_tokens: Any, kv_ca
     tokens = normalize_deepy_context_tokens(context_tokens)
     block_size = max(1, int(spec.get("kvcache_block_size", 256) or 256))
     num_blocks = (tokens + block_size - 1) // block_size
-    head_dim = int(spec["head_dim"])
-    vector_bytes = head_dim + 2 if resolve_deepy_kv_cache_quantization(kv_cache_quantization)[0] == "int8" else head_dim * int(spec["dtype_bytes"])
-    total_bytes = 2 * int(spec["num_kv_cache_layers"]) * num_blocks * block_size * int(spec["num_key_value_heads"]) * vector_bytes
+    layers, heads, head_dim = int(spec["num_kv_cache_layers"]), int(spec["num_key_value_heads"]), int(spec["head_dim"])
+    mode = resolve_deepy_kv_cache_quantization(kv_cache_quantization)[0]
+    if mode:
+        from shared.llm_engines.lmgp.layers.kv_formats import parse_layout
+        layout = parse_layout(mode)
+        total_bytes = num_blocks * block_size * layout.body_bytes_per_token(layers, heads, head_dim) + layout.overlay_bytes(layers, heads, head_dim, block_size, 1)
+    else:
+        total_bytes = 2 * layers * num_blocks * block_size * heads * head_dim * int(spec["dtype_bytes"])
     return _DEEPY_QWEN_VARIANT_LABELS.get(enhancer_no, "Qwen3.5"), int(round(total_bytes / (1024 * 1024)))
 
 
@@ -489,7 +643,7 @@ def format_deepy_context_tokens_label(enhancer_enabled: Any, context_tokens: Any
     if variant_label is None or cache_mb is None:
         return "Context Window Tokens (KV cache: N/A)"
     auto_label = " Auto" if requested_quantization == DEEPY_KV_CACHE_QUANTIZATION_AUTO else ""
-    return f"Context Window Tokens (KV cache ~{cache_mb} MB {quantization.upper() if quantization else 'BF16'}{auto_label} on {variant_label})"
+    return f"Context Window Tokens (KV cache ~{cache_mb} MB {describe_deepy_kv_cache_quantization(quantization)}{auto_label} on {variant_label})"
 
 
 def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -507,6 +661,9 @@ def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict
     runtime_config[DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY] = normalize_deepy_tool_gen_video_with_refs(runtime_config.get(DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY, DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS))
     runtime_config[DEEPY_TOOL_GEN_SPEECH_FROM_DESCRIPTION_KEY] = normalize_deepy_tool_gen_speech_from_description(runtime_config.get(DEEPY_TOOL_GEN_SPEECH_FROM_DESCRIPTION_KEY, DEEPY_DEFAULT_GEN_SPEECH_FROM_DESCRIPTION))
     runtime_config[DEEPY_TOOL_GEN_SPEECH_FROM_SAMPLE_KEY] = normalize_deepy_tool_gen_speech_from_sample(runtime_config.get(DEEPY_TOOL_GEN_SPEECH_FROM_SAMPLE_KEY, DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE))
+    runtime_config[DEEPY_TOOL_GEN_WORLD_KEY] = normalize_deepy_tool_gen_world(runtime_config.get(DEEPY_TOOL_GEN_WORLD_KEY, DEEPY_DEFAULT_GEN_WORLD))
+    runtime_config[DEEPY_TOOL_GEN_3D_KEY] = normalize_deepy_tool_gen_3d(runtime_config.get(DEEPY_TOOL_GEN_3D_KEY, DEEPY_DEFAULT_GEN_3D))
+    runtime_config[DEEPY_TOOL_TEXTURE_3D_KEY] = normalize_deepy_tool_texture_3d(runtime_config.get(DEEPY_TOOL_TEXTURE_3D_KEY, DEEPY_DEFAULT_TEXTURE_3D))
     runtime_config[DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY] = normalize_deepy_auto_cancel_queue_tasks(runtime_config.get(DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT))
     runtime_config[DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY] = normalize_deepy_separate_requests_with_empty_line(runtime_config.get(DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY, DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT))
     runtime_config[DEEPY_SESSION_RESET_MODE_KEY] = normalize_deepy_session_reset_mode(runtime_config.get(DEEPY_SESSION_RESET_MODE_KEY, DEEPY_SESSION_RESET_MODE_DEFAULT))
@@ -518,6 +675,7 @@ def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict
     if qwen_local:
         runtime_config[DEEPY_REPETITION_PENALTY_KEY] = normalize_deepy_repetition_penalty(runtime_config.get(DEEPY_REPETITION_PENALTY_KEY, DEEPY_REPETITION_PENALTY_DEFAULT))
         runtime_config[DEEPY_KV_CACHE_QUANTIZATION_KEY] = normalize_deepy_kv_cache_quantization(runtime_config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))
+        runtime_config[DEEPY_KEPT_KV_CACHES_KEY] = normalize_deepy_kept_kv_caches(runtime_config.get(DEEPY_KEPT_KV_CACHES_KEY, DEEPY_KEPT_KV_CACHES_DEFAULT))
     if runtime_config[DEEPY_ENABLED_KEY] and (qwen_local or remote):
         runtime_config[DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_custom_system_prompt(runtime_config.get(DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, ""))
         runtime_config[DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_prime_guidance(runtime_config.get(DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_GUIDANCE_DEFAULT))
@@ -550,11 +708,15 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY: DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS,
         DEEPY_TOOL_GEN_SPEECH_FROM_DESCRIPTION_KEY: DEEPY_DEFAULT_GEN_SPEECH_FROM_DESCRIPTION,
         DEEPY_TOOL_GEN_SPEECH_FROM_SAMPLE_KEY: DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE,
+        DEEPY_TOOL_GEN_WORLD_KEY: DEEPY_DEFAULT_GEN_WORLD,
+        DEEPY_TOOL_GEN_3D_KEY: DEEPY_DEFAULT_GEN_3D,
+        DEEPY_TOOL_TEXTURE_3D_KEY: DEEPY_DEFAULT_TEXTURE_3D,
         DEEPY_CONTEXT_TOKENS_KEY: DEEPY_CONTEXT_TOKENS_DEFAULT,
         DEEPY_KV_CACHE_QUANTIZATION_KEY: DEEPY_KV_CACHE_QUANTIZATION_DEFAULT,
         DEEPY_COMPACTION_TYPE_KEY: DEEPY_COMPACTION_TYPE_DEFAULT,
         DEEPY_COMPACTION_THINKING_KEY: DEEPY_COMPACTION_THINKING_DEFAULT,
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
+        DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_MODEL_SPEED_KEY: "fast",
@@ -564,6 +726,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_ALLOW_READ_FILE_SYSTEM_KEY: DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT,
         DEEPY_FILE_SYSTEM_PATHS_KEY: list(DEEPY_FILE_SYSTEM_PATHS_DEFAULT),
         DEEPY_READ_EVERYWHERE_KEY: DEEPY_READ_EVERYWHERE_DEFAULT,
+        DEEPY_PYTHON_SANDBOX_KEY: DEEPY_PYTHON_SANDBOX_DEFAULT,
         DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY: DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT,
         DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY: DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT,
         DEEPY_SESSION_RESET_MODE_KEY: DEEPY_SESSION_RESET_MODE_DEFAULT,
@@ -606,6 +769,76 @@ def get_deepy_runtime_config() -> dict[str, Any]:
 
 def get_deepy_config_value(key: str, default: Any = None) -> Any:
     return get_deepy_runtime_config().get(key, default)
+
+
+def configured_secret(config: dict[str, Any], name: str) -> str:
+    """The secret (SECRET_CONFIG_KEYS name) a configuration holds: plaintext, or read from the OS credential manager through its credential id (raises SecureStorageError when that store is unavailable)."""
+    value_key, _secure_key, id_key = SECRET_CONFIG_KEYS[name]
+    plaintext = str(config.get(value_key, "") or "").strip()
+    credential_id = str(config.get(id_key, "") or "").strip()
+    if plaintext or not credential_id:
+        return plaintext
+    from shared.utils.credentials import load_secret
+
+    return load_secret(credential_id).strip()
+
+
+def prepare_secret_update(config: dict[str, Any], name: str, value: Any, secure: Any) -> dict[str, Any]:
+    """Configuration keys for a saved secret: in the OS credential manager when secure (plaintext blanked), else in wgp_config.json; a cleared value or a move to plaintext removes the stored credential."""
+    from uuid import uuid4
+
+    from shared.utils.credentials import availability_error, delete_secret, save_secret
+
+    value_key, secure_key, id_key = SECRET_CONFIG_KEYS[name]
+    value, secure = str(value or "").strip(), bool(secure)
+    credential_id = str(config.get(id_key, "") or "").strip()
+    if secure and value:
+        credential_id = credential_id or uuid4().hex
+        save_secret(credential_id, value)
+    elif credential_id:
+        if not availability_error():
+            delete_secret(credential_id)
+        credential_id = ""
+    return {value_key: "" if secure else value, secure_key: secure, id_key: credential_id}
+
+
+def configured_civitai_api_key(config: dict[str, Any]) -> str:
+    return configured_secret(config, "civitai")
+
+
+def prepare_civitai_api_key_update(config: dict[str, Any], key: Any, secure: Any) -> dict[str, Any]:
+    return prepare_secret_update(config, "civitai", key, secure)
+
+
+_SECRET_WARNED: set[str] = set()
+
+
+def _runtime_secret(name: str, label: str) -> str:
+    try:
+        return configured_secret(get_deepy_runtime_config(), name)
+    except Exception as error:  # SecureStorageError: the secret stays unusable until the credential service is back
+        if name not in _SECRET_WARNED:
+            _SECRET_WARNED.add(name)
+            from tqdm import tqdm
+            tqdm.write(f"[Deepy] The {label} could not be read: {error}")
+        return ""
+
+
+def get_civitai_api_key() -> str:
+    """The Civitai API key for runtime use: CIVITAI_API_KEY in the environment, else the configured one ('' with one console warning when the credential store is unavailable)."""
+    return os.environ.get("CIVITAI_API_KEY", "").strip() or _runtime_secret("civitai", "Civitai API key")
+
+
+def get_huggingface_token() -> str:
+    """The Hugging Face token for Deepy's LoRA hub: HF_TOKEN in the environment, else the configured one, else the login cached by the Hugging Face CLI; '' when none (public repositories need none)."""
+    token = os.environ.get("HF_TOKEN", "").strip() or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip() or _runtime_secret("huggingface", "Hugging Face token")
+    if token:
+        return token
+    try:
+        from huggingface_hub import get_token
+        return (get_token() or "").strip()
+    except Exception:
+        return ""
 
 
 def deepy_requirement_met(server_config: dict[str, Any] | None) -> bool:

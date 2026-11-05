@@ -21,7 +21,6 @@ PROMPT_ENHANCER_CHOICES = [
     ("Qwen3.5VL Abliterated 4B (recommended, captioning + uncensored text enhancement, vllm accelerated if available)", 3),
     ("Qwen3.5VL Abliterated 9B (captioning + uncensored high end text enhancement, vllm accelerated if available)", 4),
     ("Qwen3.8VL Uncensored 27B by Jonathan Coletti (highest quality, choose GGUF Q2, Q3 or Q4 below)", 5),
-    ("Qwen3.8VL Uncensored 9B (distilled from Qwen3.8, Deepy Prime in about 6.5 GB VRAM, choose GGUF Q4 or Q8 below)", 6),
 ]
 
 SEEDVC_DEFAULT_MODE = 2
@@ -317,6 +316,8 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
 
     changed = _migrate_audio_processors_config(server_config, version) or changed
     changed = _migrate_temporal_upsamplers_config(server_config) or changed
+    from postprocessing.memory import migrate_config as migrate_postprocessor_memory
+    changed = migrate_postprocessor_memory(server_config) or changed
 
     if server_config.pop(LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY, None) is not None:
         changed = True

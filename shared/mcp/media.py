@@ -84,8 +84,11 @@ def view_images(records, *, times_s=None, frame_nos=None, range_s=None, count=8,
             selections += [(record, frame, time) for frame, time in video_frames(record["path"], times_s=times_s, frame_nos=frame_nos, range_s=range_s, count=count)]
         elif record["media_type"] == "image":
             selections.append((record, None, None))
+        elif record["media_type"] == "world":  # its last frame, where an exploration starts
+            from shared.utils.world_outputs import poster_image
+            selections.append(({**record, "path": poster_image(record["path"])}, None, None))
         else:
-            raise ValueError(f"view_media shows images and videos; {record['media_id']} is {record['media_type']}. Render 3D assets with render_3d_views first.")
+            raise ValueError(f"view_media shows images, videos and worlds; {record['media_id']} is {record['media_type']}. Render 3D assets with render_3d_views first.")
     if len(selections) > VIEW_MAX_IMAGES:
         raise ValueError(f"view_media returns at most {VIEW_MAX_IMAGES} images; this request selects {len(selections)}. Choose fewer media, times or frames.")
     edge = min(max_edge, math.isqrt(VIEW_MAX_PIXELS // len(selections)))  # the total stays within the pixel budget

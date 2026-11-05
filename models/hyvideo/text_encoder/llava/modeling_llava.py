@@ -467,7 +467,8 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
         cache_position = torch.arange(attention_mask.shape[1], device=attention_mask.device)
 
 
-        outputs = self.language_model(
+        # WanGP encodes with it: the hidden states of the language model, without the logits of its output head (kept off the GPU)
+        outputs = self.language_model.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -477,10 +478,9 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
         )
 
-        logits = outputs[0]
+        logits = None
 
         loss = None
 

@@ -217,6 +217,7 @@ def load_pipeline(model_filename, text_encoder_filename, model_def, model_type, 
     offload.load_model_data(transformer, model_filename, writable_tensors=False, default_dtype=torch.bfloat16)
     offload.load_model_data(encoder, text_encoder_filename, writable_tensors=False, default_dtype=torch.bfloat16,
                            fused_split_map=encoder.split_linear_modules_map)
+    runtime.lookup_on_cpu(encoder.language_model.embed_tokens)  # the 0.7 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     offload.load_model_data(vae, fl.locate_file("fibo2/flux2_vae_fp16.safetensors"), writable_tensors=False, default_dtype=None)
     for module in (transformer, encoder, vae):
         module.eval().requires_grad_(False)

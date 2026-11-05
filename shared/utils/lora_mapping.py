@@ -103,6 +103,8 @@ def convert_lora_keys(state_dict, module_names, target="wangp", fused_split_map=
     suffixes += tuple("." + suffix for suffix in _DECOMPOSED_LOKR)
     for key, value in state_dict.items():
         normalized = key.replace(".lora.", ".lora_").replace(".default.weight", ".weight")
+        if normalized.endswith((".lora_A", ".lora_B")):
+            normalized += ".weight"
         suffix = next((suffix for suffix in suffixes if normalized.endswith(suffix)), None)
         if suffix is None:
             result[key] = value

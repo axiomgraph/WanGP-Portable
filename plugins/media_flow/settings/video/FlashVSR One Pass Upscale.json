@@ -6,5 +6,11 @@
   "target_ratio": "flashvsr*2",
   "chunk_size_seconds": 3.0,
   "sliding_window_overlap": 0,
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "use_configured_model": true,
+    "task": "upscale",
+    "summary": "FlashVSR learned detail recovery with modest VRAM use.",
+    "recommended": true
+  }
 }

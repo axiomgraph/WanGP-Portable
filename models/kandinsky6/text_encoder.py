@@ -4,7 +4,7 @@
 import os
 
 import torch
-from mmgp import offload
+from mmgp import offload, runtime
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, Qwen2_5_VLForConditionalGeneration
 
 from shared.utils.phase_progress import text_encoding_progress
@@ -34,6 +34,7 @@ class Kandinsky6TextEncoder:
                                                     defaultConfigPath=os.path.join(qwen_folder, "config.json"), default_dtype=torch.bfloat16)
         # Only the language model conditions Kandinsky 6: the vision tower and the LM head are never loaded to the GPU.
         self.model = qwen.model.language_model.eval()
+        runtime.lookup_on_cpu(self.model.embed_tokens)  # the 1 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
         self.tokenizer = AutoTokenizer.from_pretrained(qwen_folder)
         self.clip = offload.fast_load_transformers_model(os.path.join(clip_folder, "model.safetensors"), writable_tensors=False, modelClass=CLIPTextModel,
                                                          ignore_unused_weights=True, forcedConfigPath=os.path.join(clip_folder, "text_config.json"),

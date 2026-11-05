@@ -79,8 +79,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.use_triton_rmsnorm = _USE_TRITON_RMSNORM
-        self.use_bf16_bits = False  # set by models for BF16 on GPUs that run Triton without BF16 conversions (shared.kernels.bf16_bits)
+        self.use_triton_rmsnorm = _USE_TRITON_RMSNORM  # the LM features' Triton switch; each call then picks the kernel its GPU and dtype run
         self._small_batch_num_warps = 4
 
     def _can_use_triton(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> bool:
@@ -98,6 +97,11 @@ class RMSNorm(nn.Module):
             if residual.device != x.device or residual.dtype != x.dtype or residual.stride(-1) != 1:
                 return False
         return int(x.shape[-1]) <= 8192
+
+    def _can_use_bits(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> bool:
+        """BF16 on a GPU whose Triton has no BF16 conversions (Turing): the kernel reading BF16 as bits (shared.kernels.bf16_bits)."""
+        return (self.use_triton_rmsnorm and triton is not None and bf16_bits.applies(x) and x.stride(-1) == 1 and int(x.shape[-1]) <= 8192
+                and self.weight.is_cuda and (residual is None or residual.dtype == x.dtype and residual.stride(-1) == 1))
 
     def _fallback_rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -177,7 +181,7 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.use_bf16_bits and x.dtype == torch.bfloat16 and x.stride(-1) == 1:
+        if self._can_use_bits(x, residual):
             return bf16_bits.rms_norm(x, residual, self.weight, self.eps)
         if residual is None:
             if self._can_use_triton(x):

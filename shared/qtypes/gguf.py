@@ -188,9 +188,10 @@ def _validate_gguf_cuda_module(module):
     raw_weight = torch.from_numpy(quantized_weight).contiguous().cuda()
     input_tensor = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device="cuda").reshape(2, 32)
     fast_out = module.linear(raw_weight, "Q4_0", [1, 32], input_tensor, None, torch.float32)
-    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(device=input_tensor.device, dtype=torch.float32)
-    ref_out = torch.nn.functional.linear(input_tensor, dense_weight, None)
-    torch.cuda.synchronize()
+    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(dtype=torch.float32)
+    # On the CPU: on the GPU, cuBLAS would keep a workspace for this thread and stream.
+    ref_out = torch.nn.functional.linear(input_tensor.cpu(), dense_weight, None)
+    fast_out = fast_out.cpu()
     if fast_out.shape != ref_out.shape:
         raise RuntimeError(f"Q4 self-test shape mismatch: {tuple(fast_out.shape)} vs {tuple(ref_out.shape)}")
     if not torch.allclose(fast_out, ref_out, atol=2e-2, rtol=2e-2):
@@ -861,11 +862,25 @@ _cuda_graphs.register_key(lambda: GGUF_CUDA_CHUNKING)
 _ROW_LOOP_TUNER = LaunchTuner("gguf_row_loop", 1, "GGUF")
 
 
+def _typed_mmq(module, target_dtype):
+    """Whether the package's MMQ writes target_dtype itself (GGUF 1.0.28+: BF16, no FP32 product nor conversion pass)."""
+    typed = getattr(module, "_wangp_typed_mmq", None)
+    if typed is None:
+        typed = module._wangp_typed_mmq = callable(getattr(module, "has_typed_mmq", None)) and bool(module.has_typed_mmq())
+    return typed and target_dtype == torch.bfloat16
+
+
+def _mmq_product_bytes(module, target_dtype):
+    return 2 if _typed_mmq(module, target_dtype) else 4
+
+
 def _sliced_cuda_linear(module, raw, qtype_name, shape, x, bias, target_dtype, step):
-    # Legacy MMQ needs a Q8 input copy and an FP32 product: bound that scratch with 128-row-aligned slices.
+    # Legacy MMQ needs a Q8 input copy and a product the size of the output (FP32, or the output type when the kernels write it):
+    # bound that scratch with 128-row-aligned slices.
+    product_dtype = target_dtype if _typed_mmq(module, target_dtype) else torch.float32
     out = torch.empty((x.shape[0], shape[0]), dtype=target_dtype, device=x.device)
     for start in range(0, x.shape[0], step):
-        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, torch.float32))
+        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, product_dtype))
     if bias is not None:
         out.add_(bias.to(out.device, out.dtype))
     return out
@@ -905,12 +920,13 @@ def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, ta
     input_tensor = input_tensor.contiguous()
     out_features, in_features = shape
     rows = input_tensor.numel() // in_features
-    step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
+    product_bytes = _mmq_product_bytes(module, target_dtype)
+    step = max(128, _LLAMACPP_SLICE_BYTES // (product_bytes * out_features + in_features * 9 // 8) // 128 * 128)
     if rows < 2 * step or module._linear_mode() != "mmq":
         return module.linear(raw, qtype_name, shape, input_tensor, bias, target_dtype)
     step = -(-rows // (-(-rows // step) * 128)) * 128  # slices of even size
     # The row loop's Q8 ring stays one 2 MiB allocator page below a slice (here at least 32 MiB): its peak is never above the slices'.
-    scratch = step * (4 * out_features + in_features * 9 // 8) - (2 << 20)
+    scratch = step * (product_bytes * out_features + in_features * 9 // 8) - (2 << 20)
     x = input_tensor.reshape(rows, in_features)
     if _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, step, scratch):
         out = module.linear_chunked(raw, qtype_name, shape, x, bias, target_dtype, scratch)

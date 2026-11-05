@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from shared import attention_kit
 from shared.attention import pay_attention
 from shared.kernels import ops as kernels
 from .modules import model as wan_model  # partially initialized here when model.py imports this module: used at call time only
@@ -9,6 +10,22 @@ from .modules.posemb_layers import apply_rotary_emb, apply_rotary_emb_single
 
 
 _attention_backends = {}
+
+
+# The KV cache of the driving-video branch (animate2_kv_cache): the branch is modulated at a fixed timestep and never attends the
+# generation, so each block's reference input and keys / values are the same at every step. Kept on the GPU as the exact hidden states
+# (K/V recomputed each step), or as INT8 K/V (attention_kit q8 prefix, no recomputation) on the GPU or in RAM.
+def store_kv(ref_kv_list, device):
+    """A block's reference keys / values (not consumed) as an attention_kit q8 prefix on device."""
+    prefix = attention_kit.cache_prefix(list(ref_kv_list), native=False)
+    return attention_kit.KVPrefix(*(None if tensor is None else tensor.to(device) for tensor in prefix))
+
+
+def load_cached(entry, device, dtype):
+    """A cached entry back on device: the reference input in dtype, or a q8 K/V prefix (attention_kit.KVPrefix)."""
+    if isinstance(entry, attention_kit.KVPrefix):
+        return attention_kit.KVPrefix(*(None if tensor is None else tensor.to(device) for tensor in entry))
+    return entry.to(device=device, dtype=dtype)
 
 
 def _attention_with_lse(q, k, v):
@@ -153,13 +170,19 @@ def _animate2_generation_blocks(block, ref_kv_list, ref_grid_sizes, generation):
 
 def animate2_attention_block(block, ref_x_list, ref_e, ref_context, ref_grid_sizes, ref_freqs, generation):
     ref_x, ref_kv_list = animate2_reference_block(block, ref_x_list, ref_e, ref_context, ref_grid_sizes, ref_freqs)
+    if generation.get("store_kv") is not None:  # the INT8 K/V cache
+        generation["store_kv"](ref_kv_list)
     outputs = _animate2_generation_blocks(block, ref_kv_list, ref_grid_sizes, generation)
     return ref_x, outputs
 
 
 def animate2_cached_attention_block(block, ref_x_list, ref_e, ref_grid_sizes, ref_freqs, generation):
+    """ref_x_list: the block's cached reference input, or its cached q8 keys / values."""
     ref_x = ref_x_list[0]
     ref_x_list.clear()
-    ref_kv_list = _reference_kv(block, ref_x, ref_e, ref_freqs)
+    if isinstance(ref_x, attention_kit.KVPrefix):
+        ref_kv_list = list(attention_kit.dequantize_prefix(ref_x, block.self_attn.q.weight.dtype))
+    else:
+        ref_kv_list = _reference_kv(block, ref_x, ref_e, ref_freqs)
     ref_x = None
     return _animate2_generation_blocks(block, ref_kv_list, ref_grid_sizes, generation)

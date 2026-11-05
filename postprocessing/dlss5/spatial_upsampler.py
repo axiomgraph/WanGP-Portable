@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from postprocessing import spatial_upsamplers as api
-from .runtime import DEPTH_RESOLUTION_DIVISORS, MOTION_VECTOR_METHODS, NR_MODES, configure_depth_estimator, neural_render, release_flow_model, unavailable_reason
+from .runtime import DEPTH_RESOLUTION_DIVISORS, MOTION_VECTOR_METHODS, NR_MODES, USE_DEPTH_GUIDE, configure_depth_estimator, neural_render, release_flow_model, unavailable_reason
 
 
 class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
@@ -31,6 +31,27 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
 
     def config(self):
         return api.read_config_section(self.server_config, self)
+
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import depth_checkpoint_inventory, query_preprocessor_download_def
+
+        if USE_DEPTH_GUIDE:
+            for entry in depth_checkpoint_inventory():
+                yield {"name": "DLSS 5", "variant": f"{entry['name']} {entry['variant']}", "download_defs": entry["download_defs"]}
+        yield {"name": "DLSS 5", "variant": "RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}
+
+    def query_download_defs(self, enabled_only=True):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        definitions = [query_preprocessor_download_def("depth", self.server_config)] if USE_DEPTH_GUIDE else []
+        if self.config()["motion_vector"] == "raft":
+            definitions.append(query_preprocessor_download_def("flow", self.server_config))
+        return definitions
+
+    def download(self, process_files, *, send_cmd=None, status_text=None, gen=None, **_kwargs):
+        from shared.utils.download import process_files_def_if_needed
+
+        return process_files_def_if_needed(self.query_download_defs(), send_cmd=send_cmd, status_text=status_text or "Downloading DLSS 5 Model Files", gen=gen, process_files=process_files)
 
     @property
     def status(self):
@@ -65,7 +86,7 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
             "postprocessing_category": api.POSTPROCESSING_CATEGORY_UPSAMPLER,
             "description": "DLSS 5 Neural Rendering. At x1 it refines at native resolution; higher modes refine and upscale. Requires Windows and a compatible NVIDIA RTX GPU. WSL can use the Windows worker through Windows interoperability; this is not native Linux Neural Rendering.",
             "method_parameters": {cls.METHOD: [
-                {"name": "spatial_upsampler_dlss_strength", "setting": "intensity", "type": "number", "component": "slider", "ui": (api.PARAMETER_UI_POSTPROCESSING, api.PARAMETER_UI_LATE_POSTPROCESSING, api.PARAMETER_UI_MEDIA_FLOW), "required": False, "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "label": "DLSS 5 NR Intensity", "description": "Controls the native Neural Rendering intensity. 1 is the native default; values up to 2 strengthen the effect."},
+                {"name": "dlss_strength", "setting": "intensity", "type": "number", "component": "slider", "ui": (api.PARAMETER_UI_POSTPROCESSING, api.PARAMETER_UI_LATE_POSTPROCESSING, api.PARAMETER_UI_MEDIA_FLOW), "required": False, "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "label": "DLSS 5 NR Intensity", "description": "Controls the native Neural Rendering intensity. 1 is the native default; values up to 2 strengthen the effect."},
             ]},
         }
 

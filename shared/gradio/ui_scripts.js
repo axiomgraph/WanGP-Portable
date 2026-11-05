@@ -87,7 +87,7 @@
             // Keep keyboard focus order aligned with the displayed actions.
             if (reset.nextElementSibling !== exportButton) exportButton.before(reset);
             row.classList.toggle('is-compact', row.clientWidth < 580);
-            for (const button of row.querySelectorAll('.wangp-settings-default, .wangp-settings-export')) {
+            for (const button of row.querySelectorAll('.wangp-settings-default, .wangp-reset-settings, .wangp-settings-export')) {
                 if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', button.textContent.trim());
             }
         }

@@ -68,6 +68,12 @@ _TOOL_ALIASES = {
     "gen_speech_from_sample": "gen_speech_from_sample",
     "speech_from_sample": "gen_speech_from_sample",
     "voice_clone": "gen_speech_from_sample",
+    "gen_world": "gen_world",
+    "world": "gen_world",
+    "gen_3d": "gen_3d",
+    "3d": "gen_3d",
+    "texture_3d": "texture_3d",
+    "texture": "texture_3d",
 }
 
 
@@ -473,13 +479,7 @@ class DeepyCliSession(GenerationRuntime):
             f"Video frames: {settings['num_frames']}",
             f"Audio duration: {settings['audio_duration']} seconds",
             f"Seed: {settings['seed']}",
-            f"gen_image template: {self._format_template_value(settings['image_generator_variant'])}",
-            f"edit_image template: {self._format_template_value(settings['image_editor_variant'])}",
-            f"gen_video template: {self._format_template_value(settings['video_generator_variant'])}",
-            f"gen_video_with_speech template: {self._format_template_value(settings['video_with_speech_variant'])}",
-            f"gen_song template: {self._format_template_value(settings['song_variant'])}",
-            f"gen_speech_from_description template: {self._format_template_value(settings['speech_from_description_variant'])}",
-            f"gen_speech_from_sample template: {self._format_template_value(settings['speech_from_sample_variant'])}",
+            *(f"{tool} template: {self._format_template_value(settings[key])}" for tool, key in deepy_ui_settings.TEMPLATE_TOOL_UI_KEY.items()),
         ]
 
     def _print_tool_settings(self) -> None:
@@ -745,30 +745,11 @@ class DeepyCliSession(GenerationRuntime):
             tool_name, _, tool_value = argument.partition(" ")
             resolved_tool = self._resolve_tool_name(tool_name)
             if resolved_tool is None or len(tool_value.strip()) == 0:
-                self._print("Use /template <gen_image|edit_image|gen_video|gen_video_with_speech|gen_song|gen_speech_from_description|gen_speech_from_sample> <variant>.")
+                self._print(f"Use /template <{'|'.join(deepy_tool_settings.GENERATION_TOOL_IDS)}> <variant>.")
                 return True
             try:
-                if resolved_tool == "gen_image":
-                    settings = self._update_tool_ui_settings(image_generator_variant=tool_value.strip())
-                    value = settings["image_generator_variant"]
-                elif resolved_tool == "edit_image":
-                    settings = self._update_tool_ui_settings(image_editor_variant=tool_value.strip())
-                    value = settings["image_editor_variant"]
-                elif resolved_tool == "gen_video":
-                    settings = self._update_tool_ui_settings(video_generator_variant=tool_value.strip())
-                    value = settings["video_generator_variant"]
-                elif resolved_tool == "gen_video_with_speech":
-                    settings = self._update_tool_ui_settings(video_with_speech_variant=tool_value.strip())
-                    value = settings["video_with_speech_variant"]
-                elif resolved_tool == "gen_song":
-                    settings = self._update_tool_ui_settings(song_variant=tool_value.strip())
-                    value = settings["song_variant"]
-                elif resolved_tool == "gen_speech_from_description":
-                    settings = self._update_tool_ui_settings(speech_from_description_variant=tool_value.strip())
-                    value = settings["speech_from_description_variant"]
-                else:
-                    settings = self._update_tool_ui_settings(speech_from_sample_variant=tool_value.strip())
-                    value = settings["speech_from_sample_variant"]
+                key = deepy_ui_settings.TEMPLATE_TOOL_UI_KEY[resolved_tool]
+                value = self._update_tool_ui_settings(**{key: tool_value.strip()})[key]
             except Exception as exc:
                 self._print(f"[ERROR] {exc}")
             else:
@@ -776,21 +757,14 @@ class DeepyCliSession(GenerationRuntime):
             return True
         if command == "/templates":
             if len(argument) == 0:
-                for tool_name in (
-                    "gen_image",
-                    "edit_image",
-                    "gen_video",
-                    "gen_video_with_speech",
-                    "gen_speech_from_description",
-                    "gen_speech_from_sample",
-                ):
+                for tool_name in deepy_tool_settings.GENERATION_TOOL_IDS:
                     variants = deepy_tool_settings.list_tool_variants(tool_name)
                     suffix = ", ".join(variants) if variants else "(none)"
                     self._print(f"{tool_name}: {suffix}")
                 return True
             resolved_tool = self._resolve_tool_name(argument)
             if resolved_tool is None:
-                self._print("Use /templates [gen_image|edit_image|gen_video|gen_video_with_speech|gen_song|gen_speech_from_description|gen_speech_from_sample].")
+                self._print(f"Use /templates [{'|'.join(deepy_tool_settings.GENERATION_TOOL_IDS)}].")
                 return True
             variants = deepy_tool_settings.list_tool_variants(resolved_tool)
             self._print(f"{resolved_tool}: {', '.join(variants) if variants else '(none)'}")

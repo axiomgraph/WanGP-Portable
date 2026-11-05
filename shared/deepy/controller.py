@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import traceback
@@ -14,7 +15,11 @@ from typing import Any, Callable
 import gradio as gr
 from shared.utils.config_store import config_lock, write_config
 
+from shared.deepy.onboarding import deepy_performance_warning
 from shared.deepy.config import (
+    DEEPY_KEPT_KV_CACHES_DEFAULT,
+    DEEPY_KEPT_KV_CACHES_KEY,
+    normalize_deepy_kept_kv_caches,
     DEEPY_CONTEXT_TOKENS_DEFAULT,
     DEEPY_CONTEXT_TOKENS_KEY,
     DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY,
@@ -135,11 +140,14 @@ class DeepyController:
     def __init__(self, deps: DeepyDeps):
         self._deps = deps
         self._active_assistant_session: Any | None = None
+        self._kept_contexts: dict[str, dict[str, Any]] = {}  # the KV caches (copies in RAM) of the conversations set aside: one per owner, oldest first
         self._queue_state_lock = threading.RLock()
         self._session_mode = normalize_deepy_session_mode(self._server_config().get(DEEPY_MULTI_SESSION_KEY, DEEPY_MULTI_SESSION_DEFAULT))
         self._multi_session_enabled = normalize_deepy_multi_session(self._session_mode)
         self.workspace_host = None
         self._multi_session_latched = False
+        # Called with (submission_id, phase, info) when a submitted request starts, finishes or is cancelled.
+        self.request_listener = None
 
     def get_verbose_level(self) -> int:
         try:
@@ -369,8 +377,8 @@ class DeepyController:
     def get_deepy_type(self) -> str:
         return normalize_deepy_type(self._server_config().get(DEEPY_TYPE_KEY, ""))
 
-    def _ensure_vision_loaded(self, override_profile=-1):
-        self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile)
+    def _ensure_vision_loaded(self, override_profile=-1, **loading_kwargs):
+        self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile, **loading_kwargs)
         image_caption_model = self._deps.get_image_caption_model()
         image_caption_processor = self._deps.get_image_caption_processor()
         if image_caption_model is None or image_caption_processor is None:
@@ -488,7 +496,8 @@ class DeepyController:
                 force_release_on_acquire=True,
             )
 
-    def update_tool_ui_settings(self, state, *, auto_cancel_queue_tasks=None, separate_requests_with_empty_line=None, use_template_properties=None, model_speed=None, model_size=None, width=None, height=None, num_frames=None, audio_duration=None, seed=None, video_with_speech_variant=None, image_generator_variant=None, image_editor_variant=None, video_generator_variant=None, song_variant=None, with_refs_variant=None, speech_from_description_variant=None, speech_from_sample_variant=None, persist=False):
+    def update_tool_ui_settings(self, state, *, auto_cancel_queue_tasks=None, separate_requests_with_empty_line=None, use_template_properties=None, model_speed=None, model_size=None, width=None, height=None, num_frames=None, audio_duration=None, seed=None, persist=False, **variants):
+        """variants: the template of each task, given as its ui_key (ui_settings.TEMPLATE_TOOL_UI_KEY)."""
         session = get_or_create_assistant_session(state)
         normalized = set_assistant_tool_ui_settings(
             session,
@@ -502,14 +511,7 @@ class DeepyController:
             num_frames=num_frames,
             audio_duration=audio_duration,
             seed=seed,
-            video_with_speech_variant=video_with_speech_variant,
-            image_generator_variant=image_generator_variant,
-            image_editor_variant=image_editor_variant,
-            video_generator_variant=video_generator_variant,
-            song_variant=song_variant,
-            with_refs_variant=with_refs_variant,
-            speech_from_description_variant=speech_from_description_variant,
-            speech_from_sample_variant=speech_from_sample_variant,
+            **variants,
         )
         if persist:
             self._persist_tool_ui_settings(normalized)
@@ -545,7 +547,8 @@ class DeepyController:
 
     def _prepare_session_request_locked(self, session, ask_request: str) -> None:
         self._multi_session_latched = True
-        if not self._multi_session_enabled:
+        # A plugin session keeps its own folder even when saved sessions are disabled.
+        if not self._multi_session_enabled and not session.storage_session_id:
             session.safe_checkpoint_callback = None
             return
         default_gallery_mode = normalize_deepy_session_gallery_media_mode(self._server_config().get(DEEPY_SESSION_GALLERY_MEDIA_MODE_KEY, DEEPY_SESSION_GALLERY_MEDIA_MODE_DEFAULT))
@@ -564,10 +567,14 @@ class DeepyController:
             self.workspace_host.ensure_session_workspace()
         return user_message_id, user_event
 
-    def _queue_assistant_request(self, state, session, output_queue, ask_request: str, queued_epoch: int, *, queued: bool, client_submission_id: str = "", assistant_badge: str = "", replay_action: dict[str, Any] | None = None):
+    def _queue_assistant_request(self, state, session, output_queue, ask_request: str, queued_epoch: int, *, queued: bool, client_submission_id: str = "", assistant_badge: str = "", replay_action: dict[str, Any] | None = None, media: list[dict[str, str]] | None = None, author: str = "You"):
         raw_send_cmd = output_queue.push
         assistant_badge = str(assistant_badge or "").strip()
         replay = None if replay_action is None else dict(replay_action)
+
+        def notify(phase, **info):
+            if client_submission_id and self.request_listener is not None:
+                self.request_listener(client_submission_id, phase, info)
 
         def send_cmd(cmd, data=None):
             if queued_epoch != session.chat_epoch and cmd in {"chat_output", "load_queue_trigger", "refresh_gallery", "error"}:
@@ -586,7 +593,7 @@ class DeepyController:
             session.queued_job_count += 1
             if replay is None:
                 self._prepare_session_request_locked(session, ask_request)
-                user_message_id, _user_event = assistant_chat.add_user_message(session, ask_request, queued=queued, client_submission_id=client_submission_id)
+                user_message_id, _user_event = assistant_chat.add_user_message(session, ask_request, queued=queued, client_submission_id=client_submission_id, media=media, author=author)
                 if assistant_badge:
                     user_record = assistant_chat._find_message(session, user_message_id)
                     user_record["assistant_badge"] = assistant_badge
@@ -594,8 +601,7 @@ class DeepyController:
             else:
                 user_message_id = str(replay["user_message_id"])
             self._debug_log(f"Request enqueued user_message_id={user_message_id} queued={bool(queued)} queued_jobs={int(session.queued_job_count or 0)}")
-            if self._multi_session_enabled:
-                session_store.schedule_autosave(session)
+            session_store.schedule_autosave(session)
 
         def queue_worker_func():
             with deepy_log_scope(start_if_needed=True):
@@ -648,10 +654,12 @@ class DeepyController:
                             starting_sync = assistant_chat.build_sync_event(session, status=starting_status)
                 if stale_request:
                     self._debug_log(f"Worker skipped stale request user_message_id={user_message_id} queued_epoch={queued_epoch} chat_epoch={session.chat_epoch}")
+                    notify("cancelled")
                     raw_send_cmd("exit", None)
                     return
                 if cancelled_request:
                     self._debug_log(f"Worker cancelled queued request user_message_id={user_message_id}")
+                    notify("cancelled")
                     raw_send_cmd("chat_output", cancelled_sync)
                     if cancelled_has_more_work:
                         raw_send_cmd("chat_output", assistant_chat.build_status_event("Queued behind the current assistant task.", kind="queued", session=session))
@@ -662,6 +670,7 @@ class DeepyController:
                         raw_send_cmd("exit", None)
                     return
                 self._debug_log(f"Worker starting user_message_id={user_message_id} queued_jobs={int(session.queued_job_count or 0)}")
+                notify("started", user_message_id=user_message_id)
                 if starting_sync is not None:
                     send_cmd("chat_output", starting_sync)
                 my_tools = self.create_tools(state, send_cmd, session=session)
@@ -685,8 +694,7 @@ class DeepyController:
                         send_cmd("chat_output", error_event)
                     send_cmd("chat_output", assistant_chat.build_status_event(None, visible=False, session=session))
                 finally:
-                    if self._multi_session_enabled:
-                        session_store.schedule_autosave(session)
+                    session_store.schedule_autosave(session)
                     with self._queue_state_lock:
                         if self._active_assistant_session is session:
                             self._active_assistant_session = None
@@ -700,6 +708,7 @@ class DeepyController:
                         pending_steering = has_more_work and any(str(record.get("role", "")).strip() == "user" and bool(record.get("queued", False)) and str(record.get("assistant_badge", "")).strip() == "Steered" for record in session.chat_transcript)
                         final_status = None if not has_more_work else {"visible": True, "kind": "queued", "text": "Steering accepted. Deepy is applying the new instructions..." if pending_steering else "Queued behind the current assistant task."}
                         final_sync = assistant_chat.build_sync_event(session, status=final_status) if has_more_work else None
+                        interrupted = bool(session.interrupt_requested)
                         session.interrupt_requested = False
                     if pending_reset_mode:
                         self._complete_session_reset(state, session, pending_reset_mode)
@@ -720,6 +729,7 @@ class DeepyController:
                         raw_send_cmd("exit", None)
                         self._debug_log(f"Terminal publication queued for user_message_id={user_message_id}: {output_queue.metrics()}")
                     session.worker_idle_event.set()
+                    notify("finished", user_message_id=user_message_id, interrupted=interrupted or stale_turn or bool(pending_reset_mode))
 
         task_handle = async_run_in("assistant", queue_worker_func)
         if queued:
@@ -739,6 +749,10 @@ class DeepyController:
         if self.get_deepy_type() == DEEPY_TYPE_PRIME:
             from shared.deepy.prime_tools import DeepyPrimeTools
 
+            allow_async = is_remote_engine(resolve_role_engine(self._server_config(), "deepy"))
+            if active_session.prime_toolbox is not None and active_session.prime_toolbox.allow_async != allow_async:  # the tools' job options follow the engine
+                active_session.prime_toolbox.close()
+                active_session.prime_toolbox = None
             if active_session.prime_toolbox is not None and self.workspace_host is not None:
                 from shared.deepy.filesystem import build_file_access_policy
                 workspace_id = self.workspace_host.deepy_workspace_id()
@@ -752,7 +766,7 @@ class DeepyController:
             if active_session.prime_toolbox is None:
                 gen = self._deps.get_gen_info(state)
                 zero_tools = DeepyZeroTools(gen, self._deps.get_processed_queue, send_cmd, session=active_session, get_output_filepath=self._deps.get_output_filepath, record_file_metadata=self._deps.record_file_metadata, get_server_config=self._server_config)
-                active_session.prime_toolbox = DeepyPrimeTools(state, send_cmd, active_session, zero_tools=zero_tools)
+                active_session.prime_toolbox = DeepyPrimeTools(state, send_cmd, active_session, zero_tools=zero_tools, allow_async=allow_async)
             else:
                 active_session.prime_toolbox.bind_turn(state, send_cmd)
             return active_session.prime_toolbox
@@ -779,11 +793,12 @@ class DeepyController:
             session.file_access_policy = tools.file_access_policy
             scope = "Reading may extend outside these roots; writing does not." if tools.file_access_policy.read_everywhere else "Use authorized @alias paths from IO discovery."
             access = f"Filesystem access outside the session workspace is configured as {tools.file_access_policy.mode}. {scope}"
-            return f"{PRIME_SYSTEM_PROMPT}\n\n{tools.get_system_instructions()}\n\n{access}", DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY
+            job = f"\n\n{session.plugin_instructions}" if session.plugin_instructions else ""  # a plugin job's own instructions, for its session only
+            return f"{PRIME_SYSTEM_PROMPT}\n\n{tools.get_system_instructions()}\n\n{access}{job}", DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY
         from shared.deepy.filesystem import build_file_access_policy
-        from shared.deepy.long_text import add_session_workspace, hide_legacy_artifact_guidance, long_text_system_instructions, long_text_tools_active
+        from shared.deepy.long_text import add_session_workspace, long_text_system_instructions, long_text_tools_active
 
-        workspace = session_store.session_workspace(session) if self._multi_session_enabled else session_store.ensure_mono_session_workspace(session.chat_session_id)
+        workspace = session_store.session_workspace(session) if self._multi_session_enabled or session.storage_session_dir else session_store.ensure_mono_session_workspace(session.chat_session_id)
         file_access_policy = add_session_workspace(build_file_access_policy(server_config), session.chat_session_id, workspace)
         session.file_access_policy = file_access_policy
         system_prompt = ZERO_SYSTEM_PROMPT
@@ -791,7 +806,7 @@ class DeepyController:
         if file_access_policy.read_enabled:
             access = "read/write" if file_access_policy.write_enabled else "read-only"
             scope = "Reading is allowed everywhere; writing remains limited to output and selected folders." if file_access_policy.read_everywhere else "Use @alias/path from list_files roots; plain paths use @outputs."
-            file_access_instructions = f"Filesystem {access} access is enabled. {scope} Use list_files without a path to discover roots, list_files with a path to navigate one directory, rg for recursive search, and query_file for one file's metadata or text. Directory listings return bounded pages; when has_more is true, repeat the same filters with cursor=next_cursor."
+            file_access_instructions = f"Filesystem {access} access is enabled. {scope} Files are toolbox actions: list_files without a path lists the roots, with a path one folder (pages: repeat with cursor=next_cursor while has_more); rg searches recursively; query_file reads one file's metadata or text."
         else:
             file_access_instructions = "Filesystem access is disabled. Use Gallery/media ids rather than direct paths."
         system_prompt = f"{system_prompt}\n\n{file_access_instructions}"
@@ -801,6 +816,12 @@ class DeepyController:
         return system_prompt, custom_system_prompt_key
 
     def _build_local_engine(self, state, session, tools, send_cmd, system_prompt: str, custom_system_prompt_key: str, *, thinking_enabled: bool, override_profile=-1) -> AssistantEngine:
+        from shared.deepy.loading_progress import DeepyLoadingProgress
+
+        loading = DeepyLoadingProgress(
+            lambda text: send_cmd("chat_output", assistant_chat.build_status_event(text, kind="loading", session=session)),
+            lambda: session.interrupt_requested,
+        )
         return AssistantEngine(
             session,
             AssistantRuntimeHooks(
@@ -808,10 +829,10 @@ class DeepyController:
                 release_gpu=lambda keep_resident = False, release_vram_callback = None, force_release_on_acquire = True: self._deps.release_gpu(state, keep_resident=keep_resident, release_vram_callback=release_vram_callback, force_release_on_acquire=force_release_on_acquire),
                 register_gpu_resident=lambda release_vram_callback = None, force_release_on_acquire = True: self._deps.register_gpu_resident(state, release_vram_callback=release_vram_callback, force_release_on_acquire=force_release_on_acquire),
                 clear_gpu_resident=lambda: self._deps.clear_gpu_resident(state),
-                ensure_loaded=lambda: self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile),
+                ensure_loaded=lambda: self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile, progress=loading, gen=loading.gen),
                 unload_runtime=self._deps.unload_prompt_enhancer_runtime,
                 unload_weights=self._unload_weights,
-                ensure_vision_loaded=lambda: self._ensure_vision_loaded(override_profile=override_profile),
+                ensure_vision_loaded=lambda: self._ensure_vision_loaded(override_profile=override_profile, progress=loading, gen=loading.gen),
                 get_offload_manager=self._deps.get_enhancer_offloadobj,
             ),
             tools,
@@ -871,14 +892,21 @@ class DeepyController:
         from shared.deepy.drivers import gradio_chat_updates
         yield from gradio_chat_updates(self.iter_commands(state, ask_request, client_submission_id, steering), lambda: self._deps.get_new_refresh_id())
 
-    def iter_commands(self, state, ask_request, client_submission_id: str = "", steering: bool = False):
+    def _warn_about_performance(self, session) -> None:
+        """Settings too heavy for this GPU are the first thing to look at when Deepy is slow: a note in the chat, once per conversation, that the model does not read."""
+        note = deepy_performance_warning(self._server_config(), icons=True)
+        if note and not any(block.get("text") == note for record in session.chat_transcript for block in record.get("blocks", [])):
+            assistant_chat.add_assistant_note(session, note)
+
+    def iter_commands(self, state, ask_request, client_submission_id: str = "", steering: bool = False, *, media: list[dict[str, str]] | None = None, author: str = "You"):
         debug_enabled = self._sync_debug_enabled()
         submission_id = str(client_submission_id or "").strip()[:128]
         acknowledged_submission_ids = [submission_id] if submission_id else []
 
         session = get_or_create_assistant_session(state)
         foreign_session_reset = self._reset_foreign_active_session(session)
-        request_blocks = self._expand_assistant_requests(session, ask_request)
+        # A request carrying its own media (plugins) stays one message.
+        request_blocks = self._expand_assistant_requests(session, ask_request) if media is None else [str(ask_request or "").strip()]
         if len(request_blocks) == 0:
             if debug_enabled:
                 self._debug_log("Request ignored because it was empty after normalization.")
@@ -904,6 +932,7 @@ class DeepyController:
                 self._prepare_session_request_locked(session, request_blocks[0])
             # The host lock must be acquired outside all queue-lock scopes.
             self.workspace_host.ensure_session_workspace()
+        self._warn_about_performance(session)
         if steering:
             with self._queue_state_lock:
                 steering_active = bool(session.worker_active and session.control_queue is not None)
@@ -950,7 +979,7 @@ class DeepyController:
             if enqueue_active:
                 queued_epoch = session.chat_epoch
                 for request_block in request_blocks:
-                    self._queue_assistant_request(state, session, existing_output_queue, request_block, queued_epoch, queued=True, client_submission_id=submission_id)
+                    self._queue_assistant_request(state, session, existing_output_queue, request_block, queued_epoch, queued=True, client_submission_id=submission_id, media=media, author=author)
                 queued_sync = assistant_chat.build_sync_event(session, status={"visible": True, "kind": "queued", "text": "Queued behind the current assistant task."}, acknowledged_submission_ids=acknowledged_submission_ids)
         if enqueue_active:
             existing_output_queue.push("chat_output", queued_sync)
@@ -964,7 +993,7 @@ class DeepyController:
             queued_epoch = session.chat_epoch
             session.control_queue = output_queue
             for index, request_block in enumerate(request_blocks):
-                self._queue_assistant_request(state, session, output_queue, request_block, queued_epoch, queued=queued or index > 0, client_submission_id=submission_id)
+                self._queue_assistant_request(state, session, output_queue, request_block, queued_epoch, queued=queued or index > 0, client_submission_id=submission_id, media=media, author=author)
             accepted_status = None if queued else {"visible": True, "kind": "loading", "text": "Starting Deepy..."}
             accepted_sync = assistant_chat.build_sync_event(session, status=accepted_status, acknowledged_submission_ids=acknowledged_submission_ids)
             output_queue.push("chat_output", accepted_sync)
@@ -1107,6 +1136,91 @@ class DeepyController:
             session_store.start_new_session(session, save_current=False)
             self.release_vram(state, True, discard_runtime_snapshot=True, preserve_reset_base=True)
         return {"pending": False, "event": assistant_chat.build_reset_event(session)}
+
+    def park_conversation(self, state, parking_dir) -> dict[str, Any]:
+        """Set the idle conversation aside for a plugin job; unpark_conversation brings it back."""
+        session = get_or_create_assistant_session(state)
+        with session.turn_lock:
+            parked = {"chat_session_id": session.chat_session_id, "gallery_workspace_id": session.gallery_workspace_id}
+            self._keep_context(session, session.chat_session_id)
+            if session.storage_session_id:
+                session_store.flush_session(session)
+                parked["storage_id"] = session.storage_session_id
+            elif session.chat_transcript:
+                # Without saved sessions the conversation exists only in memory: keep it in a private folder meanwhile.
+                session.storage_title = "Parked Deepy conversation"
+                session_store.ensure_session(session, "", self.get_deepy_type(), session_store.GALLERY_MEDIA_LINK, self._session_environment(session), media_import=True, directory=parking_dir)
+                session_store.flush_session(session)
+                parked["parked_id"], parked["parked_dir"] = session.storage_session_id, str(parking_dir)
+            session_store.start_new_session(session, save_current=False)
+            session.gallery_workspace_id = ""
+            self.release_vram(state, True, discard_runtime_snapshot=True, preserve_reset_base=True)
+        return parked
+
+    def _keep_context(self, session, owner: str) -> None:
+        """A conversation set aside (a plugin job that ends, the user's chat during a job) leaves its KV cache in RAM: when it comes back it goes on from it, without a prefill."""
+        self._kept_contexts.pop(owner, None)
+        if session.runtime_snapshot is not None and session.rendered_token_ids and session.pending_action_replay is None:
+            self._kept_contexts[owner] = {"runtime_snapshot": session.runtime_snapshot, "rendered_token_ids": list(session.rendered_token_ids), "rendered_messages_len": session.rendered_messages_len,
+                                          "rendered_system_prompt_signature": session.rendered_system_prompt_signature, "rendered_context_window_tokens": session.rendered_context_window_tokens}
+
+    def _take_kept_context(self, session, owner: str | None, live: bool = False) -> None:
+        """The conversation now current, once loaded, takes its KV cache back: it reaches the GPU with its next request, and what no longer matches token for token prefills as usual.
+        The oldest others make way so that at most the configured number stays, the current one's included (live: it is about to have one)."""
+        kept = self._kept_contexts.pop(owner, None)
+        if kept is not None:
+            for name, value in kept.items():
+                setattr(session, name, value)
+            session.pending_replay_reason = ""
+        room = normalize_deepy_kept_kv_caches(self._server_config().get(DEEPY_KEPT_KV_CACHES_KEY, DEEPY_KEPT_KV_CACHES_DEFAULT)) - (live or session.runtime_snapshot is not None)
+        while len(self._kept_contexts) > max(room, 0):
+            self._kept_contexts.pop(next(iter(self._kept_contexts)))
+
+    def open_external_session(self, state, directory, title: str | None, new_title: str) -> dict[str, Any]:
+        """Make a session folder outside the catalog the conversation; an empty folder starts a new session."""
+        session = get_or_create_assistant_session(state)
+        storage_id = session_store.open_external_session(directory)
+        with session.turn_lock:
+            if storage_id is None:
+                self._take_kept_context(session, None, live=True)
+                session.storage_title = title or new_title
+                session_store.ensure_session(session, "", self.get_deepy_type(), session_store.GALLERY_MEDIA_LINK, self._session_environment(session), media_import=True, directory=directory)
+                return {"event": assistant_chat.build_reset_event(session), "resumed": False, "missing_media": []}
+            try:
+                session_store.validate_session(storage_id, self.get_deepy_type())
+                loaded = session_store.load_session(session, storage_id, self.get_deepy_type())
+            except Exception:
+                session_store.close_external_session(storage_id)
+                raise
+            if title:
+                session.storage_title = title
+            self._take_kept_context(session, storage_id, live=True)
+            return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "resumed": True, "missing_media": loaded["missing_media"]}
+
+    def unpark_conversation(self, state, parked: dict[str, Any]) -> dict[str, Any]:
+        """Save and close the plugin session, then reload the conversation set aside by park_conversation."""
+        session = get_or_create_assistant_session(state)
+        with session.turn_lock:
+            plugin_id = session.storage_session_id
+            self._keep_context(session, plugin_id)
+            session_store.start_new_session(session)
+            session_store.close_external_session(plugin_id)
+            self.release_vram(state, True, discard_runtime_snapshot=True, preserve_reset_base=True)
+            storage_id = parked.get("storage_id") or parked.get("parked_id")
+            if storage_id is None:
+                session.chat_session_id, session.gallery_workspace_id = parked["chat_session_id"], parked["gallery_workspace_id"]
+                self._take_kept_context(session, parked["chat_session_id"])
+                return {"event": assistant_chat.build_reset_event(session), "prefill": False}
+            loaded = session_store.load_session(session, storage_id, self.get_deepy_type())
+            if "parked_id" in parked:
+                # Back to an unsaved conversation: drop the private folder, keep the content.
+                session_store.start_new_session(session, save_current=False)
+                session_store.close_external_session(storage_id)
+                shutil.rmtree(parked["parked_dir"])
+            session.chat_session_id, session.gallery_workspace_id = parked["chat_session_id"], parked["gallery_workspace_id"]
+            self._take_kept_context(session, parked["chat_session_id"])
+            # Its cards are back; its context comes back when the user writes to it, unless an interrupted action has to go on.
+            return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "prefill": session.pending_action_replay is not None}
 
     def prefill_restored_session_context(self, state, *, replay_pending: bool = False):
         session = get_or_create_assistant_session(state)

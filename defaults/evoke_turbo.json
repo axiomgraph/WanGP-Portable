@@ -1,0 +1,17 @@
+{
+    "model": {
+        "name": "EVOKE Turbo World 14B",
+        "architecture": "evoke_turbo",
+        "description": "EVOKE makes an explorable world from a start image: the camera walks and turns through it 1.5 seconds at a time while the world keeps a depth memory of what it has shown, so places you return to keep their layout. Explore it with the keyboard in the Worlds gallery; 640x384, slower per second of video than Hy-Nomas, and its depth model is for non-commercial use.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Worlds/resolve/main/evoke_turbo_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Worlds/resolve/main/evoke_turbo_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "A narrow cobblestone street in an old European town on a sunny afternoon, cafe terraces and flower boxes on both sides. Warm cinematic light, natural colors.\n[Forward 3s]\n[Look_Left 3s]",
+    "num_inference_steps": 3,
+    "guidance_scale": 1.0,
+    "video_length": 144,
+    "resolution": "640x384",
+    "image_prompt_type": "S"
+}

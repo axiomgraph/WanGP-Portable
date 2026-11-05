@@ -56,12 +56,20 @@
         node.append(' ', link);
       }
     }
+    // The page renders its model lists when it loads: rebuild them only on a later revision, once visible.
+    let modelsRevision = null, modelsDirty = false;
+    function flushModels() {
+      if (!modelsDirty || document.hidden) return;
+      modelsDirty = false;
+      click('deepy_hybrid_models_sync');
+    }
     function refresh(view) {
       const gallery = view.gallery !== galleryRevision, settings = view.settings !== settingsRevision;
       galleryRevision = view.gallery; settingsRevision = view.settings;
       if (gallery) {requestGallery(); viewer.invalidate();}
       if (settings) click('deepy_hybrid_settings_sync');
       if (view.preview !== previewRevision) {previewRevision = view.preview; click('deepy_hybrid_preview_sync');}
+      if (view.models !== modelsRevision) {modelsDirty = modelsRevision !== null; modelsRevision = view.models; flushModels();}
     }
     function catalog(state) {
       WAC.consumePayload({type: 'session_catalog', sessions: state.sessions, active_session_id: state.active_session_id, multi_session_enabled: state.multi_session});
@@ -149,9 +157,24 @@
       return true;
     };
     WAC.prefillResumedSession = () => {};
+    // Images and videos of the image/video gallery open in its full-screen viewer, 3D assets in the 3D gallery's
+    // viewer (a new tab would only download them); other media keep their new tab and download cards their download.
+    WAC.openAttachment = link => {
+      const kind = link.dataset.mediaKind;
+      if (link.hasAttribute('download') || !(kind === '3d' || WAC.galleryMediaViewer && ['image', 'video'].includes(kind))) return false;
+      const scroll = WAC.captureAutoscrollState(), restore = () => WAC.scheduleComposerLayout(scroll);
+      const query = new URLSearchParams({url: link.getAttribute('href')});
+      const opened = kind === '3d'
+        ? transport.request('media/mesh-viewer?' + query).then(result => window.WanGPGallerySelection.viewMesh(result.html, restore))
+        : transport.request('media/locate?' + query).then(item => {
+          if (!item || !window.WanGPGallerySelection.view(item, restore)) window.open(link.href, '_blank', 'noopener');
+        });
+      opened.catch(error => showError(error.notification || error.message));
+      return true;
+    };
     window.addEventListener('online', () => transport.connect());
     window.addEventListener('focus', () => {if (!transport.source) transport.connect(); requestGallery();});
-    document.addEventListener('visibilitychange', () => {if (!document.hidden) requestGallery();});
+    document.addEventListener('visibilitychange', () => {if (!document.hidden) {requestGallery(); flushModels();}});
     window.addEventListener('pagehide', () => transport.close());
     window.addEventListener('pageshow', event => {if (event.persisted) transport.connect();});
     WAC.mountChatUpload((path, body) => transport.request(path, body), notice);

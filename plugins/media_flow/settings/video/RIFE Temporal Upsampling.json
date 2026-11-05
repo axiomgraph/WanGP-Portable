@@ -5,5 +5,10 @@
   "target_ratio": "rife*2",
   "chunk_size_seconds": 3.0,
   "sliding_window_overlap": 0,
-  "prompt": ""
+  "prompt": "",
+  "process": {
+    "task": "interpolate",
+    "summary": "RIFE v4.26 frame interpolation x2 to x4: fast.",
+    "recommended": true
+  }
 }

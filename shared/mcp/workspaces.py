@@ -14,7 +14,7 @@ from shared.utils.workspace_storage import OUTPUT_KEYS, background_workspace, ex
 from shared.utils.workspaces import WorkspaceStore, capture_gallery, load_gallery
 
 VISIBILITY_KEY, VISIBILITY_MODES = 'mcp_workspace_visibility', ('own', 'own_and_user', 'all')
-SCOPED_TOOLS = {'wangp_generate', 'wangp_validate', 'wangp_postprocess', 'wangp_toolbox', 'wangp_list_gallery', 'wangp_io', 'wangp_session'}
+SCOPED_TOOLS = {'wangp_generate', 'wangp_validate', 'wangp_postprocess', 'wangp_toolbox', 'wangp_list_gallery', 'wangp_io', 'wangp_session', 'wangp_plugins'}
 
 
 class StandaloneWorkspaceHost:
@@ -201,7 +201,7 @@ class AgentWorkspaces:
         if name != 'wangp_toolbox' or arguments.get('action') is None or arguments.get('arguments') is None:
             return False
         action = arguments['action']
-        if action in ('media_settings', 'inspect_media', 'inspect_video', 'view_media'):
+        if action in ('media_settings', 'inspect_media', 'inspect_video', 'view_media', 'check_lip_sync'):
             return False
         return action != 'inspect_audio' or bool(arguments['arguments'].get('preview'))
 

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import torch
 from shared.utils.conv_bands import band_convs, conv_bands
+from shared.kernels import vae_ops
 from einops import rearrange
 from torch import Tensor, nn
 
@@ -20,27 +21,12 @@ class AutoEncoderParams:
     shift_factor: float
 
 
-def swish_(x: Tensor, chunk_bytes: int = 256 << 20) -> Tensor:
-    """x * sigmoid(x) written into x (always a fresh normalization output here) by chunks: the same values, without two full-size temporaries."""
-    flat, rows = x.view(-1), max(1, chunk_bytes // x.element_size())
-    for start in range(0, flat.numel(), rows):
-        part = flat[start:start + rows]
-        part.mul_(torch.sigmoid(part))
-    return x
-
-
-def norm_swish(norm: nn.GroupNorm, x: Tensor, chunk_bytes: int = 256 << 20) -> Tensor:
+def norm_swish(norm: nn.GroupNorm, x: Tensor) -> Tensor:
     """swish(norm(x)) for a convolution. Under autocast, GroupNorm computes in float32 and the convolution casts its input to the autocast dtype:
-    each chunk of groups is cast right away, so neither the float32 copy of x nor the float32 result is allocated in full (same values)."""
+    the shared operation rounds once to that dtype without float32 tensors in full (vae_ops.group_norm_silu)."""
     if not torch.is_autocast_enabled(x.device.type):
-        return swish_(norm(x))
-    out = torch.empty_like(x, dtype=torch.get_autocast_dtype(x.device.type))
-    step = x.shape[1] // norm.num_groups
-    groups = max(1, chunk_bytes // (x[:, :step].numel() * 4))
-    for start in range(0, norm.num_groups, groups):
-        c0, c1 = start * step, min(norm.num_groups, start + groups) * step
-        out[:, c0:c1] = swish_(nn.functional.group_norm(x[:, c0:c1], (c1 - c0) // step, norm.weight[c0:c1], norm.bias[c0:c1], norm.eps))
-    return out
+        return vae_ops.silu_(norm(x))
+    return vae_ops.group_norm_silu(x, norm, torch.get_autocast_dtype(x.device.type))
 
 
 class AttnBlock(nn.Module):
@@ -65,7 +51,7 @@ class AttnBlock(nn.Module):
         q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
         k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
         v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
-        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+        h_ = vae_ops.attention(q, k, v)  # by chunks of queries where SDPA has no memory-efficient kernel (BF16 on Turing)
 
         return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 

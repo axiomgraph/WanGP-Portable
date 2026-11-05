@@ -1,6 +1,18 @@
 # Manual Installation Guide For Windows & Linux
 
-This guide covers manual installation for different GPU generations and operating systems. Alternatively you may use the 1 click install / update scripts (please check the repo readme for instructions).
+This guide covers manual installation for different GPU generations and operating systems. The [README's four guided installation methods](../README.md#-quick-start) also cover the Bat/SH scripts, Pinokio, Wan2GP Desktop and **WanGP Manager (Experimental, Windows x64)**.
+
+WanGP Manager guides installation, installs Python and dependencies, launches WanGP in an app window or browser, and manages updates and rollback. **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release. See the [Manager instructions](../README.md#wangp-manager-experimental-windows).
+
+For an existing installation, choose **Install / Add → Use existing installation** at the top of the page. Browse to the WanGP folder: Manager detects its saved environment and local `env_uv`, `venv`, `.venv` or `env` folders. A single compatible environment is selected automatically. Under **Choose another Conda environment or Python**, you can pick a discovered Conda environment or browse to Python. Discovery and registration leave packages unchanged.
+
+Choose **Update WanGP → Prepare latest update**, review the result and confirm **Update WanGP**. Manager checks the current Python environment against the selected version, optional kernels and installed plugins. Automatic updates keep compatible packages, including on the first update of an existing installation. When packages need to change, Manager validates a separate Conda clone or a new virtual environment before switching. **Choose another version or change dependencies** lets you select an older build.
+
+Under **Saved versions and rollback**, use **Preview restore** to return to a saved source and environment pair. Use **Remove** to discard a rollback version. Manager reclaims an environment it created after its last reference is removed. It preserves imported environments and environments used by another saved version, the active installation or another registered installation.
+
+Existing-installation updates require Git and a WanGP Git checkout with no pending tracked source edits; Conda installations also require Conda. Stop WanGP and save or stash those edits first. Allow disk space for another environment; retained environments are kept for rollback. Launch through Manager or WanGP's installation scripts to use the selected environment: activating the original Conda environment by its old name still selects the unchanged original. Manager keeps the chosen source revision separate from your Git branches. Installations without a Git checkout or virtual environment can be launched, but cannot be updated through this workflow.
+
+To update **Manager itself**, use **Preferences → Check for Manager updates**, download the latest installer, close Manager and run it. The installer defaults to **Update in place** when upgrading and preserves your installation list and preferences; uninstalling first is unnecessary. The permanent download URL stays the same across releases.
 
 It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.8 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
 
@@ -64,27 +76,27 @@ For **PyTorch 2.10 / CUDA 13** (NVIDIA R580+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-linux_x86_64.whl
 ```
 
 For **PyTorch 2.7.1 / CUDA 12.8** (NVIDIA R570+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-linux_x86_64.whl
 ```
 
 For **AMD RDNA4 (`gfx1200`, `gfx1201`) with PyTorch 2.13.0 / ROCm 10.0** (experimental):
 
 ```bash
 # Windows
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-win_amd64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-win_amd64.whl
 # Linux
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.3.0/wgpkernels-1.3.0%2Brocm100-py3-none-linux_x86_64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and Conv3D remain CUDA-only; AMD retains the independent supported backends for those operations. AMD packages pass installation and library-loading checks, but kernel execution on AMD hardware remains unvalidated.
@@ -262,24 +274,24 @@ Install the wheel matching your Python, PyTorch and CUDA stack. `--no-deps` pres
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
 ```
 
 ### Python 3.10 / PyTorch 2.7.1 / CUDA 12.8
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
 ```
 
 The CUDA 13 builds contain native GPU code for SM75 through the architectures supported by CUDA 13.1. CUDA 12.8 builds additionally contain pre-SM75 code, subject to PyTorch's own support. Linux wheels need glibc 2.28 or newer. The release includes the exact architecture lists, source and build instructions.
@@ -290,12 +302,12 @@ For RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer 
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.28/llamacpp_gguf_cuda-1.0.28%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl
 ```
 
 The HIP and CUDA wheels use the same package name; select the matching backend. The HIP wheel requires exactly PyTorch 2.13.0+rocm10.0.0 and rejects a different PyTorch build at import. It keeps the previous GGUF kernels: the new single-kernel row loop is CUDA only. Compilation and import checks do not establish AMD inference correctness: hardware validation remains pending.

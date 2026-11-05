@@ -13,5 +13,10 @@
   "loras_multipliers": "1",
   "activated_loras": [
     "https://huggingface.co/DeepBeepMeep/LTX-2/resolve/main/ltx-2.3-22b-ic-lora-ungrade.safetensors"
-  ]
+  ],
+  "process": {
+    "task": "ungrade",
+    "summary": "LTX-2.5 22B distilled with the ungrade IC-LoRA.",
+    "recommended": true
+  }
 }

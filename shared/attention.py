@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import functools
 import sys
 from contextlib import contextmanager, nullcontext
 
@@ -271,7 +272,10 @@ def sdpa_wrapper(
     return o
 
 
-def get_attention_modes():
+@functools.lru_cache(maxsize=None)
+def _attention_modes():
+    # Installed packages do not change while the server runs; the package
+    # version lookups below read dist-info files on every call otherwise.
     ret = ["sdpa", "auto"]
     if flash_attn != None:
         ret.append("flash")
@@ -286,13 +290,20 @@ def get_attention_modes():
 
     if sageattn3 != None: # and version("sageattention").startswith("3") :
         ret.append("sage3")
-        
-    return ret
+
+    return tuple(ret)
+
+def get_attention_modes():
+    return list(_attention_modes())
 
 def get_supported_attention_modes():
+    return list(_supported_attention_modes())
+
+@functools.lru_cache(maxsize=None)
+def _supported_attention_modes():
     # MPS compatibility: only SDPA is supported on Apple Silicon
     if _is_mps:
-        return ["sdpa", "auto"]
+        return ("sdpa", "auto")
     ret = get_attention_modes()
     major, minor = torch.cuda.get_device_capability()
     if  major < 10 or not triton_installed:
@@ -309,7 +320,7 @@ def get_supported_attention_modes():
         if "sage" in ret:
             ret.remove("sage")
 
-    return ret
+    return tuple(ret)
 
 
 def get_override_attention_modes():
@@ -437,6 +448,13 @@ def get_cu_seqlens(batch_size, lens, max_len):
     return cu_seqlens
 
 @torch.compiler.disable()
+def _sage_rows_head_dim(q, softmax_scale):
+    # the SageAttention (1) rows path (sage1_core.attention) for q's head_dim: those its kernels run, with the default softmax scale (as
+    # before: with another scale they keep sageattn_varlen), and the others it pads with zeros (padded_head_dim), with any scale
+    head_dim = q.shape[-1]
+    return sage1_core.padded_head_dim(head_dim, q.device) is not None and (softmax_scale is None or head_dim not in sage1_core.head_dims(q.device))
+
+
 def pay_attention(
     qkv_list,
     dropout_p=0.,
@@ -470,8 +488,8 @@ def pay_attention(
             support_reason = sageattn_attention_mask_support_reason(qkv_list, attention_mask, tensor_layout="NHD")
         if requested_attn == "sage2" and support_reason is None and sageattn2 != None and q_lens == None and k_lens == None:
             force_attention = "sage2"
-        elif (requested_attn == "sage" and sage1_core is not None and q_lens == None and k_lens == None and softmax_scale is None
-              and qkv_list[0].shape[-1] in sage1_core.head_dims(qkv_list[0].device) and sage1_core.masks_supported(qkv_list[0].device)):
+        elif (requested_attn == "sage" and sage1_core is not None and q_lens == None and k_lens == None and _sage_rows_head_dim(qkv_list[0], softmax_scale)
+              and sage1_core.masks_supported(qkv_list[0].device)):
             force_attention = "sage"  # the Turing kernel takes the mask (sage_rows below)
         else:
             force_attention = "sdpa"
@@ -490,7 +508,7 @@ def pay_attention(
     qkv_list.clear()
     out_dtype = q.dtype
     # SageAttention on every batch item with all its tokens: its kernels without its device sync (CUDA graphs can record them)
-    sage_rows = attn == "sage" and q_lens == None and k_lens == None and not causal and softmax_scale is None and q.shape[-1] in sage1_core.head_dims(q.device)
+    sage_rows = attn == "sage" and q_lens == None and k_lens == None and not causal and _sage_rows_head_dim(q, softmax_scale)
     if q.dtype == torch.bfloat16 and not bfloat16_supported and not sage_rows:  # sage1_core converts what its kernels need
         q = q.to(torch.float16)
         k = k.to(torch.float16)
@@ -558,7 +576,7 @@ def pay_attention(
             'Flash attention 3 is not available, use flash attention 2 instead.'
         )
 
-    if attn == "sage" and not sage_rows and q.shape[-1] > 128:  # sageattn_varlen stops at 128, and 256 needs compute capability 8.0
+    if attn == "sage" and not sage_rows and q.shape[-1] not in (64, 128):  # sageattn_varlen runs 64 and 128 only (sage_rows pads the others)
         if not _HEAD_DIM_SDPA_WARNED:
             tqdm.write(f"[WAN2GP] SageAttention does not support this attention (head_dim {q.shape[-1]}): it will use SDPA.")
             _HEAD_DIM_SDPA_WARNED = True
@@ -593,7 +611,7 @@ def pay_attention(
         qkv_list = [t.reshape(-1, *t.shape[2:]).view(t.shape) for t in (q, k, v)]  # batch items one after another (copies only otherwise)
         del q, k, v
         x = sage1_core.attention(qkv_list, recycle_q, offload.shared_state.get("_sage_v_scaling", False),
-                                 None if attention_mask is None else sage_attention_mask(attention_mask, out_dtype))
+                                 None if attention_mask is None else sage_attention_mask(attention_mask, out_dtype), softmax_scale)
     elif attn=="sage":
         x = sageattn_varlen_wrapper(
             q=q,

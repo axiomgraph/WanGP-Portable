@@ -210,7 +210,8 @@ class WorkspaceSupport:
                 workspace_id = self.workspaces.create(session.storage_title, deepy_session_id=session.storage_session_id)
             else:
                 workspace_id = owned['id']
-                if owned['name'] != session.storage_title:
+                # A workspace lent to a plugin job keeps its own name.
+                if owned.get('deepy_session_id') == session.storage_session_id and owned['name'] != session.storage_title:
                     self.workspaces.rename(workspace_id, session.storage_title, deepy_session_id=session.storage_session_id)
                     self.publish_workspaces()
             if workspace_id == self.workspace_id and session.gallery_workspace_id == workspace_id:
@@ -250,6 +251,8 @@ class WorkspaceSupport:
             raise ValueError('Workspaces are not configured.')
         with self._mutation_lock:
             workspace_id = payload.get('id')
+            if action != 'rename' and self._plugin_job is not None:
+                raise DeepyBusy(f'{self._plugin_job.owner} is using Deepy. Change workspace once it finishes.')
             if payload.get('context') == 'deepy' and self._deepy_workspace_locked():
                 raise DeepyBusy('Workspaces are assigned by Deepy session in dedicated mode. Change the Deepy session to use another workspace.')
             if action in ('select', 'create', 'delete'):

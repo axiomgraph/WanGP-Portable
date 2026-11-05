@@ -212,7 +212,8 @@ class Qwen21Pipeline(QwenImage21Pipeline):
             raise ValueError("Qwen Image 2.1 Turbo scheduler requires 8 inference steps.")
         device = torch.device("cuda")
         output_channels = 4 if (custom_settings or {}).get("rgba", "Disabled") == "Enabled" else 3
-        use_kv_cache = (custom_settings or {}).get("qwen21_kv_cache", "Disabled") == "Enabled"
+        kv_cache_mode = (custom_settings or {}).get("qwen21_kv_cache", "Disabled")
+        use_kv_cache = kv_cache_mode in ("Enabled", "INT8", "INT8_RAM")
         border_method = OUTPAINTING_METHOD
         if border_method not in ("Red Canvas", "Reference"):
             raise ValueError(f"Unknown outpainting border method: {border_method}")
@@ -289,7 +290,11 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 branch["img_mask"] = torch.cat([slots, slots.new_ones(slots.shape[0], latents.shape[1] // 4)], dim=1)
                 branch["img_shapes"] = [shapes] * batch_size
                 branch["target_rope_offset"] = target_rope_offset
-                cache = QwenImage21KVCache(len(self.transformer.transformer_blocks)) if use_kv_cache else None
+                # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM);
+                # Enabled / INT8: in VRAM as far as it fits beside the weights, the other layers in RAM and streamed
+                cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=kv_cache_mode in ("INT8", "INT8_RAM"), native=nag_parameters is None,
+                                           ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None,
+                                           dynamic=kv_cache_mode in ("Enabled", "INT8")) if use_kv_cache else None
                 branch["kv_cache"] = cache
                 if cache is not None:
                     caches.append(cache)
@@ -357,10 +362,10 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 offload.set_step_no_for_lora(self.transformer, step_offset + i)
                 if dynamic_loras:
                     for cache in caches:
-                        cache.clear()
+                        cache.clear(keep_ring=True)
                 def denoise(value, guidance):
                     model_input = torch.cat([condition, value], dim=1) if condition is not None else value
-                    inputs = [{**branch, "hidden_states": model_input, "timestep": timestep.expand(batch_size).to(dtype) / 1000, "kv_cache_mode": None if branch["kv_cache"] is None else ("extract" if branch["kv_cache"].layer_caches[0].k is None else "cached"), "return_dict": False} for branch in branches]
+                    inputs = [{**branch, "hidden_states": model_input, "timestep": timestep.expand(batch_size).to(dtype) / 1000, "kv_cache_mode": None if branch["kv_cache"] is None else ("extract" if branch["kv_cache"].layer_caches[0].empty() else "cached"), "return_dict": False} for branch in branches]
                     predictions = self.transformer(branches=inputs, nag_parameters=nag_parameters) if nag_parameters or (joint_pass and len(inputs) > 1) else [self.transformer(**item)[0] for item in inputs]
                     return predictions[0][:, -value.shape[1]:], predictions[1][:, -value.shape[1]:] if len(predictions) > 1 else None
                 def combine(positive, negative, guidance, time):

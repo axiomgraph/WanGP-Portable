@@ -7,6 +7,11 @@
 - cuda: FP8 tensor cores (torch._scaled_mm, cuBLASLt, RTX 40xx and later): the activations are also quantized to FP8 (one scale per
   call), fastest, lower precision;
 - auto: the fastest available (cuda, then triton, then pytorch), as WanGP's FP8 checkpoints used FP8 tensor cores before.
+Block-scaled FP8 weights (shared.qtypes.block_scaled: one scale per 128 x 128 block, or per output channel and 128-element block of K)
+run on WGPKernels' FP8 GEMMs with E4M3 activations (quantized per row and 128 columns, approximate) under the cuda choice, else with
+16-bit activations (exact, the weights decoded in registers): WGPKernels' W8A16 kernels when its library has them, else the Triton block
+kernel (shared.kernels.fp8_block_triton), on every GPU including those without FP8 tensor cores; without a precise kernel, the E4M3
+kernels when the precision setting allows approximate kernels; the pytorch choice dequantizes them per call.
 A choice this GPU cannot run gives way to the next one (cuda -> triton -> pytorch), and the kernels in use are printed."""
 import torch
 from torch._subclasses.fake_tensor import is_fake
@@ -20,6 +25,11 @@ scaled_backend = "pytorch"  # kernels of the scaled FP8 weights (shared.qtypes.s
 revision = 0  # part of the CUDA graph keys: graphs record the kernels of the backend
 _ops_registered = False
 _cuda_skips_noted = False
+_wgp_fp8 = None  # wgpkernels.fp8 while a kernel choice is active and its library runs on this GPU (block-scaled FP8 weights)
+_wgp_a16 = False  # that library computes 16-bit activations (W8A16)
+_triton_block = False  # shared.kernels.fp8_block_triton imports
+_selection = "auto"
+BLOCK_LABELS = {"wgp_w8a8": "WGPKernels (E4M3 activations)", "wgp_a16": "WGPKernels (16-bit activations)", "triton_a16": "Triton (16-bit activations)"}
 
 
 def _available(selection):
@@ -48,19 +58,62 @@ def resolve_backend(selection):
     return (resolved, resolved), reason
 
 
+def _probe_wgp_fp8():
+    """wgpkernels.fp8 when installed with its library and its selftest passes on this GPU, else None."""
+    import importlib
+    try:
+        module = importlib.import_module("wgpkernels.fp8")
+        if not module.default_library_path().is_file():
+            return None
+        if module._lib is None:
+            module.load_library()
+        with torch.inference_mode():
+            return None if module.selftest() else module
+    except Exception:
+        return None
+
+
 def configure(selection, resolved=None):
-    global backend, scaled_backend, revision
+    global backend, scaled_backend, revision, _wgp_fp8, _wgp_a16, _triton_block, _selection
     (quanto, scaled), reason = resolve_backend(selection) if resolved is None else resolved
-    if (quanto, scaled) != (backend, scaled_backend):
+    if (quanto, scaled, selection) != (backend, scaled_backend, _selection):
         revision += 1
-    backend, scaled_backend = quanto, scaled
+    backend, scaled_backend, _selection = quanto, scaled, selection
+    _wgp_fp8 = _probe_wgp_fp8() if scaled != "pytorch" else None
+    _wgp_a16 = _wgp_fp8 is not None and getattr(_wgp_fp8, "a16_supported", lambda: False)()
+    _triton_block = scaled != "pytorch" and _probe_triton_block()
     if (quanto, scaled) != ("pytorch", "pytorch"):
         _register_ops()
     from mmgp import offload
     offload.register_row_projection(_FP8_ROW_PROJECTION)
     kernels = _LABELS[quanto] if quanto == scaled else f"{_LABELS[quanto]}, {_LABELS[scaled]} for scaled FP8 checkpoints"
-    print(f"[FP8] Backend: {kernels} (setting: {selection}{'; ' + reason if reason else ''}).")
+    block = _block_route()
+    print(f"[FP8] Backend: {kernels}{'; block-scaled weights: ' + BLOCK_LABELS[block] if block else ''} (setting: {selection}{'; ' + reason if reason else ''}).")
     return quanto, scaled
+
+
+def _probe_triton_block():
+    try:
+        from shared.kernels import fp8_block_triton  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _block_route():
+    """Kernels of the block-scaled FP8 weights for the active choice: 'wgp_w8a8' (WGPKernels, E4M3 activations) under the cuda choice,
+    else the exact 16-bit-activation kernels 'wgp_a16' (WGPKernels) or 'triton_a16', else 'wgp_w8a8' when approximate kernels are allowed,
+    else None (dequantized per call)."""
+    if scaled_backend == "pytorch":
+        return None
+    if _wgp_fp8 is not None and (scaled_backend == "cuda" or _selection == "cuda"):
+        return "wgp_w8a8"
+    if _wgp_a16:
+        return "wgp_a16"
+    if _triton_block:
+        return "triton_a16"
+    from shared.kernels import kernel_policy
+    return "wgp_w8a8" if _wgp_fp8 is not None and kernel_policy.allow_approximate() else None
 
 
 def _cuda_runs(weight, x):
@@ -114,6 +167,30 @@ def matmul(x, weight, scale, bias, cuda):
     if torch.compiler.is_compiling() or is_fake(x):  # tracing (Dynamo also runs tensor methods on fake tensors): the opaque op
         return torch.ops.wan2gp_fp8.linear(x, weight, scale, bias, cuda)
     return _linear_impl(x, weight, scale, bias, cuda)
+
+
+def block_mode(input, weight):
+    """The kernels (a BLOCK_LABELS key) computing a block-scaled FP8 weight for this input (BF16/FP16 CUDA activations, K a multiple of 16),
+    or None for the per-call dequantization."""
+    if not (input.is_cuda and input.dtype in (torch.bfloat16, torch.float16) and weight.is_cuda and input.shape[-1] % 16 == 0):
+        return None
+    return _block_route()
+
+
+def block_linear(input, weight, scale, bias=None, mode="wgp_w8a8"):
+    """input @ (weight E4M3 * scale per 128 x 128 block, or per channel and 128-element block of K).T + bias with the kernels of mode
+    (block_mode()): WGPKernels with E4M3 activations ('wgp_w8a8') or 16-bit ones ('wgp_a16'), or the Triton block kernel ('triton_a16')."""
+    x = input.reshape(-1, input.shape[-1])
+    if x.stride(-1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:  # rows loaded by 16 bytes
+        x = x.contiguous()
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(x.dtype)
+    if mode == "triton_a16":
+        from shared.kernels import fp8_block_triton
+        out = fp8_block_triton.linear(x, weight, scale, bias)
+    else:
+        out = _wgp_fp8.linear(x, weight, scale, bias, precise=mode == "wgp_a16") if _wgp_a16 else _wgp_fp8.linear(x, weight, scale, bias)
+    return out.reshape(*input.shape[:-1], weight.shape[0])
 
 
 def linear(input, weight, bias=None):

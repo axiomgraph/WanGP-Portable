@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import difflib
 import hashlib
 import os
 import platform
@@ -30,7 +31,6 @@ _MAX_TEXT_EDIT_CHARS = 1024 * 1024
 _MAX_PROMPT_FILE_BYTES = 4 * 1024 * 1024
 _PROMPT_FILE_RE = re.compile(r'^\s*@file\(\s*"([^"\r\n]+)"\s*\)\s*$')
 _PROMPT_FIELDS = {"prompt", "negative_prompt", "alt_prompt", "audio_prompt", "lyrics", "music_caption", "voice_description"}
-_LEGACY_SKILLS = {"large-artifact-workflows", "long-form-story"}
 _RUNTIME_LOCK = threading.RLock()
 _WORKSPACES_PURGED = False
 
@@ -61,7 +61,7 @@ _RG_FLAG_OPTIONS = {
     "--trim", "-P", "--pcre2", "--crlf", "--stats", "--no-messages",
 }
 _RG_VALUE_OPTIONS = {
-    "-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "--after-context", "-B", "--before-context",
+    "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-A", "--after-context", "-B", "--before-context",
     "-C", "--context", "-m", "--max-count", "--max-depth", "--max-filesize", "-j", "--threads", "-e", "--regexp",
     "-r", "--replace", "--engine", "--sort", "--sortr", "--encoding",
 }
@@ -127,22 +127,6 @@ def long_text_system_instructions(policy) -> str:
         "Use edit(file_path, old_string, new_string, replace_all=false) for exact replacement. Search for enough local context that old_string occurs once, preserve its whitespace and line endings exactly, then search or read back the changed area. "
         f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries."
     )
-
-
-def hide_legacy_artifact_guidance(text: str) -> str:
-    lines = []
-    for line in str(text or "").strip().splitlines():
-        normalized = line.casefold()
-        if "wangp_artifact" in normalized or "managed artifact" in normalized or any(f"wangp://skills/{name}" in normalized for name in _LEGACY_SKILLS):
-            continue
-        line = line.replace("literal text writing, artifact text export (including explicit partial-progress snapshots),", "literal text writing,")
-        line = re.sub(r" Use `write_artifact_text`, not literal `write_text`, when file content comes from an artifact\.", "", line)
-        lines.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-
-
-def legacy_skill_hidden(skill_name: str, policy) -> bool:
-    return long_text_tools_active(policy) and str(skill_name or "").strip().casefold() in _LEGACY_SKILLS
 
 
 def _platform_key() -> tuple[str, str]:
@@ -326,6 +310,19 @@ def _decode_text(data: bytes, label: str) -> tuple[str, str]:
         raise ValueError(f"{label} is not UTF-8 text.") from exc
 
 
+def _closest_passage(original: str, old_string: str) -> str:
+    """Where an old_string quoted from memory (another indentation, a value changed since) most resembles the file, as the text to quote instead."""
+    lines, wanted = original.splitlines(), old_string.replace("\r\n", "\n")
+    size, best, where = wanted.count("\n") + 1, 0.0, -1
+    for index in range(max(1, len(lines) - size + 1)):
+        matcher = difflib.SequenceMatcher(None, wanted, "\n".join(lines[index:index + size]), autojunk=False)
+        if matcher.real_quick_ratio() > best and matcher.quick_ratio() > best and matcher.ratio() > best:
+            best, where = matcher.ratio(), index
+    if best < 0.6:
+        return ""
+    return f" The closest passage, at line {where + 1}, reads: {chr(10).join(lines[where:where + size])[:600]!r}. Copy it exactly into old_string."
+
+
 def _text_argument(value: Any, name: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a string.")
@@ -349,26 +346,32 @@ def _atomic_write(target: Path, data: bytes, *, create_only: bool = False) -> No
         temporary.unlink(missing_ok=True)
 
 
-def edit_text(policy, file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict[str, Any]:
+def edit_text(policy, file_path: str, old_string: str = "", new_string: str = "", replace_all: bool = False, edits: list[dict[str, str]] | None = None) -> dict[str, Any]:
     if not long_text_tools_active(policy):
         raise PermissionError("The experimental edit tool requires Deepy read/write filesystem access.")
-    old_string = _text_argument(old_string, "old_string")
-    new_string = _text_argument(new_string, "new_string", allow_empty=True)
-    if old_string == new_string:
-        raise ValueError("old_string and new_string are identical.")
+    where = (lambda index: f"edits[{index}]: ") if edits else (lambda index: "")
+    pairs = [(item.get("old_string"), item.get("new_string")) for item in edits] if edits else [(old_string, new_string)]
+    pairs = [(_text_argument(old, "old_string"), _text_argument(new, "new_string", allow_empty=True)) for old, new in pairs]
+    for index, (old, new) in enumerate(pairs):
+        if old == new:
+            raise ValueError(f"{where(index)}old_string and new_string are identical.")
     with _RUNTIME_LOCK:
         target = policy.require_read(file_path, file=True)
         policy.require_write(target)
         original, encoding = _decode_text(target.read_bytes(), policy.virtualize_path(target))
-        if "\r\n" in original and "\n" not in original.replace("\r\n", ""):  # read_text shows a CRLF file with plain newlines
-            old_string, new_string = (value.replace("\r\n", "\n").replace("\n", "\r\n") for value in (old_string, new_string))
-        occurrences = original.count(old_string)
-        if occurrences == 0:
-            raise ValueError("old_string was not found exactly in the target file. Use rg and preserve whitespace and line endings.")
-        if occurrences > 1 and not replace_all:
-            raise ValueError(f"old_string occurs {occurrences} times; include more surrounding context or set replace_all=true.")
-        replacements = occurrences if replace_all else 1
-        updated = original.replace(old_string, new_string, -1 if replace_all else 1)
+        crlf = "\r\n" in original and "\n" not in original.replace("\r\n", "")  # read_text shows a CRLF file with plain newlines
+        updated, replacements = original, 0
+        for index, (old, new) in enumerate(pairs):  # in order, on the text the previous ones left; written once, all or none
+            if crlf:
+                old, new = (value.replace("\r\n", "\n").replace("\n", "\r\n") for value in (old, new))
+            occurrences = updated.count(old)
+            if occurrences == 0:
+                raise ValueError(f"{where(index)}old_string was not found exactly in the target file. Use rg and preserve whitespace and line endings." + _closest_passage(updated, old)
+                                 + (" Nothing was changed." if edits else ""))
+            if occurrences > 1 and not replace_all:
+                raise ValueError(f"{where(index)}old_string occurs {occurrences} times; include more surrounding context or set replace_all=true.")
+            replacements += occurrences if replace_all else 1
+            updated = updated.replace(old, new, -1 if replace_all else 1)
         data = updated.encode(encoding)
         _atomic_write(target, data, create_only=policy.create_only(target))
     return {"status": "done", "action": "edit", "path": policy.virtualize_path(target), "replacements": replacements, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -425,6 +428,6 @@ def resolve_prompt_references(value: Any, policy, key: str = "", *, read_only: b
 
 
 __all__ = [
-    "add_session_workspace", "append_text", "edit_text", "ensure_ripgrep", "hide_legacy_artifact_guidance", "legacy_skill_hidden",
+    "add_session_workspace", "append_text", "edit_text", "ensure_ripgrep",
     "long_text_system_instructions", "long_text_tools_active", "resolve_prompt_file", "resolve_prompt_references", "run_rg", "workspace_mount",
 ]

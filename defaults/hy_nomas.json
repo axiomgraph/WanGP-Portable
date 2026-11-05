@@ -1,0 +1,15 @@
+{
+    "model": {
+        "name": "Hy-Nomas World Model 8B",
+        "architecture": "hy_nomas",
+        "description": "Hy-Nomas makes explorable worlds at 24 fps: Generate creates a world from a description, optionally walked through with exploration instructions, then Explore in the Worlds gallery continues it as you move with the keyboard or type events, remembering places and characters. Each move takes a few seconds on a 24 GB GPU; the decoder weights are for non-commercial use.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Worlds/resolve/main/hy_nomas_distilled_int8.safetensors"
+        ]
+    },
+    "prompt": "{\"perspective_view\": \"third-person follow\", \"Style\": \"real-world footage\", \"subject_list\": [{\"subject_id\": \"<|Subject1|>\", \"display_name\": \"red fox\", \"subject_attribute\": \"A slender red fox with a thick russet coat, black legs, amber eyes and a bushy white-tipped tail, seen from behind a few meters ahead of the camera.\"}], \"segments\": [{\"start_time\": \"00:00.000\", \"end_time\": \"00:04.000\", \"visual_description_long\": \"A snowy pine forest at dawn. A narrow trail of trampled snow winds between tall dark pines whose branches are heavy with snow. Soft pink light filters through the trunks and long blue shadows stretch across the untouched snow on both sides of the trail. Small clumps of snow occasionally drop from the branches, and a thin mist hangs low between the trees in the distance. <Camera1>The camera tracks forward along the trail at a low height</Camera1>.\", \"description_change\": null, \"contained_actions\": []}]}",
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "video_length": 97,
+    "resolution": "832x480"
+}

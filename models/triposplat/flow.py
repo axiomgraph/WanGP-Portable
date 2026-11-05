@@ -9,13 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shared.kernels import ops
+from shared.utils.lora_mapping import convert_lora_keys
 from shared.utils.phase_progress import check_abort
 from .layers import EmbedderMLP, FeedForward, SelfAttention, layer_norm
-
-
-def fused_split_map(channels):
-    """mmgp split map of the fused upstream self-attention projection."""
-    return {"qkv": {"mapped_modules": ["q", "k", "v"], "split_sizes": [channels] * 3}}
 
 
 class RePo3DRotaryEmbedding(nn.Module):
@@ -71,12 +68,22 @@ class TransformerBlock(nn.Module):
             self.shift_table = nn.Parameter(torch.zeros(1, 6 * channels))
 
     def forward(self, x, mod, phases):
+        """x (1, tokens, channels), updated in place; mod (1, 6 * channels) or None for the context refiners."""
+        rows = x.view(-1, x.shape[-1])
+        fc1, fc2 = self.mlp.mlp[0], self.mlp.mlp[2]
         if not self.modulation:
-            x.add_(self.attn([layer_norm(x, self.norm1.weight, self.norm1.bias, self.norm1.eps)], phases))
-            return x.add_(self.mlp(layer_norm(x, self.norm2.weight, self.norm2.bias, self.norm2.eps)))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (m.unsqueeze(1) for m in (mod + self.shift_table.type(mod.dtype)).chunk(6, dim=1))
-        x.add_(self.attn([layer_norm(x).mul_(1 + scale_msa).add_(shift_msa)], phases).mul_(gate_msa))
-        return x.add_(self.mlp(layer_norm(x).mul_(1 + scale_mlp).add_(shift_mlp)).mul_(gate_mlp))
+            y = self.attn.attend([layer_norm(x, self.norm1.weight, self.norm1.bias, self.norm1.eps)], phases)
+            ops.linear_residual_(self.attn.output, [y.view(rows.shape)], rows)
+            del y
+            ops.mlp([layer_norm(rows, self.norm2.weight, self.norm2.bias, self.norm2.eps)], fc1, fc2, "gelu", residual=rows)
+            return x
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (mod + self.shift_table.type(mod.dtype)).chunk(6, dim=1)
+        spans = [(0, rows.shape[0], 0)]
+        y = self.attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], phases)
+        ops.gated_linear(self.attn.output, [y.view(rows.shape)], rows, gate_msa, spans)
+        del y
+        ops.mlp([ops.norm_modulate([rows], self.norm2, shift_mlp, scale_mlp, spans)], fc1, fc2, "gelu", residual=rows, gate=gate_mlp[0])
+        return x
 
 
 class CameraMLP(nn.Module):
@@ -90,6 +97,7 @@ class TripoSplatFlow(nn.Module):
                  num_blocks, num_heads, mlp_ratio):
         super().__init__()
         self.q_token_length, self.in_channels, self.cam_channels, self.model_channels = q_token_length, in_channels, cam_channels, model_channels
+        self.split_linear_modules_map = {"qkv": {"mapped_modules": ["q", "k", "v"], "split_sizes": [model_channels] * 3}}
         head_dim = model_channels // num_heads
         self.t_embedder = EmbedderMLP(model_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(model_channels, 6 * model_channels))
@@ -107,6 +115,9 @@ class TripoSplatFlow(nn.Module):
         self.shift_table = nn.Parameter(torch.zeros(1, 2, model_channels))
         self.out_layer = nn.Linear(model_channels, out_channels)
         self.cam_out_layer = nn.Linear(model_channels, cam_channels)
+
+    def preprocess_loras(self, model_type, state_dict):
+        return convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)
 
     def encode_context(self, feature1, feature2):
         """Image tokens after the context refiners (1, tokens, channels): DINOv3 features feature1 and FLUX.2 VAE latents feature2."""

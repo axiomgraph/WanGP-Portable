@@ -19,6 +19,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     kv_cache_int8: bool = False
+    kv_cache_layout: str = "int8"  # body formats and exact overlays of a quantized cache (kv_formats.parse_layout)
     kv_cache_initial_tokens: int = 0
     kv_cache_max_tokens: int = 0
     kv_cache_prompt_tokens: int = 0

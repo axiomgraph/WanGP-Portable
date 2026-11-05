@@ -28,6 +28,11 @@ def set_main_generation_running(state, running):
         else:
             gen.pop(_MAIN_PROCESS_RUNNING_KEY, None)
 
+def main_generation_running(state):
+    gen = get_gen_info(state)
+    with gen_lock:
+        return _main_generation_active_locked(gen)
+
 def any_GPU_process_running(state, process_id, ignore_main = False, *, wait_for_lock = False):
     gen = get_gen_info(state)
 #"process:" + process_id
@@ -110,6 +115,7 @@ def force_release_GPU_resident(state, process_id):
 
 
 def acquire_main_GPU_ressources(state):
+    """Claim the GPU for the main generation. False when the user aborts while another process holds it."""
     gen = get_gen_info(state)
     release_actions = []
     waiting_on = None
@@ -120,16 +126,19 @@ def acquire_main_GPU_ressources(state):
                 release_actions = _collect_resident_release_actions_locked(gen, requester_id="main")
                 set_generation_state(gen, process_status="process:main")
                 break
+            if gen.get("abort", False):
+                return False
             if process_status != waiting_on:
                 process_id = process_status.split(":", 1)[1]
-                process_name = gen[_PROCESS_NAMES_KEY][process_id]
-                set_generation_state(gen, status=f"Media generation is waiting for {process_name} to release GPU resources...")
+                wait_msg = f"Media generation is waiting for {gen[_PROCESS_NAMES_KEY][process_id]} to release GPU resources..."
                 waiting_on = process_status
+            set_generation_state(gen, status=wait_msg)  # restores it when a queued status message has replaced it
         time.sleep(0.1)
     _run_release_actions(release_actions)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    
+    return True
+
 def try_acquire_GPU_ressources(state, process_id, process_name):
     """Atomically claim an idle GPU, without suspending an active generation."""
     gen = get_gen_info(state)
@@ -147,7 +156,9 @@ def try_acquire_GPU_ressources(state, process_id, process_name):
     return True
 
 
-def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pause_msg = None, custom_wait_msg = None):
+def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pause_msg = None, custom_wait_msg = None, parks = False):
+    """parks: a generation running suspends at its next step with its models parked (their VRAM is reclaimed only as this process
+    allocates it, see mmgp offload.park) rather than unloaded; for processes whose VRAM goes through PyTorch's allocator."""
     gen = get_gen_info(state)
     original_process_status = None
     release_actions = []
@@ -184,6 +195,7 @@ def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pa
                     set_generation_state(gen, process_status="process:" + process_id)
                     break
                 original_process_status = process_status
+                gen["park_request"] = parks
                 set_generation_state(gen, process_status="request:" + process_id)
 
                 gen["pause_msg"] = custom_pause_msg if custom_pause_msg is not None else f"Generation Suspended while using {process_name}" 

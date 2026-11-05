@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "MOSS Image 5B Base",
+        "name": "Moss Image 5B Base",
         "architecture": "moss_image",
         "description": "MOSS-Image Base: text-to-image with natural-language, tag and layout prompts. 50 steps with CFG.",
         "URLs": [

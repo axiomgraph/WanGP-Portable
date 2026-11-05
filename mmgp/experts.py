@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from . import allocator, cuda_graphs, memory_pressure, runtime
+from . import allocator, cuda_graphs, memory_pressure, pinned, runtime
 from .read_ahead import cold_ranges, prefetch_ranges
 
 MARGIN = 512 << 20
@@ -96,6 +96,7 @@ class Residency:
         self.pressure_ceiling = None
         self.pinned = {}  # (bank, expert) -> checkpoint name -> pinned copy, the source of its uploads (pin())
         self._pinned_holder = None
+        self.upload_staging = [pinned.Buffer("experts") for _ in range(2)]  # the two locked buffers of _upload, kept until close()
         # Every prefix spreads individual experts across layers; no whole-bank minimum. With priorities, the most used experts of all
         # layers come first (equal priorities keep this order).
         self.ranking = [(bank, expert) for expert in range(max(bank.num_experts for bank in self.banks)) for bank in self.banks if expert < bank.num_experts]
@@ -111,6 +112,8 @@ class Residency:
     def close(self):
         self.unload()
         self.pinned, self._pinned_holder = {}, None
+        for buffer in self.upload_staging:
+            buffer.release()
         memory_pressure.unregister(self)
         for bank in self.banks:
             bank._residency = None
@@ -183,8 +186,8 @@ class Residency:
     def prepare(self, grow_only=False):
         """At a model/cycle boundary, after the ordinary preload has priority."""
         self.thread = threading.get_ident()
-        if self.changing:
-            return
+        if self.changing or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+            return  # never inside a graph capture (a decoding pass of a model called as a module): its next eager call places them
         if not self._nonexperts_resident():
             self.unload(reset=False)
             return
@@ -236,7 +239,10 @@ class Residency:
         Sources that a drive must read are read ahead in large requests, the next expert while the current one is copied (the parallel CPU
         copy would fault them in 64 KiB reads)."""
         size = max(UPLOAD_STAGING, 2 * max(self.sizes.values()))
-        staging = [torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True) for _ in range(2)]
+        with torch.inference_mode(False):  # reused by the uploads that follow, whatever their inference mode
+            staging = [buffer.get(size) for buffer in self.upload_staging]
+        if None in staging:
+            raise RuntimeError(f"Unable to lock {2 * size / 2**20:.0f} MB of RAM for the expert uploads of {self.model_id}")
         transfers = [torch.cuda.Event(), torch.cuda.Event()]
         slot, offset = 0, 0
 
@@ -264,9 +270,9 @@ class Residency:
                         continue
                     source = getattr(bank, name)[expert]
                     nbytes = source.numel() * source.element_size()
-                    pinned = staging[slot][offset:offset + nbytes].view(source.dtype).view(source.shape)
-                    pinned.copy_(source)
-                    tensors[name] = torch.empty_like(source, device="cuda").copy_(pinned, non_blocking=True)
+                    staged = staging[slot][offset:offset + nbytes].view(source.dtype).view(source.shape)
+                    staged.copy_(source)
+                    tensors[name] = torch.empty_like(source, device="cuda").copy_(staged, non_blocking=True)
                     offset += -(-nbytes // 64) * 64
                 bank._place(expert, tensors)
                 self.loaded[(bank, expert)] = None
@@ -286,8 +292,9 @@ class Residency:
         if auto_preload is not None:
             auto_preload.on_expert_change()
 
-    def on_pressure(self, need):
-        if need <= 0 or self.changing or self.thread != threading.get_ident() or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+    def on_pressure(self, need, parked=False):
+        # parked: its offload object is parked (offload.park), any thread may release its copies
+        if need <= 0 or self.changing or not parked and self.thread != threading.get_ident() or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
             return 0
         victims = [(bank, expert) for bank, expert in reversed(self.loaded) if not bank._leases]
         if not victims:

@@ -51,7 +51,7 @@ class MCPState:
             row = db.execute("SELECT snapshot FROM requests WHERE job_id=?", (job_id,)).fetchone()
             if row:
                 if snapshot.get("done"):
-                    snapshot = dict(snapshot, status="done")
+                    snapshot = dict(snapshot, status=snapshot.get("status", "done"))
                 db.execute("UPDATE requests SET snapshot=? WHERE job_id=?", (json.dumps({**json.loads(row[0]), **snapshot}, ensure_ascii=False), job_id))
 
     def get_job(self, job_id):

@@ -12,7 +12,14 @@ ADD_USER_SETTINGS_MODEL_TYPE = "__add_user_settings__"
 ADD_USER_SETTINGS_LABEL = "<Add User Settings>"
 NO_USER_SETTINGS_VALUE = "__no_user_settings__"
 NO_USER_SETTINGS_LABEL = "<No choice>"
-USER_SETTINGS_HINT_HTML = "<div style='font-size:10px;line-height:1;opacity:.65;'>* user settings</div>"
+USER_SETTINGS_HINT_HTML = "<div class='mf-hint'>* linked user settings</div>"
 MAX_STATUS_REFRESH_HZ = 3.0
 STATUS_REFRESH_INTERVAL_SECONDS = 1.0 / MAX_STATUS_REFRESH_HZ
 SUPPORTED_OUTPUT_CONTAINERS = SUPPORTED_VIDEO_CONTAINERS
+HIGH_OUTPUT_RESOLUTION_CHOICES = [("2160p", "2160p"), ("1440p", "1440p")]
+STANDARD_OUTPUT_RESOLUTION_CHOICES = [("1080p", "1080p"), ("900p", "900p"), ("720p", "720p"), ("540p", "540p"), ("480p", "480p"), ("384p", "384p"), ("320p", "320p"), ("256p", "256p")]
+SOURCE_AUDIO_TRACK_CHOICES = [("Auto", "")] + [(f"Audio Track {track_no}", str(track_no)) for track_no in range(1, 10)]
+
+
+def output_resolution_choices(server_config: dict) -> list[tuple[str, str]]:
+    return HIGH_OUTPUT_RESOLUTION_CHOICES + STANDARD_OUTPUT_RESOLUTION_CHOICES if server_config.get("enable_4k_resolutions", 0) == 1 else STANDARD_OUTPUT_RESOLUTION_CHOICES

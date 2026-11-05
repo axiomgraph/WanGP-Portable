@@ -93,7 +93,7 @@ def _caller(depth=2):
 
 def _install():
     import torch
-    from mmgp import offload
+    from mmgp import offload, pinned
     from . import debug, ram
 
     def patch(owner, name, make):
@@ -175,11 +175,11 @@ def _install():
         def wrapped(self):
             error = original(self)
             if int(error) == 0:
-                ring = isinstance(self.buffer, torch.Tensor)  # the staging ring; the pinned weights are NumPy arrays
+                ring = self.kind == "ring"
                 pooled = None if ring else getattr(_pool_thread, "owner", None)
                 with _lock:
                     registrations[self.pointer] = {"size": self.size, "cls": "pinned_ring" if ring else "pinned_mmgp", "pool": pooled is not None,
-                                                   "owner": "staging ring" if ring else pooled or _owner or "?", "t": time.perf_counter()}
+                                                   "owner": "staging ring" if ring else pooled or _owner or self.kind, "t": time.perf_counter()}
                 if ring:
                     record("ring", f"staging ring of {self.size / MB:.0f} MiB pinned")
             return error
@@ -218,8 +218,8 @@ def _install():
     patch(offload.offload, "unload_all", unload_all)
     patch(offload.offload, "release", release)
     patch(offload, "_pin_to_memory", pin_to_memory)
-    patch(offload._HostRegistration, "register", register)
-    patch(offload._HostRegistration, "close", close)
+    patch(pinned.Registration, "register", register)
+    patch(pinned.Registration, "close", close)
     patch(offload._PinnedPool, "_prepare", pool_prepare)
     patch(ram, "release", ram_release)
 

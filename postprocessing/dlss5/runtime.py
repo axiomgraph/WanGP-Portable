@@ -59,15 +59,21 @@ RAFT_ITERATIONS = 20
 _RAFT_MODELS = {}
 _DEPTH_MODELS = {}
 _GUIDE_OFFLOADS = {}
+_POSTPROCESSOR_CONFIG = {}
 
 
 def configure_depth_estimator(server_config):
-    global DEPTH_MODEL_VARIANT
+    global DEPTH_MODEL_VARIANT, _POSTPROCESSOR_CONFIG
     DEPTH_MODEL_VARIANT = server_config.get("depth_anything_v2_variant", "vitl")
+    _POSTPROCESSOR_CONFIG = server_config
 
 
 def _offload_guide_model(name, model):
-    offloadobj = offload.profile({"model": model}, loading_callback=loading_callback(), profile_no=3, quantizeTransformer=False, convertWeightsFloatTo=None, pinnedMemory=False, verboseLevel=-1)
+    from postprocessing.memory import configure
+
+    kwargs = {}
+    profile = configure(kwargs, _POSTPROCESSOR_CONFIG)
+    offloadobj = offload.profile({"model": model}, loading_callback=loading_callback(), profile_no=profile, quantizeTransformer=False, convertWeightsFloatTo=None, pinnedMemory=False, verboseLevel=-1, **kwargs)
     _GUIDE_OFFLOADS[name] = offloadobj
     offload_registry.register_offloadobj(name, offloadobj, release_flow_model)
 

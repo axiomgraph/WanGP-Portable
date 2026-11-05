@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -20,13 +20,13 @@ from anyio.from_thread import start_blocking_portal
 
 from shared.api import WanGPSession
 from shared.deepy import media_registry
-from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
+from shared.deepy.config import DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT, DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_auto_cancel_queue_tasks, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
 from shared.gradio import assistant_chat
 from shared.mcp.server import _compact_job_snapshot, build_inprocess_server, resolve_gallery_media_path
 from shared.mcp.resources import RESOURCE_ALIASES, RESOURCE_DESCRIPTION, query_resources, resource_record, _extract_markdown_sections, _select_markdown_sections, _search_markdown_sections, _resource_read_blocks
 
 
-PRIME_ASYNC_ENABLED = False
+REMOTE_JOB_WAIT_S = 600  # a remote engine's generation or post-processing call returns by then, its job still running
 
 
 def _resolve_external_stdio_command(value: str, allow_changed_path_search: bool = False) -> str:
@@ -78,8 +78,11 @@ def _mcp_connection_error_message(error: BaseException) -> str:
 class DeepyPrimeTools:
     _POLL_INTERVAL_SECONDS = 0.2
     _plugin_tools_by_name = {}
+    allow_async = False  # remote engines start jobs in the background (wait=false) and wait for them in bounded calls
+    _queue_on_server = False  # their jobs join the queue whether or not a turn is still running to forward them
 
-    def __init__(self, state: dict[str, Any], send_cmd: Callable[..., None], assistant_session, zero_tools=None) -> None:
+    def __init__(self, state: dict[str, Any], send_cmd: Callable[..., None], assistant_session, zero_tools=None, allow_async: bool = False) -> None:
+        self.allow_async = allow_async
         self.state = state
         self.send_cmd = send_cmd
         self.assistant_session = assistant_session
@@ -89,12 +92,15 @@ class DeepyPrimeTools:
         from shared.deepy import session_store
 
         base_policy = build_file_access_policy(zero_tools._server_config() if zero_tools is not None else get_deepy_runtime_config())
-        self._api_session = WanGPSession(webui_state=state, console_output=False, console_isatty=False)
+        self._api_session = WanGPSession(webui_state=state, console_output=False, console_isatty=False, webui_concurrent=allow_async)
         from shared.utils.workspace_storage import host_for_gen
         host = host_for_gen(state['gen'])
         if host is not None:
             self._api_session._workspace_id = host.deepy_workspace_id()
-        self._api_session._gradio_webui_context = {"defer_load_queue_trigger": True}
+        from shared.deepy.hybrid import service_for
+        service = service_for(state) if allow_async else None
+        self._queue_on_server = service is not None
+        self._api_session._gradio_webui_context = {"load_queue": service.load_inline_queue} if service is not None else {"defer_load_queue_trigger": True}
 
         workspace = session_store.session_workspace(assistant_session)
         if workspace is None:
@@ -103,15 +109,31 @@ class DeepyPrimeTools:
         if zero_tools is not None:
             zero_tools.file_access_policy_override = self.file_access_policy
         self.assistant_session.file_access_policy = self.file_access_policy
-        if getattr(self.assistant_session, "artifact_workspace", None) is None:
-            from shared.deepy.artifacts import ArtifactWorkspace
-            self.assistant_session.artifact_workspace = ArtifactWorkspace()
         self.allow_read_file_system = self.file_access_policy.read_enabled
         from shared.utils.plugins import get_deepy_prime_plugin_tools
 
         self._plugin_tools_by_name = {definition.name: definition for definition in get_deepy_prime_plugin_tools() if not definition.requires_file_system or base_policy.read_enabled}
         self._tool_progress_callback: Callable[..., None] | None = None
-        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, file_access_policy=self.file_access_policy, artifact_workspace=self.assistant_session.artifact_workspace, api_version="2.1", allow_async=PRIME_ASYNC_ENABLED)
+        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, file_access_policy=self.file_access_policy, api_version="2.1", allow_async=allow_async)
+        self._server._wangp_wait_interrupted = self._is_interrupted  # the chat Stop button ends a wait for jobs
+        if self._server._wangp_python_sandbox is not None:
+            sandbox = self._server._wangp_python_sandbox
+            sandbox.interrupted = self._is_interrupted  # the chat Stop button kills a running script
+            sandbox.call_tool = lambda name, arguments: self.call(name, arguments, inline=True)  # scripts call WanGP's tools with Prime's own bookkeeping
+            sandbox.progress = self._report_script_progress
+        if getattr(self._server, "_wangp_web_search", None) is not None:
+            self._server._wangp_web_search.progress = self._report_script_progress  # downloads and LoRA installs show a progress bar like scripts
+        plugins = getattr(self._server, "_wangp_plugins", None)
+        if plugins is not None:  # plugin actions stop with the chat Stop button, report on their card, call WanGP's tools re-entrantly and start the browser queue
+            plugins.interrupted = self._is_interrupted
+            plugins.progress = self._report_plugin_progress
+            plugins.call_tool = lambda name, arguments: self.call(name, arguments, inline=True, cascade=True)
+            plugins.trigger_queue = lambda job: self.send_cmd("load_queue_trigger", {"job_id": "", "token": job.webui_load_queue_token})
+        self._script_progress_target: Callable[..., None] | None = None  # the transcript entry of the running script, while one of its tool calls reports elsewhere
+        self._plugin_progress: tuple[str, dict[str, Any]] | None = None  # the last progress a running plugin action reported on its card
+        self._inline_calls = 0  # tool calls of a running script or plugin action: their generations report their steps
+        self.pause_runtime: Callable[..., None] | None = None  # set by the engine running this toolbox: releases Deepy's GPU before a script's GPU tool
+        self.run_script_tool: Callable[..., dict[str, Any]] | None = None  # set by the engine too: gives a script's tool call its own transcript card
         self._background_jobs = {}
         self._external_servers = normalize_deepy_prime_mcp_servers(get_deepy_config_value(DEEPY_PRIME_MCP_SERVERS_KEY, {}))
         self._auto_discover_mcp_paths = normalize_deepy_mcp_auto_discover_paths(get_deepy_config_value(DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT))
@@ -154,7 +176,10 @@ class DeepyPrimeTools:
             self._active_job_id = ""
             self._active_session_job = None
         for job in list(self._background_jobs.values()):
-            job.cancel()
+            with suppress(ValueError):  # a toolbox job that cannot be cancelled runs to completion
+                job.cancel()
+        if self._server._wangp_python_sandbox is not None:
+            self._server._wangp_python_sandbox.close()
         self._server._wangp_pages.close()
         self._request_queue.put(None)
         self._worker_future.result(timeout=30)
@@ -163,8 +188,15 @@ class DeepyPrimeTools:
 
     def cancel_active_job(self) -> str:
         job_id = str(self._active_job_id or "").strip()
+        background_id = ""
+        auto_abort = normalize_deepy_auto_cancel_queue_tasks(get_deepy_config_value(DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT))
+        for running_id, job in list(self._background_jobs.items()) if auto_abort else ():
+            if not job.done and not job.cancel_requested:
+                with suppress(ValueError):  # a toolbox job that cannot be cancelled runs to completion
+                    job.cancel()
+                    background_id = running_id
         if not job_id or self._active_job_cancel_requested:
-            return ""
+            return background_id
         self._active_job_cancel_requested = True
         try:
             if self._active_session_job is not None:
@@ -324,7 +356,7 @@ class DeepyPrimeTools:
                 payload = content_text
         if isinstance(payload, dict):
             normalized = dict(payload)
-            normalized.setdefault("status", "done")
+            normalized.setdefault("status", "running" if normalized.get("done") is False else "done")
         else:
             normalized = {"status": "done", "content": payload}
         normalized = self._enforce_output_budget(tool_name, self.file_access_policy.virtualize_result(normalized))
@@ -425,23 +457,6 @@ class DeepyPrimeTools:
                 page["next_offset"] = None
             if entries and len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) <= max_chars:
                 return page
-        if tool_name == "wangp_artifact" and isinstance(result.get("items"), list) and result["items"]:
-            page = dict(result)
-            source_items = page["items"]
-            items = page["items"] = []
-            offset = int(page.get("offset", 0) or 0)
-            for item in source_items:
-                items.append(item)
-                page.update(count=len(items), has_more=True, next_offset=offset + len(items))
-                if len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) > max_chars:
-                    items.pop()
-                    page.update(count=len(items), next_offset=offset + len(items))
-                    break
-            page["has_more"] = bool(result.get("has_more")) or len(items) < len(source_items)
-            if not page["has_more"]:
-                page["next_offset"] = None
-            if items and len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) <= max_chars:
-                return page
         return {
             "status": "error",
             "tool": tool_name,
@@ -455,6 +470,29 @@ class DeepyPrimeTools:
     def _update_tool_progress(self, status: str, status_text: str, result: dict[str, Any]) -> None:
         if callable(self._tool_progress_callback):
             self._tool_progress_callback(status=status, status_text=status_text, result=self.file_access_policy.virtualize_result(result))
+
+    def _report_script_progress(self, status_text: str, summary: dict[str, Any]) -> None:
+        """Live status of a running Python script on its own transcript entry (its tool calls report to the script, not to that entry)."""
+        target = self._script_progress_target or self._tool_progress_callback
+        if callable(target):
+            target(status="running", status_text=status_text, result=self.file_access_policy.virtualize_result(summary))
+
+    def _report_plugin_progress(self, status_text: str, summary: dict[str, Any]) -> None:
+        self._plugin_progress = (status_text, summary)
+        self._update_tool_progress("running", status_text, summary)
+
+    def _cascade_plugin_progress(self, result: dict[str, Any] | None) -> None:
+        """A generation run by a plugin action moves the action's own bar: done of total items plus the running item's fraction."""
+        inner = (result or {}).get("progress") if isinstance(result, dict) else None
+        if not isinstance(inner, dict) or not inner.get("total"):
+            return
+        status_text, summary = self._plugin_progress or ("Running", {"status": "running", "live": True})
+        outer = dict(summary.get("progress") or {"done": 0, "total": 1, "text": ""})
+        total = float(outer.get("total") or 1)
+        fraction = max(0.0, min(1.0, float(inner.get("done") or 0) / float(inner["total"])))
+        outer["done"] = round(min(total, float(outer.get("done") or 0) + fraction), 3)
+        outer["total"] = total
+        self._report_script_progress(status_text, {**summary, "progress": outer})
 
     @staticmethod
     def _finalize_generation_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -472,17 +510,24 @@ class DeepyPrimeTools:
             return initial
         self._active_job_id = job_id
         self._active_job_cancel_requested = False
-        queue_triggered = False
+        queue_triggered = self._queue_on_server
         cancel_requested = False
         snapshot = initial
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         from shared.deepy.media_pause import MediaToolPause
         job = self._server._wangp_jobs.get(job_id).job
+        reported = 0.0
         try:
             with MediaToolPause(self.assistant_session, self.state["gen"], job.webui_client_ids, self.send_cmd) as media_pause:
                 while True:
                     media_pause.poll()
-                    if snapshot.get("webui_submission_ready") and not queue_triggered:
+                    live = snapshot.get("progress") if self._inline_calls else None
+                    if isinstance(live, dict) and live.get("progress") is not None and time.monotonic() - reported >= 0.34 and not snapshot.get("done"):
+                        # A script's or plugin action's generation shows its steps (the status bar's second line, and the action's bar).
+                        reported = time.monotonic()
+                        text = str(live.get("status") or live.get("phase") or "Running")[:120]
+                        self._update_tool_progress("running", text, {"status": "running", "job_id": job_id, "progress": {"done": round(float(live["progress"]), 1), "total": 100, "text": text}})
+                    if snapshot.get("webui_submission_ready") and not queue_triggered and not (cancel_requested or job.cancel_requested or self._is_interrupted()):  # a stopped job never reaches the queue
                         self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": snapshot.get("webui_load_queue_token", "")})
                         queue_triggered = True
                         self._update_tool_progress("running", "Running", {"status": "running", "job_id": job_id})
@@ -511,9 +556,9 @@ class DeepyPrimeTools:
         return str(self._server_instructions or "").strip()
 
     def get_remote_execution_instructions(self) -> str:
-        if PRIME_ASYNC_ENABLED:
-            return ""
-        return "WanGP waits for generation and post-processing internally and returns their results; do not poll jobs."
+        return (f"wangp_generate and wangp_postprocess wait for their job for up to {REMOTE_JOB_WAIT_S} seconds, or timeout_s when shorter. A job still running then returns status timeout with its job_id and keeps running: "
+                "follow it with wangp_session wait_jobs or get_job, and never submit it again. With wait=false they return the job_id at once, so you can start several jobs and keep working; wangp_toolbox and wangp_plugins accept wait=false too. "
+                "Before your final answer, wait for the jobs whose results you still need and report the rest as running.")
 
     def get_runtime_context(self) -> str:
         from shared.deepy.ui_settings import normalize_assistant_tool_ui_settings
@@ -535,7 +580,7 @@ class DeepyPrimeTools:
             f"Use properties defined in template settings files: {bool(settings['use_template_properties'])}.",
         ]
         if settings["use_template_properties"]:  # named as settings: "width" and "height" are not setting names
-            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user asks for an override.")
+            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user or the task states otherwise (a production brief's format, for instance).")
         else:
             lines.extend([
                 f"Default resolution: \"{int(settings['width'])}x{int(settings['height'])}\".",
@@ -544,6 +589,7 @@ class DeepyPrimeTools:
                 f"Default seed: {int(settings['seed'])}.",
             ])
             lines.append("Override compatible template/model defaults with the resolution, video_length, duration_seconds and seed above when the user does not specify them.")
+        lines.append("A supplied speech or song that must be heard whole sets video_length instead: its duration in seconds, such as \"10.2s\", which WanGP fits to the model's frame steps.")
         lines.append("The generate tool fills omitted dimensions, duration, and seed from Deepy's standing defaults before model factory defaults; pass the template values explicitly to preserve them.")
         return "\n".join(lines)
 
@@ -570,7 +616,6 @@ class DeepyPrimeTools:
             "wangp_session": ("action",),
             "wangp_toolbox": ("action",),
             "wangp_io": ("action",),
-            "wangp_artifact": ("action", "arguments"),
         }.get(str(tool_name or "").strip(), ())
 
     @staticmethod
@@ -648,7 +693,46 @@ class DeepyPrimeTools:
         finish = assistant_chat._finish_tool_call_label
         short = assistant_chat._short_tool_label_value
         humanize = assistant_chat._humanize_tool_value
-        if tool_name in {"wangp_toolbox", "wangp_io", "wangp_artifact"}:
+        if tool_name == "wangp_python":
+            action = str(arguments.get("action", "") or "").strip()
+            action_arguments = arguments.get("arguments")
+            if not action and isinstance(action_arguments, dict) and isinstance(action_arguments.get("code"), str):
+                action = "run"  # code alone is a run
+            if not action:
+                return "Explore Python Sandbox"
+            action = {"execute": "run", "exec": "run", "run_code": "run", "run_python": "run", "python": "run", "code": "run", "reset": "restart", "reboot": "restart", "list_sandbox": "files"}.get(action, action)
+            label = {"run": "Python", "restart": "Restart Python Sandbox", "files": "List Sandbox Files"}.get(action, f"Python {humanize(action)}")
+            if action_arguments is None:
+                return f"Get {label} Schema"
+            if action == "run" and isinstance(action_arguments, dict):
+                first = next((line.strip() for line in str(action_arguments.get("code", "") or "").splitlines() if line.strip()), "")
+                title = " ".join(first.lstrip("# ").split())  # a title, not a path: keep "videos in @outputs/aaa" whole
+                if first.startswith("#") and title:
+                    return finish(f"Python: {title if len(title) <= 72 else title[:71].rstrip() + '…'}")
+            return label
+        if tool_name == "wangp_plugins":
+            from shared.mcp.plugin_toolbox import transcript_label
+
+            return transcript_label(arguments, humanize)
+        if tool_name == "wangp_validate" and isinstance(arguments.get("settings"), list) and len(arguments["settings"]) > 1:
+            return f"Validate {len(arguments['settings'])} Tasks"
+        if tool_name == "wangp_web_search":
+            action = str(arguments.get("action", "") or "").strip()
+            action_arguments = arguments.get("arguments")
+            if not action:
+                return "Explore Web Search"
+            label = {"search": "Search the Web", "news": "Search the News", "images": "Search Images", "videos": "Search Videos", "open": "Open Web Page", "download": "Download from the Web", "screenshot": "Screenshot Web Page", "cookies": "Manage Web Cookies", "lora_search": "Search LoRAs", "lora_install": "Install LoRA"}.get(action, f"Web {humanize(action)}")
+            if action_arguments is None:
+                return f"Get {label} Schema"
+            if isinstance(action_arguments, dict):
+                if action in ("open", "download") and isinstance(action_arguments.get("url"), str):
+                    return finish(f"{label}: {short(action_arguments['url'].split('//', 1)[-1].split('/', 1)[0], 72)}")
+                if action == "lora_install" and isinstance(action_arguments.get("id"), str):
+                    return finish(f"{label}: {short(action_arguments['id'], 72)}")
+                if isinstance(action_arguments.get("query"), str):
+                    return finish(f"{label}: {short(action_arguments['query'], 72)}")
+            return label
+        if tool_name in {"wangp_toolbox", "wangp_io"}:
             action = str(arguments.get("action", "") or "").strip()
             action_arguments = arguments.get("arguments")
             if tool_name == "wangp_io":
@@ -666,19 +750,6 @@ class DeepyPrimeTools:
                         return finish(f"{label}: {action_arguments.get('command', action_arguments.get('arguments', ''))}")
                     return finish(f"{label} in {short(action_arguments.get('path', action_arguments.get('file_path')))}")
                 return assistant_chat.build_io_tool_call_label(action, action_arguments if "arguments" in arguments else None)
-            if tool_name == "wangp_artifact":
-                if not action and isinstance(action_arguments, dict):
-                    nested_action = str(action_arguments.get("action", "") or "").strip()
-                    if nested_action and isinstance(action_arguments.get("arguments"), dict):
-                        action, action_arguments = nested_action, action_arguments["arguments"]
-                    elif not action_arguments:
-                        action = "list"
-                if action == "list" and isinstance(action_arguments, dict):
-                    return "List Artifacts"
-                if not action and "arguments" in arguments:
-                    return "Artifact Request"
-                action_label = {"prepare": "Load Next Workflow Item", "commit_item": "Commit Workflow Item", "query": "Query Exact Artifact Data", "update_ledger": "Update Ledger Artifact"}.get(action, action.replace("_", " ").title())
-                return "List Artifact Actions" if not action else f"Get {action_label} Schema" if "arguments" not in arguments else action_label
             if not action:
                 return "List Toolbox Content"
             if action == "media_settings":
@@ -758,6 +829,10 @@ class DeepyPrimeTools:
         plugin_tool = self._plugin_tools_by_name.get(tool_name)
         if plugin_tool is not None:
             return {"pause_runtime": plugin_tool.pause_runtime, "pause_reason": plugin_tool.pause_reason}
+        if tool_name == "wangp_plugins":
+            from shared.mcp.plugin_toolbox import call_policy
+
+            return call_policy(call_arguments)
         if tool_name == "wangp_generate":
             return {"pause_runtime": isinstance(call_arguments.get("settings"), (dict, list, str)), "pause_reason": "tool"}
         if tool_name == "wangp_postprocess":
@@ -767,8 +842,6 @@ class DeepyPrimeTools:
             if not action or call_arguments.get("arguments") is None:
                 return {"pause_runtime": False, "pause_reason": "tool"}
             return {"pause_runtime": False, "pause_reason": "tool"} if action == "media_settings" else self._zero_tools.get_tool_policy(action, call_arguments["arguments"])
-        if tool_name in {"wangp_io", "wangp_artifact"}:
-            return {"pause_runtime": False, "pause_reason": "tool"}
         return {"pause_runtime": False, "pause_reason": "tool"}
 
     def validate_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> str:
@@ -778,8 +851,28 @@ class DeepyPrimeTools:
         parameters = schema["function"].get("parameters", {})
         properties = parameters.get("properties", {})
         toolbox = "action" in properties and "arguments" in properties
+        inner = arguments.get("arguments")
+        if toolbox and isinstance(inner, dict) and inner.get("action") == arguments.get("action") is not None and set(inner) == {"action", "arguments"} and isinstance(inner["arguments"], dict):
+            arguments["arguments"] = inner = inner["arguments"]  # the whole call repeated inside arguments under the same action
+        if toolbox and arguments.get("action") is not None and isinstance(inner, dict) and "arguments" in inner and inner["arguments"] is None:
+            arguments["arguments"] = inner = None  # the action's contract, asked for with its null written one level too deep
+        if toolbox and arguments.get("action") is None and isinstance(inner, dict):
+            if set(arguments) == {"arguments"} and set(inner) & set(properties) - {"action", "arguments"} and set(inner) <= set(properties):
+                arguments.pop("arguments")  # the whole call nested in arguments with its other top-level parameters (wangp_plugins' plugin)
+                arguments.update(inner)
+                inner = arguments.get("arguments")
+            if isinstance(inner, dict) and set(inner) == {"arguments"} and isinstance(inner["arguments"], dict):
+                arguments["arguments"] = inner = inner["arguments"]  # arguments nested twice
+            if isinstance(inner, dict) and isinstance(inner.get("action"), str) and set(inner) <= {"action", "arguments"}:
+                arguments.update(action=inner["action"], arguments=inner.get("arguments", {}))  # the whole call nested in arguments: unwrap it
+            elif isinstance(inner, dict) and isinstance(inner.get("action"), str):
+                arguments["action"] = inner.pop("action")  # the action written among its own arguments
         unknown = set(arguments) - set(properties)
-        if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
+        if set(properties) == {"action", "arguments"} and isinstance(arguments.get("arguments"), dict) and unknown and not unknown & set(arguments["arguments"]):
+            for name in unknown:  # action parameters written beside action and arguments, checked there by the action's schema (a flat call stays refused)
+                arguments["arguments"][name] = arguments.pop(name)
+            unknown = set()
+        if not self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess"}:
             unknown -= {"wait", "timeout_s", "event_limit"}
         unknown = sorted(unknown)
         if unknown and (toolbox or parameters.get("additionalProperties") is False):
@@ -802,18 +895,26 @@ class DeepyPrimeTools:
                 continue
             if isinstance(decoded, dict) and "object" in kinds or isinstance(decoded, list) and "array" in kinds:
                 arguments[name] = decoded
-        if toolbox and tool_name != "wangp_artifact" and arguments.get("arguments") is not None:
+        if tool_name == "wangp_python" and not arguments.get("action") and isinstance(arguments.get("arguments"), dict) and isinstance(arguments["arguments"].get("code"), str):
+            arguments["action"] = "run"  # code alone can only mean a run
+        if tool_name == "wangp_web_search" and not arguments.get("action") and isinstance(arguments.get("arguments"), dict):
+            if isinstance(arguments["arguments"].get("url"), str):
+                arguments["action"] = "open"
+            elif isinstance(arguments["arguments"].get("query"), str):
+                arguments["action"] = "search"
+        if toolbox and arguments.get("arguments") is not None:
             nested = arguments["arguments"]
             if not isinstance(nested, dict):
                 hint = ' For rg, use {"action":"rg","arguments":{"command":"-n pattern -- @documents/file.txt"}}.' if tool_name == "wangp_io" and arguments.get("action") == "rg" else ""
                 return 'arguments must be an object: {"action":"<action>","arguments":{...}}.' + hint
             if not arguments.get("action") and nested:
-                return 'action belongs at the top level, beside arguments: {"action":"<action>","arguments":{...}}. Nothing was executed.'
-        if tool_name == "wangp_artifact" and "arguments" in arguments and not isinstance(arguments["arguments"], dict):
-            raw_arguments = arguments["arguments"]
-            if isinstance(raw_arguments, str) and "\\'" in raw_arguments:
-                return "Artifact arguments are malformed JSON: \\' is not a valid JSON escape. Write apostrophes directly inside double-quoted JSON strings, then repeat the call with arguments as an object. This is not a payload-size limit."
-            return "Artifact arguments must be a JSON object, not a JSON string. This is malformed call syntax, not a payload-size limit; repeat action and arguments as separate top-level tool parameters."
+                if tool_name == "wangp_plugins":  # name the plugin's call as it should be written, with the caller's own plugin
+                    plugin = json.dumps(arguments.get("plugin") or "<plugin>")
+                    return (f'No action was named. Write the call flat, the action beside plugin and arguments: {{"plugin": {plugin}, "action": "<action>", "arguments": {{...}}}}; '
+                            f'{{"plugin": {plugin}}} alone lists its actions. Nothing was executed.')
+                likely = next((hint for key, hint in (("old_string", "edit"), ("text", "write_text (mode 'overwrite' replaces a file) or append_text"), ("command", "rg")) if key in nested), "")
+                return ('No action was named: write it at the top level, beside arguments: {"action":"<action>","arguments":{...}}' + (f"; with these arguments: {likely}" if likely and tool_name == "wangp_io" else "")
+                        + ". Nothing was executed.")
         for parameter_name in parameters.get("required", []) or []:
             if parameter_name not in arguments or arguments[parameter_name] is None:
                 return f"{parameter_name} is required."
@@ -838,18 +939,70 @@ class DeepyPrimeTools:
 
         def finish():
             try:
-                if record.job.wait_for_webui_submission_or_completion() and trigger_queue and not record.job.done and not record.job.cancel_requested:
+                if record.job.wait_for_webui_submission_or_completion() and trigger_queue and not self._queue_on_server and not record.job.done and not record.job.cancel_requested:
                     self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": record.job.webui_load_queue_token})
-                record.job.result()
+                record.wait()
                 self._remember_generated_media(record.snapshot(event_limit=0))
             finally:
                 self._background_jobs.pop(job_id, None)
 
         threading.Thread(target=finish, name=f"deepy-job-{job_id}", daemon=True).start()
 
-    def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call(self, tool_name: str, arguments: dict[str, Any], *, inline: bool = False, cascade: bool = False) -> dict[str, Any]:
+        """Execute a tool as the model would. inline=True serves a sandbox script: the call is validated here and the WanGP tool runs on this thread,
+        because the MCP request loop is busy running the script that asks; it gets its own transcript card below the script's (run_script_tool,
+        set by the engine), its progress also feeds the script's live summary, and everything after execution (generation waits, media bookkeeping) is shared."""
+        if not inline:
+            if tool_name == "wangp_plugins":
+                self._plugin_progress = None  # a new action starts its card's progress afresh
+            result = self._call(tool_name, arguments)
+            self._hint_script_loop(tool_name, arguments, result)
+            self._hint_repeated_failure(tool_name, arguments, result)
+            return result
+        arguments = dict(arguments)
+        if tool_name == "wangp_web_search" and tool_name not in self._tool_defs_by_name:  # say why, or the model searches the docs for another way online
+            return {"status": "error", "tool": tool_name, "error": "Web search is turned off, so scripts cannot reach the web: tell the user it can be enabled in Configuration > Deepy (Enable Web Search). There is no other way online."}
+        problem = self.validate_tool_call(tool_name, arguments)
+        route = self._tool_routes.get(tool_name)
+        if problem or route is None or route[0] != "wangp":
+            return {"status": "error", "tool": tool_name, "error": problem or f"{tool_name} is not one of WanGP's own tools."}
+        policy = self.get_tool_policy(tool_name, arguments)
+        if policy["pause_runtime"] and self.pause_runtime is not None:  # Deepy still holds the GPU while its script runs: a generation would wait for it forever
+            self.pause_runtime(pause_reason=policy["pause_reason"])  # saves Deepy's state and unloads it; "vision" keeps the text model when it fits
+        sandbox = self._server._wangp_python_sandbox
+
+        def run(progress: Callable[..., None]) -> dict[str, Any]:
+            def inner(status=None, status_text=None, result=None):
+                sandbox.inner_status(str(status_text or ""))
+                progress(status, status_text, result)
+                if cascade:  # cascade=True: a plugin action's tool call, whose generation steps also move the action's bar
+                    self._cascade_plugin_progress(result)
+
+            saved = self._tool_progress_callback, getattr(self._zero_tools, "_tool_progress_callback", None)
+            self._script_progress_target, self._tool_progress_callback = saved[0], inner
+            self._inline_calls += 1
+            web = getattr(self._server, "_wangp_web_search", None)
+            if web is not None:  # a download's progress goes to its own card, not to the script's
+                web.progress = lambda status_text, summary: inner("running", status_text, self.file_access_policy.virtualize_result(summary))
+            if self._zero_tools is not None:
+                self._zero_tools._tool_progress_callback = inner
+                self._zero_tools._set_status = lambda text=None, kind="working": progress(None, text, None)  # the status bar keeps the script on its first line, the tool on its second
+            try:
+                return self._call(tool_name, arguments, route=route)
+            finally:
+                self._inline_calls -= 1
+                self._tool_progress_callback, self._script_progress_target = saved[0], None
+                if web is not None:
+                    web.progress = self._report_script_progress
+                if self._zero_tools is not None:
+                    self._zero_tools._tool_progress_callback = saved[1]
+                    self._zero_tools.__dict__.pop("_set_status", None)
+
+        return run(lambda *_args: None) if self.run_script_tool is None else self.run_script_tool(tool_name, arguments, run)
+
+    def _call(self, tool_name: str, arguments: dict[str, Any], route: tuple[str, str] | None = None) -> dict[str, Any]:
         ignored = []
-        if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
+        if not self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess"}:
             arguments = dict(arguments)
             if isinstance(arguments.get("arguments"), dict):
                 arguments["arguments"] = dict(arguments["arguments"])
@@ -860,23 +1013,66 @@ class DeepyPrimeTools:
                             values.pop(name)
                             if name not in ignored:
                                 ignored.append(name)
-        result = self._call_mcp_tool(tool_name, arguments)
+        if route is not None:  # inline: run the WanGP tool on this thread
+            from shared.mcp.server import call_tool_inline
+
+            self._remember_gallery_input_references(tool_name, arguments)
+            result = self.file_access_policy.virtualize_result(call_tool_inline(self._server, route[1], arguments))
+            self._remember_gallery_download_references(tool_name, result)
+        else:
+            result = self._call_mcp_tool(tool_name, arguments)
         if tool_name in {"wangp_generate", "wangp_postprocess"} and result.get("job_id") and not result.get("recovered"):
             from shared.mcp.v2 import JOB_CONTROLS
 
             # job controls sit at the top level; post-processing calls may still carry them inside arguments
             action_arguments = arguments if tool_name == "wangp_generate" else {**{key: value for key, value in arguments["arguments"].items() if key in JOB_CONTROLS}, **{key: arguments[key] for key in JOB_CONTROLS if key in arguments}}
             if action_arguments.get("wait", True):
-                result = self._wait_for_generation(result, action_arguments.get("timeout_s"), action_arguments.get("event_limit", 0))
+                timeout_s = action_arguments.get("timeout_s")
+                if self.allow_async and route is None:  # scripts and plugin actions wait for their own calls to end
+                    timeout_s = REMOTE_JOB_WAIT_S if timeout_s is None else min(timeout_s, REMOTE_JOB_WAIT_S)
+                result = self._wait_for_generation(result, timeout_s, action_arguments.get("event_limit", 0))
+                if result.get("waiting_timed_out"):
+                    result["info"] = "The job keeps running: follow it with wangp_session wait_jobs. Do not submit it again."
             else:
                 self._watch_background_job(result["job_id"])
+        elif tool_name in {"wangp_toolbox", "wangp_plugins"} and isinstance(result, dict) and result.get("job_id") and not result.get("done"):  # stops with the chat Stop button
+            self._background_jobs = {job_id: job for job_id, job in self._background_jobs.items() if not job.done}
+            self._background_jobs[result["job_id"]] = self._server._wangp_jobs.get(result["job_id"]).job
         if ignored:
             result["info"] = f"Ignored {', '.join(ignored)}: WanGP manages waiting for generation and post-processing."
         self._remember_generated_media(result)
+        if self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess", "wangp_session"}:  # the browser-queue handshake of running jobs is not for the model
+            for job in (result, *result.get("jobs", [])):
+                job.pop("webui_submission_ready", None)
+                job.pop("webui_load_queue_token", None)
         if tool_name in {"wangp_generate", "wangp_postprocess"}:
             from shared.mcp.v2 import public_media_result
             result = public_media_result(result)
         return self.file_access_policy.virtualize_result(result)
+
+    def _hint_script_loop(self, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        """The model's fourth successful call in a row of one toolbox or file action says once that a Python script loops over the remaining items in
+        one call. Failed calls do not count: retries of one call are not items of a batch."""
+        if isinstance(result, dict) and result.get("status") == "error":
+            return
+        action = arguments.get("action") if isinstance(arguments.get("arguments"), dict) else None
+        key = (tool_name, action)
+        count = self._action_streak[1] + 1 if getattr(self, "_action_streak", (None, 0))[0] == key else 1
+        self._action_streak = (key, count)
+        if count == 4 and action and tool_name in {"wangp_toolbox", "wangp_io"} and "wangp_python" in self._tool_defs_by_name and isinstance(result, dict):
+            helper = "wangp.io" if tool_name == "wangp_io" else "wangp.toolbox"
+            result["hint"] = (str(result.get("hint") or "") + f" Fourth {action} call in a row: for the remaining items, one wangp_python script can loop over them ({helper}({action!r}, ...) per item, wangp.progress) and return only the summary, instead of one call each.").strip()
+
+    def _hint_repeated_failure(self, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        """A failed call identical to the previous failed one: smaller models copy their last call instead of changing it, so the result says so
+        and names what the call holds (a missing argument is then visible)."""
+        failed = isinstance(result, dict) and result.get("status") == "error"
+        signature = (tool_name, json.dumps(arguments, sort_keys=True, default=str)) if failed else None
+        repeated = failed and signature == getattr(self, "_last_failed_call", None)
+        self._last_failed_call = signature
+        if repeated:
+            sent = arguments["arguments"] if isinstance(arguments.get("arguments"), dict) else arguments
+            result["hint"] = (str(result.get("hint") or "") + f" This call is identical to your previous one, which failed the same way: change the call itself before retrying. It holds only {', '.join(sorted(sent)) or 'nothing'}.").strip()
 
     def _get_selected_media_record_from_source(self, source: str, requested_media_type: str = "all"):
         return None, None
