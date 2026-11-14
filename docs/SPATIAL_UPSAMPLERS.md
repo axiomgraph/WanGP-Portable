@@ -1,6 +1,6 @@
 # Spatial Upsampler / Visual Refiner Plugin API
 
-Spatial upsamplers and visual refiners (Lanczos, FlashVSR, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
+Spatial upsamplers and visual refiners (Lanczos, FlashVSR, RelayVSR, SeedVR2, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
 Chain-of-Zoom, VAE upscalers, ...) are
 registered in `postprocessing/spatial_upsamplers.py`. Each upsampler declares itself and its
 capabilities through a handler object; the registry owns dropdown state, value
@@ -46,6 +46,12 @@ running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
+FlashVSR remembers what it computed for the last frames of the video so far.
+With **Configuration > Extensions > Postprocessor VRAM Usage** set to **Minimum**,
+that memory stays in RAM and the GPU holds one layer of it at a time, the least
+VRAM. With **Manual Choice** or **Dynamic** it stays in VRAM as far as the VRAM
+allows, which speeds the upscaling further.
+
 ## SeedVR2 Models
 
 SeedVR2 3B and SeedVR2 7B have separate selections, and
@@ -58,6 +64,35 @@ INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
 restores the saved model even when the configuration hides it. Existing
 `seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
 SeedVR2 processes use the configured model.
+
+## RelayVSR
+
+RelayVSR restores detail while upscaling real-world and generated video,
+several times faster than FlashVSR+ Turbo. Every 15 frames a one-step
+Wan 2.2 5B model generates a detailed keyframe; a small decoder then carries
+the detail of the two keyframes around each frame to every frame. Images are
+processed as one-frame videos.
+
+It has two models. The x4 model serves the ratios above x2. **RelayVSR X2**,
+LightX2V's native x2 version, serves x1 to x2: it does a quarter of the x4
+model's work with a quarter of its memory, more than twice as fast. Other ratios
+are resized from the model's output. **Configuration > Extensions > RelayVSR >
+RelayVSR Model For Upscaling Up To x2** can use the x4 model there instead,
+resized down. Each model downloads on its first use.
+
+Its memory grows with the size of the source, not with the length of the
+video: the keyframe model remembers its last four keyframes, in INT8, about
+4.6 GB for an 832x480 source and 10.5 GB for 1280x720 with the x4 model, a
+quarter of that with RelayVSR X2. Where it lives follows
+**Configuration > Extensions > Postprocessor VRAM Usage**:
+- **Minimum** keeps it in RAM: the GPU holds one layer of it at a time, the
+  least VRAM, at some cost in speed (each layer is brought in as it runs).
+- **Manual Choice** and **Dynamic** keep it in VRAM as far as the VRAM allows,
+  the rest in RAM, brought to the GPU ahead of each layer, which costs little
+  speed: a source whose memory exceeds the GPU's still runs.
+
+RelayVSR suits sources up to about 540p at x4, and larger ones at x2. Its
+keyframe models download in INT8, whatever the transformer quantization.
 
 ## Handler contract
 
@@ -98,6 +133,7 @@ class MyUpsampler:
     def split_value(self, value): ...                      # -> (method, scale) or None
     def build_value(self, method, scale): ...              # -> value or None
     def validate_upsampling(self, value, image_mode): ...  # -> "" or error text
+    def query_chunking(self, value): ...                   # optional: how a long video is processed by chunks (see Long videos)
     # postprocessing type only:
     def upscale(self, sample, value, *, seed, ..., abort_callback, progress_callback): ...
     # progress_callback(phase, current=None, total=None, unit=None): unit (e.g. "tiles") labels the counter, default "steps"
@@ -166,6 +202,69 @@ not affect method lookup, metadata labels, API discovery or execution. Media
 compatibility, model exclusions and `method_available(method)` still apply;
 restoring a hidden choice never makes an unavailable method usable. Handlers
 without this hook show all their available methods.
+
+### Long videos: chunk rules
+
+A long video is upsampled a chunk at a time, so that it never has to fit in
+memory: in Late Post Processing, for the Source Video of a continued
+generation, and in Media Flow. WanGP does not know any upsampler: each one
+declares how its chunks are cut and joined through `query_chunking(value)`,
+which returns an object with the fields below. Every field is optional. An
+upsampler without `query_chunking` receives its video in one piece.
+
+| Field | Meaning |
+|---|---|
+| `get_chunk_frames(frames_count)` | Frames of a chunk when the model has a window of its own. Without it WanGP sizes the chunks by memory (Media Flow: the user's Chunk Size). |
+| `chunk_frame_step` | Chunks sized by WanGP hold `n * chunk_frame_step + 1` frames. Default 1. |
+| `minimum_requested_frames` | Fewest frames of a chunk. Default 1. |
+| `overlap_frames`, `get_overlap_frames(chunk_frames)` or `get_overlap_frames_for_target(chunk_frames, value)` | Source frames a chunk shares with the one before it. Default 0. |
+| `crossfade_overlap_outputs` | `True`: the shared frames fade from the previous chunk's output to this one's. `False` (default): they are this chunk's. |
+| `overlap_output_split(overlap_frames)` | With `crossfade_overlap_outputs`: how many shared frames are kept from the previous chunk, the others being this chunk's. `None` fades. |
+| `output_write_range(returned_frames, source_write_start=, source_write_end=, next_overlap_frames=)` | The output frames kept from a chunk, for an upsampler that does not return one frame per source frame. |
+| `carries_cache(value)` | `True`: `upscale()` is called with `return_continue_cache=True`, and what it returns beside the frames reaches the next chunk as `continue_cache`. |
+| `release_continue_cache()` | Called after the last chunk, or when the video is stopped. |
+
+Each chunk is one `upscale()` call, which also receives `frame_offset`, the
+place of its first frame in the video. Choose the join that matches the model:
+
+- **Frames that do not depend on their neighbours** (a resize): return
+  `postprocessing.chunking.FRAME_BY_FRAME`. Any chunk gives the frames of the
+  whole video.
+- **Independent runs that invent detail:** declare a few `overlap_frames` and
+  `crossfade_overlap_outputs = True`, so that the texture of one chunk turns
+  into the next one's over the shared frames instead of changing in one frame.
+- **A model that continues from its own state:** declare `carries_cache` and
+  hand that state from chunk to chunk. No fade is needed when the shared frames
+  come out the same in both chunks.
+- **A model that builds each frame from the ones before it, without a state to
+  hand over:** a chunk starts cold. Share enough frames for it to settle and
+  fade them (`crossfade_overlap_outputs = True`); DLSS 5 shares 16. One shared
+  frame leaves a visible change at every chunk start.
+
+Check a declaration on the real model: process a video by chunks and in one
+piece, then compare the change from frame to frame across each chunk start.
+
+A video that fits in memory is still processed in one call. Upsamplers that
+declare `source_audio_conditioning` also receive their video in one piece, and
+so does a video going through a frame interpolator and an upsampler that both
+need neighbouring frames.
+
+```python
+class MyChunkRules:
+    overlap_frames = 4
+    crossfade_overlap_outputs = True
+
+    def get_overlap_frames(self, chunk_frames):
+        return min(self.overlap_frames, chunk_frames - 1)
+
+class MyUpsampler:
+    def query_chunking(self, value):
+        return MyChunkRules()
+```
+
+The built-in upsamplers return the object that also describes their Media Flow
+process (`postprocessing/<name>/process_handler.py`), so both read the same
+rules.
 
 ### Borrowing the loaded generation model
 
@@ -284,6 +383,9 @@ parsed a second time for upsampler discovery.
 Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key]`.
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
+
+RelayVSR stores `x2_model` (`x2`: RelayVSR X2 for ratios up to x2, or `x4`)
+under `spatial_upsamplers.relayvsr`.
 
 SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
 `spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the

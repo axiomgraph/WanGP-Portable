@@ -40,6 +40,11 @@ merges, this document and its actions replace them:
   (the cast ids it shows), `dialogue` (the words spoken in it: [{speaker, line, note}], the speaker a cast id or NARRATOR, the line
   exactly as the script has it, the note a delivery hint), `duration_s`, `audio_slice` [start_s, end_s] for song-driven shots, and `generation`:
   {"template": "<task>/<template name>", "settings": {...}}, as for wangp_generate.
+- Write every shot's prompt in its model's own format, given by template in `prompt_guides`: in `template_advice` before the first shot,
+  then by `plan` and `add_shots` with `reference_pictures`, the cast members whose pictures each shot receives, in order. Bind each
+  person, vehicle and place to its picture as the format says, and ask for synchronized lips where the shot sings or speaks: a plain
+  description loses what these models are trained on. To rewrite prompts already planned, call `plan()` alone first: it returns both for
+  every shot.
 - `settings` hold only what this shot changes: `prompt` and its media (`audio_guide`, `image_start`). `render` asks for the length the shot
   uses from its `duration_s`: set `video_length` only to want more than that. The brief sets the resolution: a shot sets `resolution` only
   when the user asks for another one for it. The template brings the model, LoRAs, steps and other defaults: do not copy them from the template, and do not
@@ -84,8 +89,8 @@ advice's automatic picks.
   needs other pictures too. Never pass a cast picture as `image_start`: a start image becomes the first frame of the shot, so its
   framing, aspect and setting leak into it (a square portrait gives a square take; an indoor photo opens a beach shot indoors).
 - A lip-synced shot also takes its exact slice of the song as driving audio, with the template of `cast_shots_lip_synced`: set its
-  `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice, and when that template is a reference template
-  (`lip_sync` in the advice) makes it follow the slice as its soundtrack; do not cut it yourself.
+  `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice and makes the
+  shot's model keep it as its soundtrack, whatever audio choice its template or settings hold; do not cut it yourself.
 - A change of what someone wears or looks like (a user's note "no raincoat in the last two shots") is a look, in a production of any
   length (see Long productions): rewriting the prompts is not enough, the reference picture brings the old outfit back.
 - Lip sync shows only on a face the viewer can read: frame a singing or speaking shot medium or closer, the singer facing the camera
@@ -129,7 +134,7 @@ The production's edit replaces the merge and remux steps of the film and product
   sample with `cast(voice=...)`. `speak`
   records the audio on the line and returns it; a line whose words, note or speaker's voice changed since (the user edits them) has
   no audio in the summary and is spoken again. The line's `note` is performed as a delivery direction where the model takes one.
-- Never write the spoken or sung words in a video prompt (no `<d>…</d>` dialogue, even when a template's example prompt shows one):
+- Never write the spoken or sung words in a video prompt (no lines inside `<d>…</d>`, even when a template's example prompt shows them):
   the model would voice them itself, in a new voice every shot. Speak every line with `speak` first; the prompt only says who speaks,
   "speaking with natural lip movements synchronized".
 - Unless the advice has `spoken_lines`: the user chose that the video model says the lines (the brief's Voices), knowing that a voice can change from shot to shot, so do not argue for recordings. Write the lines in `dialogue` as usual, exactly as the script has them, and do not `speak` them or lay them on the edit: `render` writes each shot's lines into its prompt, as its model reads them, with the speaker's `voice_description`. Keep their words and "natural lip movements" out of your prompt: that wording is for a recording. Quote nobody there (the model says whatever a prompt quotes, a catchphrase on a cast card too), and call each speaker by their cast name, as the lines do; `render` adds the card of a speaker on screen whom you do not name. These shots last their planned length, not their line's: about 0.4 s a word plus a second, no more, as the model fills time left with words of its own. `render` listens to each of these takes and answers under `heard`: it cuts words before the first line and after the last one, and you need another take when `missing` or `between` is not empty (a line it did not say, words added between two lines). A shot that should run on after its line gets `cut_extra_words: false`. The shots can differ a lot in level; `edit(level_voices=true)` evens them out in the export, when the user asks. A shot of a template that cannot say its lines, or that follows a song or its own audio, works as below.
@@ -143,6 +148,13 @@ The production's edit replaces the merge and remux steps of the film and product
   spoken line starts where its shot starts (`start_s` places it elsewhere), with no media ids to copy. Score: one `gen_song` instrumental as long as the cut (up to
   10 minutes), about -12 dB under speech.
 - A cut does not outlast its music: when the song ends or fades out before the last shot (the timeline's warnings say so), repeat its last bar under the end, faded out, or end the cut with the song, before you deliver. An end card over silence is a fault.
+- Song models cannot sing in a given voice. When the user wants the song (theirs or one you composed) sung by cast members or in voices they
+  gave: `change_singer_voice(cast_ids=[...])` or `change_singer_voice(voices=[...])`, one singer or two for a duet, in the order they are first
+  heard (SeedVC tells two voices apart, not more), never a new song. It changes the singing and keeps the music, words and timing, so the
+  plan, the cuts and the takes already shot stay; the former version goes to the bin. The brief's Sung by (`song_voices`) asks it for the
+  song you compose: call it right after `edit(song=...)`, before `check_song`. Without it, when its singers have a voice on their cards,
+  tell the user that Change the voice on the song card (or you, when asked) makes it theirs. This requires SeedVC **v1.0 Singing** in
+  **Configuration > Extensions** (the default); if a speech mode is selected, ask the user to select Singing first.
 - A song you make yourself becomes the production's song with `edit(song=...)`. Then `check_song(lyrics=...)` with the words you wrote for it, before anything depends on it: it says which lines of the lyrics are really sung, and when, and whether the lead voice fits the singer on screen. Its `not_sung` lines are not a transcript's mistake, they are a failed take: compose again as the skill says, and keep the take that sings the most lines. Subtitles follow its times, and an unsung line gets none. Plan the cuts on the song's `song_analysis` after that.
 - A shot whose picture you draw (a card, a diagram, a map, an animated explainer) has `generation: {"template": "draw_svg"}` and an
   intent saying what it shows: `plan` does not validate it and `render` skips it. Draw it with `draw_svg` (`duration_s` and SVG
@@ -232,7 +244,7 @@ A first version is not the end of the work. When you find a fault, or the user p
 - On a cut that plays the song, the song is the clock: a shot inserted or made longer covers what comes next, and later shots keep their place and their lips (`on_the_song` in the result says what moved). So the film does not get longer. A shot that sings longer needs a longer `audio_slice` and a new take. A shot made shorter leaves a gap that a singing shot cannot fill, as it has no picture for the song before its slice: `song_drift` reports it, and that shot is shot again on a slice that starts earlier.
 - On a film, each shot's sound, line tracks, cards and subtitles follow the shots. A score stays where it starts: its hits no longer land on the same pictures, and a longer film can outlast it.
 - When the cause reaches other shots, say so before you act: a new song means every singing shot again. Say how many shots and about how long.
-- Then assemble a new version, check that the fault is gone, and say in a line or two what changed. Earlier versions stay: the user can compare them.
+- Then assemble a new version, check that the fault is gone, and say in a line or two what changed. Earlier versions stay: the user can compare them. When the task says the user wants no new version, stop after the verdicts and say how the takes came out: the user assembles when they are ready.
 - Two new takes at most for one fault. If it is still there, stop: keep the best take, say plainly what the model cannot do here, and offer what the user can choose (another take, another framing, another line, leaving the shot out). Do not change other things to make up for it.
 - When the user names shots to fix, the tools keep everything else as it is for that task. If the fault needs more, end your turn saying what you would change and what it costs; their answer starts a task that can do it.
 - A change the user asks for as a whole (another actor, a new song, a new style, another structure) is not a fix: do all of it. Say first what it renders again.

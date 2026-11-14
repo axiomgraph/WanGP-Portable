@@ -126,8 +126,9 @@ class MiniMaxH3TextEncoder(nn.Module):
             raise RuntimeError("The Qwen tokenizer has not been initialized")
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    def _presentation(self, prompt, items):
+    def _presentation(self, prompt, items, picture_label=None):
         entries = []
+        picture_label = picture_label or "<Picture {}>: "
         counters = {"image": 0, "audio": 0, "video": 0}
 
         def add_text(text):
@@ -140,20 +141,23 @@ class MiniMaxH3TextEncoder(nn.Module):
             kind = item["type"]
             counters[kind] += 1
             if kind == "image":
-                add_text(f"<Picture {counters[kind]}>: ")
-                add_visual(item["frames"])
+                add_text(picture_label.format(counters[kind]))
+                if "frames" in item:  # a text-only presentation has the labels alone
+                    add_visual(item["frames"])
             elif kind == "audio":
                 add_text(f"<Audio {counters[kind]}>: ")
             elif kind == "video":
                 add_text(f"<Video {counters[kind]}>: ")
-                frames = item["frames"]
-                timestamps = list(item.get("timestamps", [i / 2.0 for i in range(frames.shape[0])]))
-                if frames.shape[0] % 2:
-                    frames = torch.cat((frames, frames[-1:]), dim=0)
+                frames = item.get("frames")
+                timestamps = list(item["timestamps"]) if "timestamps" in item else [i / 2.0 for i in range(frames.shape[0])]
+                if len(timestamps) % 2:
+                    if frames is not None:
+                        frames = torch.cat((frames, frames[-1:]), dim=0)
                     timestamps.append(timestamps[-1])
-                for index in range(0, frames.shape[0], 2):
+                for index in range(0, len(timestamps), 2):
                     add_text(f"<{(timestamps[index] + timestamps[index + 1]) / 2.0:.1f} seconds>")
-                    add_visual(frames[index:index + 2], video=True)
+                    if frames is not None:
+                        add_visual(frames[index:index + 2], video=True)
             else:
                 raise ValueError(f"Unsupported H3 presentation item: {kind}")
         add_text(prompt)
@@ -162,8 +166,8 @@ class MiniMaxH3TextEncoder(nn.Module):
     def _conditioning(self, output, dtype):
         return output.last_hidden_state.to(dtype)
 
-    def encode(self, prompt, items, device, dtype):
-        entries = self._presentation(prompt, items)
+    def encode(self, prompt, items, device, dtype, picture_label=None):
+        entries = self._presentation(prompt, items, picture_label)
         token_ids = []
         visual_specs = []
         for entry in entries:

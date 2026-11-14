@@ -1,4 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import importlib
 from shared.utils.config_store import write_config
 from decimal import Decimal, InvalidOperation
 
@@ -6,21 +7,23 @@ from postprocessing.mmaudio import MMAUDIO_DEFAULT_MODE
 from postprocessing.mmaudio.audio_processor import MMAudioProcessor
 from postprocessing.seedvc_processor.audio_processor import SeedVCProcessor
 from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_MIN, DEEPY_ENABLED_KEY, DEEPY_TEMPLATE_CONFIG_MIGRATIONS
+from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
 
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.30")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.32")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
-SEEDVC_MODE_CHOICES = [("v1.0 Speech", 1), ("v1.0 Singing / F0 44k", 2), ("v2 Speech", 3)]
+SEEDVC_MODE_CHOICES = [("v1.0 Singing", 2), ("v1.0 Speech", 1), ("v2 Speech", 3)]
 PROMPT_ENHANCER_CHOICES = [
     ("Florence 2 (image captioning) + LLama 3.2 3B (text generation)", 1),
     ("Florence 2 (image captioning) + Llama Joy 8B (uncensored, richer)", 2),
     ("Qwen3.5VL Abliterated 4B (recommended, captioning + uncensored text enhancement, vllm accelerated if available)", 3),
     ("Qwen3.5VL Abliterated 9B (captioning + uncensored high end text enhancement, vllm accelerated if available)", 4),
     ("Qwen3.8VL Uncensored 27B by Jonathan Coletti (highest quality, choose GGUF Q2, Q3 or Q4 below)", 5),
+    *([("Qwen3.8VL Flash-Next 125B (80 GB download, 64 GB of RAM)", 7)] if QWEN38_FLASH_NEXT_VISIBLE else []),
 ]
 
 SEEDVC_DEFAULT_MODE = 2
@@ -164,6 +167,11 @@ def _migrate_audio_processors_config(server_config, version: Decimal) -> bool:
                 del server_config[key]
                 changed = True
         changed = True
+    if version < Decimal("1.32"):
+        seedvc_config = audio_processor_api.read_config_section(server_config, SeedVCProcessor)
+        if sections.get("seedvc") != seedvc_config:
+            sections["seedvc"] = seedvc_config  # the former Off choice now selects v1.0 Singing; keep speech choices
+            changed = True
     changed = audio_processor_api.migrate_audio_processor_config(server_config) or changed
     return changed
 
@@ -221,7 +229,11 @@ def _migrate_int8_kernels(server_config) -> bool:
     return changed
 
 
-def migrate_extension_defaults(server_config, server_config_filename="", *, workspace_root=None) -> bool:
+def migrate_extension_defaults(server_config, server_config_filename="", *, workspace_root=None, family_handlers=()) -> bool:
+    """`family_handlers`: module paths of the model family handlers. Each one's optional `migrate_config(server_config, config_version)` is
+    called once per startup with the config version saved before this migration (a Decimal) and returns whether it changed the config.
+    A handler migration acts below the target version it was introduced with (bump EXTENSIONS_DEFAULTS_TARGET_VERSION in the same
+    change), so it runs once."""
     if not isinstance(server_config, dict):
         return False
 
@@ -318,6 +330,10 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
     changed = _migrate_temporal_upsamplers_config(server_config) or changed
     from postprocessing.memory import migrate_config as migrate_postprocessor_memory
     changed = migrate_postprocessor_memory(server_config) or changed
+    for path in family_handlers:
+        migrate_config = getattr(importlib.import_module(path).family_handler, "migrate_config", None)
+        if migrate_config is not None:
+            changed = migrate_config(server_config, version) or changed
 
     if server_config.pop(LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY, None) is not None:
         changed = True

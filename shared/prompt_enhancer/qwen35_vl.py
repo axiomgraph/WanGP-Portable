@@ -39,6 +39,7 @@ from .assets import (
     QWEN35_VISION_FILENAME,
     QWEN38_VARIANT_27B,
     QWEN38_VARIANT_9B,
+    QWEN38_VARIANT_FLASH_NEXT,
 )
 from .qwen3_5 import load_qwen35_model_class
 from .progress import EnhancementProgress
@@ -74,6 +75,7 @@ QWEN35_VARIANT_ALIASES = {
     "qwen3.8-27b uncensored": QWEN38_VARIANT_27B,
     "qwen3.8-9b": QWEN38_VARIANT_9B,
     "qwen3.8-9b uncensored": QWEN38_VARIANT_9B,
+    "qwen3.8 flash-next": QWEN38_VARIANT_FLASH_NEXT,
 }
 
 
@@ -89,7 +91,7 @@ def get_qwen35_assets_dir_name(variant: str | None = None) -> str:
 
 
 def get_qwen35_prompt_enhancer_variant(model_no) -> str:
-    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B}[int(model_no)]
+    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B, 7: QWEN38_VARIANT_FLASH_NEXT}[int(model_no)]
 
 
 def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
@@ -106,12 +108,22 @@ def _get_qwen35_gguf_filename(spec: dict, backend: str) -> str:
     return spec[QWEN_CHECKPOINTS[backend][0]]
 
 
+def locate_qwen35_folder(folder_name: str) -> str | None:
+    """A Qwen model's folder among the checkpoint roots: the first that holds its config.json, else the first that exists. Its large files may sit in
+    the folder of the same name of another root (a table moved to a faster drive), which _resolve_qwen35_checkpoint_file finds."""
+    if not os.path.isabs(folder_name):
+        configured = fl.installed_copies(os.path.join(folder_name, "config.json"))
+        if configured:
+            return os.path.dirname(configured[0])
+    return fl.locate_folder(folder_name, error_if_none=False)
+
+
 def _resolve_qwen35_assets_dir(assets_dir: str | None, variant: str | None = None, error_if_none: bool = True) -> str | None:
     folder_name = get_qwen35_assets_dir_name(variant)
     candidate = folder_name if assets_dir is None else assets_dir
-    resolved = fl.locate_folder(candidate, error_if_none=False)
+    resolved = locate_qwen35_folder(candidate)
     if resolved is None and assets_dir is not None and candidate != folder_name:
-        resolved = fl.locate_folder(folder_name, error_if_none=False)
+        resolved = locate_qwen35_folder(folder_name)
     if resolved is None and error_if_none:
         raise FileNotFoundError(f"Missing Qwen3.5 assets folder '{candidate}'")
     return resolved
@@ -141,7 +153,9 @@ def _resolve_qwen35_checkpoint_file(
     del variant
     if assets_dir is None:
         return None
-    resolved = fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
+    # the downloads' relative path (folder/file) in the first root that has it, so that a model's files may be spread over the roots
+    resolved = fl.locate_file(filename, error_if_none=False) or fl.locate_file(os.path.join(os.path.basename(os.path.normpath(assets_dir)), filename), error_if_none=False) \
+        or fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
     if resolved is not None:
         return resolved
     fallback_path = os.path.join(assets_dir, filename)
@@ -1084,7 +1098,15 @@ def load_qwen35_vl_prompt_enhancer(
         raise FileNotFoundError(f"Qwen3.5VL checkpoint not found: {model_path}")
 
     model_class = load_qwen35_model_class(modeling_path, class_name="Qwen3_5ForConditionalGeneration")
-    config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
+    if get_qwen35_variant_spec(variant).get("architecture") == "qwen4_exp":
+        # the vision tower of Qwen3.5 under the name of this architecture; the text model is the shared one below
+        with open(config_path, "r", encoding="utf-8") as reader:
+            config_values = json.load(reader)
+        for values in (config_values, config_values["text_config"], config_values["vision_config"]):
+            values["model_type"] = values["model_type"].replace("qwen4_exp", "qwen3_5")
+        config = AutoConfig.for_model(**config_values)
+    else:
+        config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
     config._prompt_enhancer_safe_legacy = legacy_safe_mode
     config._attn_implementation = attn_implementation
     if hasattr(config, "text_config") and config.text_config is not None:

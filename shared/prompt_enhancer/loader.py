@@ -1,13 +1,15 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
 import torch
-from mmgp import offload
+from mmgp import allocator, offload
 from safetensors import safe_open
+from tqdm import tqdm
 from shared.utils import files_locator as fl
 from shared.utils.cancellation import check_cancelled
 
@@ -22,8 +24,8 @@ from .assets import (
     LLAMA32_FOLDER,
     LLAMAJOY_FOLDER,
 )
-from shared.deepy.config import resolve_deepy_kv_cache_quantization
-from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
+from shared.deepy.config import gguf_kernels_warning, resolve_deepy_kv_cache_quantization
+from .config import mtp_auto_long_drafts, other_programs_vram_advice, resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime, split_speculative_decoding
 
 
 @dataclass(slots=True)
@@ -42,7 +44,7 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
     if enhancer_enabled in (1, 2):
         process_files_def(**florence_llama_download_def(enhancer_enabled))
         return
-    if enhancer_enabled in (3, 4, 5, 6):
+    if enhancer_enabled in (3, 4, 5, 6, 7):
         from .qwen35_vl import ensure_qwen35_prompt_enhancer_assets, get_qwen35_prompt_enhancer_variant
 
         # Auto: the drafter's files whenever it may run (the choice is made at load, from the model's fit in VRAM)
@@ -138,7 +140,10 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
 
     ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
 
-    if enhancer_enabled in (3, 4, 5, 6):
+    if enhancer_enabled in (3, 4, 5, 6, 7):
+        kernels_warning = gguf_kernels_warning() if torch.cuda.is_available() else ""  # the kernels exist for NVIDIA and AMD GPUs only
+        if kernels_warning:
+            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {kernels_warning}\033[0m")
         deepy_kv_cache_quantization, kv_cache_message = resolve_deepy_kv_cache_quantization(deepy_kv_cache_quantization)
         if kv_cache_message:
             print(f"[Prompt Enhancer / Deepy] {kv_cache_message}")
@@ -157,6 +162,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             get_qwen35_text_gguf_path,
             get_qwen35_variant_spec,
             load_qwen35_vl_prompt_enhancer,
+            locate_qwen35_folder,
         )
 
         qwen35_variant = get_qwen35_prompt_enhancer_variant(enhancer_enabled)
@@ -164,18 +170,22 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
         quantization = get_qwen35_quantization(qwen_backend or enhancer_quantization_QUANTO_INT8, variant=qwen35_variant)
         backend = enhancer_quantization_GGUF if quantization in (enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8) else quantization
         assets_dir_name = get_qwen35_assets_dir_name(qwen35_variant)
-        assets_dir = fl.locate_folder(assets_dir_name, error_if_none=False) or fl.get_download_location(assets_dir_name)
+        assets_dir = locate_qwen35_folder(assets_dir_name) or fl.get_download_location(assets_dir_name)
         if backend == enhancer_quantization_GGUF:
             from shared.qtypes.gguf import get_gguf_compute_dtype
             default_dtype = get_gguf_compute_dtype()
         else:
             default_dtype = torch.bfloat16
         text_model_path = get_qwen35_text_gguf_path(assets_dir, variant=qwen35_variant, backend=quantization) if backend == enhancer_quantization_GGUF else None
-        fit = lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization)
+        fit = functools.cache(lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization))
+        auto_draft_count = split_speculative_decoding(speculative_decoding)[1] is None  # Auto, or MTP with an automatic draft count
+        other_programs_advice = other_programs_vram_advice(enhancer_enabled, speculative_decoding, fit, allocator.other_programs(), qwen_backend=qwen_backend)
         speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend, fit=fit)
         speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
         if speculative_decoding_message:
             print(f"[Prompt Enhancer / Deepy] {speculative_decoding_message}")
+        if other_programs_advice:
+            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {other_programs_advice}\033[0m")
         runtime.llm_model = load_qwen35_text_prompt_enhancer(
             model_path=text_model_path,
             assets_dir=assets_dir,
@@ -195,6 +205,16 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
                 speculative_tokens = min(speculative_tokens, 7)
             runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
             runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
+            if auto_draft_count and speculative_decoding == 1:
+                long_tokens = mtp_auto_long_drafts(enhancer_enabled, qwen_backend, speculative_tokens)
+                if long_tokens and torch.cuda.is_available():  # what this GPU measured in an earlier session: a long pass that cannot pay is left out, with its graphs
+                    from shared.llm_engines.lmgp.engine import chain_verdicts
+                    verdict_key = runtime.llm_model._prompt_enhancer_long_chain_key = chain_verdicts.key(torch.device("cuda"), text_model_path or qwen35_variant, deepy_kv_cache_quantization, speculative_tokens, long_tokens)
+                    verdict = chain_verdicts.verdict(verdict_key)
+                    if verdict is not None and not verdict["pays"]:
+                        print(f"[Prompt Enhancer / Deepy] Long draft chain left out: on this GPU a pass with {long_tokens} draft tokens was measured at {verdict['ratio']:.2f} times one with {speculative_tokens} ({verdict['date']}).")
+                        long_tokens = 0
+                runtime.llm_model._prompt_enhancer_speculative_long_tokens = long_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
         caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)

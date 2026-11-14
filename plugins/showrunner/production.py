@@ -6,6 +6,7 @@ change it through the same operations (apply_ops), with lock and revision rules 
 from __future__ import annotations
 
 import copy
+import difflib
 import re
 import hashlib
 import json
@@ -14,7 +15,7 @@ import uuid
 from typing import Any
 
 SCHEMA = 1
-KINDS = ("music_video", "short_film", "ad", "trailer", "story", "free")
+KINDS = ("music_video", "short_film", "ad", "trailer", "story", "remake", "free")
 STAGES = ("brief", "planning", "review", "shooting", "editing", "delivered")
 SHOT_STATUSES = ("planned", "queued", "rendering", "rendered", "approved", "rejected", "failed")
 TRANSITIONS = ("cut", "crossfade", "fade_black", "fade_white")
@@ -27,7 +28,13 @@ RESOLUTIONS = {"16:9": {"480p": "832x480", "720p": "1280x720", "1080p": "1920x10
 
 
 def resolution(brief: dict[str, Any]) -> str:
+    """The brief's target: every picture is made at it, and every shot shot final."""
     return RESOLUTIONS[brief["aspect"]][brief["resolution"]]
+
+
+def tier_name(brief: dict[str, Any], final: bool = False) -> str:
+    """The resolution a video shot renders at: the draft's, when the brief has one, until the shot is shot final."""
+    return brief["resolution"] if final or not brief.get("draft_resolution") else brief["draft_resolution"]
 
 
 class OperationError(ValueError):
@@ -53,9 +60,11 @@ def new_document(title: str, kind: str = "free", **brief: Any) -> dict[str, Any]
 def normalize(doc: dict[str, Any]) -> dict[str, Any]:
     """Fill the defaults of every section in place (older or hand-edited documents load the same way)."""
     brief = doc.setdefault("brief", {})
-    for key, value in {"kind": "free", "text": "", "song": None, "script": "", "references": [], "duration_s": None, "aspect": "16:9", "resolution": "720p",
+    for key, value in {"kind": "free", "text": "", "song": None, "script": "", "references": [], "duration_s": None, "aspect": "16:9", "resolution": "720p", "draft_resolution": None,
                        "style_tags": [], "style": "", "pacing": 0, "language": "en", "plan_first": True, "budget_minutes": None, "templates": {},
-                       "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None, "voices_from_model": False}.items():
+                       "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None, "voices_from_model": False,
+                       "group_renders": True, "render_min_s": RENDER_MIN_S, "render_max_s": None,  # a remake's renders: shots join until one lasts render_min_s, up to render_max_s or its template's window
+                       "song_voices": []}.items():  # who sings the song the showrunner composes, first heard first: cast ids (song models take no voice)
         brief.setdefault(key, copy.deepcopy(value))
     if brief["kind"] not in KINDS:
         brief["kind"] = "free"
@@ -100,7 +109,8 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
 def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"title": "", "section": "", "intent": "", "camera": "", "cast": [], "dialogue": [], "duration_s": 5.0, "audio_slice": None, "generation": {},
                        "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None], "speed": 1.0, "sound": True,
-                       "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0, "cut_extra_words": True, "line_cut": None}.items():
+                       "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0, "cut_extra_words": True, "line_cut": None,
+                       "rendering_with": None}.items():  # rendering_with: the shot whose render renders this one too, while it runs
         shot.setdefault(key, copy.deepcopy(value))
     generation = shot["generation"]
     generation.setdefault("template", "gen_video")
@@ -352,17 +362,56 @@ def sung_lines(lines: list[str], words: list[tuple[str, float, float]]) -> list[
     found = [[] for _ in lines]
     for row, column in _aligned(written, said):
         found[next(index for index in range(len(lines) - 1, -1, -1) if first_word[index] <= row)].append((row, column))
-    result, floor = [], 0.0
+    counts = [len(_lyric_words(line)) for line in lines]
+    sung = [bool(pairs) and len(pairs) * 2 >= count and words[pairs[-1][1]][2] - words[pairs[0][1]][1] <= 1.5 * count + 2.0 for pairs, count in zip(found, counts)]
+    result, floor, taken = [], 0.0, -1  # taken: the last word heard of the lines before
     for index, line in enumerate(lines):
-        count, pairs = len(_lyric_words(line)), found[index]
+        count, pairs = counts[index], found[index]
         item = {"line": line, "heard": len(pairs), "words": count, "sung": False, "start_s": None, "end_s": None}
-        if pairs and len(pairs) * 2 >= count and words[pairs[-1][1]][2] - words[pairs[0][1]][1] <= 1.5 * count + 2.0:
-            missed_before, missed_after = pairs[0][0] - first_word[index], first_word[index] + count - 1 - pairs[-1][0]  # about 0.3 s a word
-            start = max(floor, words[pairs[0][1]][1] - 0.3 * missed_before)
-            floor = words[pairs[-1][1]][2] + 0.3 * missed_after
+        if sung[index]:
+            following = next((found[later][0][1] for later in range(index + 1, len(lines)) if sung[later]), len(words))
+            first, before = _reach(words, pairs[0][1], -1, pairs[0][0] - first_word[index], taken)  # the words it misses are heard next to it, read otherwise
+            last, after = _reach(words, pairs[-1][1], 1, first_word[index] + count - 1 - pairs[-1][0], following)
+            start = max(floor, words[first][1] - 0.3 * before)  # about 0.3 s a word missed and not heard
+            floor, taken = words[last][2] + 0.3 * after, last
             item.update(sung=True, start_s=round(start, 2), end_s=round(floor, 2))
         result.append(item)
+    _place_unclear(result, words)
     return result
+
+
+def _reach(words: list[tuple[str, float, float]], column: int, step: int, missed: int, bound: int) -> tuple[int, int]:
+    """The heard word a line reaches from its word heard at `column`, going over at most `missed` neighbours sung on without a pause and never to `bound`;
+    with the number of missed words left over."""
+    while missed and bound != column + step and abs(words[column + step][1 if step > 0 else 2] - words[column][2 if step > 0 else 1]) <= 1.0:
+        column, missed = column + step, missed - 1
+    return column, missed
+
+
+def _place_unclear(result: list[dict[str, Any]], words: list[tuple[str, float, float]]) -> None:
+    """Lines a transcript cannot read, sung between two lines it reads: where the words heard between them read like these lines, they are these lines sung unclearly,
+    shared by their number of words. They get their times (and a subtitle) with unclear=True, and stay not sung as written."""
+    letters = lambda text: re.sub(r"[^a-z0-9]", "", text.lower())
+    index = 0
+    while index < len(result):
+        if result[index]["sung"]:
+            index += 1
+            continue
+        run = [index]
+        while run[-1] + 1 < len(result) and not result[run[-1] + 1]["sung"]:
+            run.append(run[-1] + 1)
+        index = run[-1] + 1
+        before = result[run[0] - 1]["end_s"] if run[0] else -1.0
+        after = result[index]["start_s"] if index < len(result) else float("inf")
+        heard = [word for word in words if before <= word[1] < after]
+        if not heard or difflib.SequenceMatcher(None, letters(" ".join(result[line]["line"] for line in run)), letters(" ".join(word for word, _, _ in heard)), autojunk=False).ratio() < 0.5:
+            continue
+        total, done = sum(result[line]["words"] for line in run), 0
+        for line in run:
+            share = heard[round(len(heard) * done / total):round(len(heard) * (done + result[line]["words"]) / total)]
+            done += result[line]["words"]
+            if share:
+                result[line].update(unclear=True, start_s=round(max(share[0][1], before), 2), end_s=round(share[-1][2], 2))
 
 
 WORD_CUT_MARGIN_S = 0.1  # a cut before a word heard: its start is known to about this much
@@ -428,7 +477,8 @@ def song_words(doc: dict[str, Any]) -> list[str]:
     if lines is None:
         return ["The song's words are not checked: check_song says which lines it really sings, and times the subtitles on them."]
     missing = [line["line"] for line in lines if not line["sung"]]
-    warnings = [f"The song does not sing {len(missing)} of its {len(lines)} lines as written, and they get no subtitle: " + " / ".join(f'"{line}"' for line in missing[:8]) + (" ..." if len(missing) > 8 else "") + ". Compose it again before shooting on it, with fewer lines or more length."] if missing else []
+    untimed = sum(line["start_s"] is None for line in lines)
+    warnings = [f"The song does not sing {len(missing)} of its {len(lines)} lines as written" + (", and they get no subtitle" if untimed == len(missing) else f" ({untimed} get no subtitle, the others are subtitled where they are sung unclearly)" if untimed else " (they are subtitled where they are sung unclearly)") + ": " + " / ".join(f'"{line}"' for line in missing[:8]) + (" ..." if len(missing) > 8 else "") + ". Compose it again before shooting on it, with fewer lines or more length."] if missing else []
     pitch, kinds = doc["audio"]["lyrics"].get("voice_hz"), singer_kinds(doc)
     if len(kinds) == 1 and voice_off(next(iter(kinds)), pitch):
         warnings.append(f"The song's lead voice measures {pitch:.0f} Hz, which reads as a {'man' if next(iter(kinds)) == 'woman' else 'woman'}, and the singer on screen is a {next(iter(kinds))}: compose it again, with the lead voice named first in its style.")
@@ -467,7 +517,7 @@ def song_drift(doc: dict[str, Any]) -> list[str]:
 def missing_ends(doc: dict[str, Any]) -> list[str]:
     """A cut with no title or no end card: the viewer never reads its name, and it stops on its last image."""
     included = [shot for shot in doc["shots"] if shot.get("included", True)]
-    if not included:
+    if not included or doc["brief"].get("kind") == "remake":  # a remake is the source video changed: it adds nothing the user did not ask for
         return []
     styles = {item.get("style") for item in doc["edit"]["overlays"]}
     notes = [str((chosen_take(shot) or {}).get("note") or "") for shot in included]
@@ -688,9 +738,10 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 
 # Operations ---------------------------------------------------------------------------------------------------------------------------
 
-BRIEF_FIELDS = {"kind", "title", "text", "song", "script", "references", "duration_s", "aspect", "resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
-                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model"}
+BRIEF_FIELDS = {"kind", "title", "text", "song", "source", "script", "references", "duration_s", "aspect", "resolution", "draft_resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
+                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model", "group_renders", "render_min_s", "render_max_s", "song_voices"}
 DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
+RENDER_MIN_S = 8.0  # a remake's shorter renders lose the lips: Skate Queen s3 alone (5.8 s) did not follow the singing, with its neighbour (9.5 s) it did
 
 
 def shot_range(doc: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -704,7 +755,7 @@ def shot_range_words(doc: dict[str, Any]) -> str:
     return f"{low:g} to {high:g} s" if low and high else f"at least {low:g} s" if low else f"at most {high:g} s" if high else ""
 GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
-               "transition", "notes", "cut_extra_words"}
+               "transition", "notes", "cut_extra_words", "source_range", "source_poster", "painted_frames", "seen", "looked", "rendering_with"}
 SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
 CAST_FIELDS = {"name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "lora", "locked", "looks"}
 MEDIA_SETTINGS = {"image_refs", "image_start", "image_end", "image_guide", "image_mask", "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
@@ -732,13 +783,15 @@ def _check_shot_write(shot: dict[str, Any], by: str, fields: set[str], base_revi
 
 
 def _generation_fields(fields: dict[str, Any]) -> dict[str, Any]:
-    """A shot's settings or template written beside its fields go in its generation: there is only one thing they can mean."""
+    """A shot's settings or template written beside its fields, or a setting written directly in its generation, go where they are read: there is only one thing they can mean."""
     loose = {key: fields[key] for key in fields if key in GENERATION_SHORTHAND}
-    if not loose:
+    given = fields.get("generation")
+    nested = {key: given[key] for key in given if key not in {"template", "settings"}} if isinstance(given, dict) else {}
+    if not loose and not nested:
         return fields
     rest = {key: value for key, value in fields.items() if key not in loose}
-    generation = dict(rest.get("generation") or {})
-    settings = dict(generation.get("settings") or {})
+    generation = {key: value for key, value in (given or {}).items() if key not in nested}
+    settings = {**nested, **(generation.get("settings") or {})}
     if "template" in loose:
         generation["template"] = loose.pop("template")
     settings.update(loose.pop("settings", None) or {})
@@ -851,7 +904,7 @@ def _new_shot(doc: dict[str, Any], fields: dict[str, Any], by: str, revision: in
     return shot
 
 
-def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str) -> dict[str, Any]:
+def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str, choose: bool = True) -> dict[str, Any]:
     if not take.get("path"):
         raise OperationError("A take needs the path of its media file.")
     record = {"id": _next_id("t", shot["takes"]), "path": take["path"], "media": take.get("media"), "kind": take.get("kind", "video"),
@@ -861,10 +914,12 @@ def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str) -> dict[str, 
               "gpu_s": take.get("gpu_s")}  # gpu_s: the measured generation time, for shoot estimates
     if take.get("base_loras"):  # its LoRAs before the cast's (activated, multipliers): a new take adds the cast's as they are then
         record["base_loras"] = copy.deepcopy(take["base_loras"])
+    record.update({key: take[key] for key in ("tier", "kept_source") if take.get(key)})  # tier: "draft" until it is shot final; kept_source: the edit reads the shot from the source itself
     shot["takes"].append(record)
-    shot["chosen_take"] = record["id"]
-    if shot["status"] in ("planned", "queued", "rendering", "failed", "rejected"):
-        shot["status"] = "rendered"
+    if choose or shot["chosen_take"] is None:  # not chosen: another shot's render gave it this take, beside the one it uses
+        shot["chosen_take"] = record["id"]
+        if shot["status"] in ("planned", "queued", "rendering", "failed", "rejected"):
+            shot["status"] = "rendered"
     follow_line_cut(shot)
     return record
 
@@ -903,6 +958,9 @@ def _op_brief(doc, op, by, revision, base_revision):
         raise OperationError(f"Unknown brief fields: {', '.join(sorted(unknown))}.")
     if "title" in fields:
         doc["title"] = str(fields.pop("title")).strip() or doc["title"]
+    singers = fields.get("song_voices", [])
+    if not isinstance(singers, list) or len(singers) > 2 or any(not any(member["id"] == singer for member in doc["cast"]) for singer in singers):
+        raise OperationError("song_voices: one or two cast ids, first heard first (SeedVC tells two voices apart, not more).")
     doc["brief"].update(copy.deepcopy(fields))
     normalize(doc)
 
@@ -947,6 +1005,12 @@ def singer_kinds(doc: dict[str, Any]) -> set[str]:
     return {kind for member in doc["cast"] if not is_place(member) and (not singing or member["id"] in singing) and (kind := voice_kind(member.get("voice_description") or member.get("description")))}
 
 
+def song_singers(doc: dict[str, Any]) -> str:
+    """Who the brief says sings the song the showrunner composes, in words ("" for the song model's own voice)."""
+    names = [f"{member['name'] or member['id']} ({member['id']})" for singer in doc["brief"]["song_voices"] for member in doc["cast"] if member["id"] == singer]
+    return " then ".join(names) + (", a duet in the order they are first heard" if len(names) == 2 else "")
+
+
 def is_place(member: dict[str, Any]) -> bool:
     """A location kept the same from shot to shot: a cast card whose picture shows the empty set."""
     return str(member.get("role") or "").strip().casefold() in ("place", "location", "set")
@@ -989,15 +1053,39 @@ def _op_remove_cast(doc, op, by, revision, base_revision):
     doc["cast"].remove(member)
     for shot in doc["shots"]:
         shot["cast"] = [item for item in shot["cast"] if item != member["id"]]
+    doc["brief"]["song_voices"] = [singer for singer in doc["brief"]["song_voices"] if singer != member["id"]]  # they sing no more
+
+
+def _op_remake(doc, op, by, revision, base_revision):
+    """A remake's source as ingest_source prepared it (path, fps, frames, cuts). Only a remake's document has this section and its shots' source_range, source_poster, painted_frames and seen."""
+    doc["remake"] = copy.deepcopy(op.get("source"))
 
 
 def _op_add_shots(doc, op, by, revision, base_revision):
     position, added = op.get("position"), []
     for offset, fields in enumerate(op.get("shots") or []):
-        shot = _new_shot(doc, dict(fields), by, revision)  # inserted at once: the next shot's id accounts for it
+        fields = dict(fields)
+        take = fields.pop("take", None)  # a shot made from a file of the user's arrives with it as its take
+        shot = _new_shot(doc, fields, by, revision)  # inserted at once: the next shot's id accounts for it
         doc["shots"].insert(len(doc["shots"]) if position is None else int(position) + offset, shot)
+        if take:
+            _add_take(shot, take, by)
         added.append(shot["id"])
     return {"shots": added}
+
+
+def media_shot(doc: dict[str, Any], media: dict[str, Any], position: int | None = None) -> tuple[int, dict[str, Any]]:
+    """Where a shot made from a video or a picture of the user's goes, and its fields with the file as its take: placed as Add a shot places one
+    (at the position given, else at the end, before a closing card), named after the file, in the part and with the model of the shot before it.
+    The showrunner then treats it as any shot with a take."""
+    shots, drawn = doc["shots"], lambda shot: (shot.get("generation") or {}).get("template") == "draw_svg"
+    position = (len(shots) - 1 if shots and drawn(shots[-1]) else len(shots)) if position is None else max(0, min(int(position), len(shots)))
+    pattern = next((shot for shot in reversed(shots[:position]) if not drawn(shot)), None) or next((shot for shot in shots if not drawn(shot)), None)
+    file = str(media.get("name") or media["path"]).replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_|\.\w+$", "", file).replace("_", " ").strip()  # a generated file: the words of its prompt
+    return position, {"title": name[:60] or "Your shot", "section": shots[position - 1]["section"] if position else "",
+                      "duration_s": round(float(media["duration_s"]), 2) if media.get("kind") == "video" and media.get("duration_s") else 4.0,
+                      "generation": {"template": (pattern or {}).get("generation", {}).get("template") or "gen_video", "settings": {"prompt": ""}}, "take": {**media, "note": "Your file"}}
 
 
 def _op_replace_plan(doc, op, by, revision, base_revision):
@@ -1023,6 +1111,10 @@ def _op_remove_shot(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     _check_shot_write(shot, by, set(), op.get("revision", base_revision))
     doc["shots"].remove(shot)
+    for number, take in enumerate(shot["takes"], 1):  # its takes wait in the bin, to come back as a shot or a take of another
+        if take.get("path") and not any(item["path"] == take["path"] for item in doc["bin"]):
+            doc["bin"].append({"id": _next_id("b", doc["bin"]), "created": now(), "by": take.get("by") or by, "name": f"{shot['title'] or shot['id']} T{number}",
+                               **{key: take.get(key) for key in ("path", "kind", "duration_s", "width", "height", "fps", "poster", "has_audio", "codec", "strip")}})
 
 
 def _op_move_shots(doc, op, by, revision, base_revision):
@@ -1051,7 +1143,7 @@ def _op_add_take(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     if by != "user" and shot["locked"]:
         raise OperationError(f"Shot {shot['id']} is locked by the user: leave it as it is.")
-    take = _add_take(shot, dict(op.get("take") or {}), by)
+    take = _add_take(shot, dict(op.get("take") or {}), by, choose=op.get("choose", True))
     doc["bin"] = [item for item in doc["bin"] if item.get("by") != "deepy" or item.get("path") != take.get("path")]  # it was in the bin until it became a take
     if by == "user":
         shot["updated_by"], shot["updated_rev"] = by, revision
@@ -1063,6 +1155,11 @@ def _op_verdict(doc, op, by, revision, base_revision):
     take = find(shot["takes"], op.get("take") or shot["chosen_take"], "take")
     if by != "user" and (take.get("verdict") or {}).get("by") == "user":
         raise OperationError(f"The user already judged take {take['id']} of shot {shot['id']}: {take['verdict']}.", current=copy.deepcopy(take["verdict"]))
+    if by == "user" and op.get("ok") is None:  # the user takes their verdict back: the take waits for review again, with the showrunner's verdict
+        take["verdict"] = copy.deepcopy(take.get("showrunner_verdict"))
+        shot["status"] = "rejected" if take["verdict"] and not take["verdict"]["ok"] else "rendered"
+        shot["updated_by"], shot["updated_rev"] = by, revision
+        return
     take["verdict"] = {"by": by, "ok": bool(op.get("ok")), "note": str(op.get("note") or ""), "time": now()}
     if by != "user":  # the user's verdict replaces it as the take's verdict; the showrunner's note stays readable beside it
         take["showrunner_verdict"] = copy.deepcopy(take["verdict"])
@@ -1162,7 +1259,7 @@ def _op_remove_overlay(doc, op, by, revision, base_revision):
 
 
 def _op_log(doc, op, by, revision, base_revision):
-    text = " ".join(str(op.get("text") or "").split())
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(" ".join(line.split()) for line in str(op.get("text") or "").strip().splitlines()))  # its lines kept: Deepy's tables and lists
     if text:
         doc["log"].append({"id": uuid.uuid4().hex[:8], "time": now(), "by": by, "text": text[:4000], **({"shot": op["shot"]} if op.get("shot") else {})})
         del doc["log"][:-500]
@@ -1408,15 +1505,43 @@ def _op_bin_remove(doc, op, by, revision, base_revision):
 
 def _op_bin_to_take(doc, op, by, revision, base_revision):
     item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") == "audio":
+        raise OperationError("A sound is not a take: use bin_to_track to lay it over the edit from this shot.")
     result = _op_add_take(doc, {"shot": op.get("shot"), "take": {**item, "note": "From the bin"}}, by, revision, base_revision)
     if op.get("move", True):
         doc["bin"].remove(item)
     return result
 
 
-_OPS = {"heard": _op_heard, "brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
+def _op_bin_to_track(doc, op, by, revision, base_revision):
+    """A sound from the bin over the edit, from the start of a shot (its whole file: the Timeline shortens it), then following that shot's
+    picture when the cut changes. A sound is never a shot's take."""
+    item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") != "audio":
+        raise OperationError("Only a sound goes over the edit: a picture or a video becomes a take of a shot.")
+    start = next((part["start_s"] for part in timeline(doc) if part["shot"] == op.get("shot")), None)
+    if start is None:
+        raise OperationError(f"Shot {op.get('shot')} is not in the edit: include it first.")
+    doc["edit"]["audio_tracks"].append({"path": item["path"], "start_s": round(start, 3), "gain_db": 0.0})
+    if doc["edit"]["audio_mode"] == "song":  # the song keeps playing beside it
+        doc["edit"]["audio_mode"] = "mix"
+    doc["bin"].remove(item)
+    return {"track": len(doc["edit"]["audio_tracks"]) - 1, "start_s": round(start, 3)}
+
+
+def _op_bin_to_shot(doc, op, by, revision, base_revision):
+    """A video or a picture from the bin as a new shot of its own, its take (position: where it goes, else at the end)."""
+    item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") == "audio":
+        raise OperationError("A sound is no shot: it plays over the edit from a shot (bin_to_track).")
+    position, fields = media_shot(doc, item, op.get("position"))
+    doc["bin"].remove(item)
+    return _op_add_shots(doc, {"position": position, "shots": [fields]}, by, revision, base_revision)
+
+
+_OPS = {"heard": _op_heard, "remake": _op_remake, "brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
         "add_shots": _op_add_shots, "replace_plan": _op_replace_plan, "update_shot": _op_update_shot, "remove_shot": _op_remove_shot, "move_shots": _op_move_shots,
         "reorder": _op_reorder, "add_take": _op_add_take, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
         "director": _op_director, "line_audio": _op_line_audio, "bring_back": _op_bring_back, "restore_version": _op_restore_version, "outline": _op_outline, "add_overlay": _op_add_overlay, "update_overlay": _op_update_overlay,
         "remove_overlay": _op_remove_overlay, "deliverable": _op_deliverable, "budget": _op_budget, "audio": _op_audio, "lyrics": _op_lyrics, "review": _op_review, "bin_add": _op_bin_add, "bin_remove": _op_bin_remove,
-        "bin_to_take": _op_bin_to_take}
+        "bin_to_take": _op_bin_to_take, "bin_to_track": _op_bin_to_track, "bin_to_shot": _op_bin_to_shot}

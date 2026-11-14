@@ -37,6 +37,10 @@ Control Video processing tells the model what structure, motion, or area to foll
 
 If a Video Mask is provided, the selected process can apply only to the masked area or only to the non-masked area. This lets you keep a subject while changing the background, replace one person among several people, or combine different effects inside and outside the mask.
 
+A Control Video keeps its timing. At a rate within 0.1 frames per second of the model's, such as 23.976 for a 24 fps model, WanGP reads every frame without repeating or dropping any, and it records the result and places the sound on the video's real rate, so they stay together however long the video is.
+
+A part of a video named without encoding it (a view, or a path ending in `|start_frame=...,end_frame=...` or `|start_s=...,end_s=...`) can be any length, even one the model cannot render. WanGP fills the render by playing the part's last frames backwards, then trims the output back, so you get exactly its frames. Asking for clearly more than the part holds still extends it by temporal outpainting.
+
 WanGP previews processed Control Video and Video Mask thumbnails before generation. Use `--save-masks` when you need to inspect the full generated control media.
 
 ### Masks
@@ -128,6 +132,12 @@ When sliding windows are enabled, positional arguments such as injected-frame po
 
 If you continue from a Source Video, the Source Video is treated as the first window. The overlap size controls how many frames from that source or previous window are used to condition the next generated segment.
 
+A long Source Video does not need to fit in memory. WanGP reads only the last frames the first new window needs and leaves the rest in the file. If the Source Video already has the output's size, frame rate and video codec settings (for example a video WanGP generated with the same settings), its pictures are copied unchanged into the result; otherwise it is resized and encoded once. Each new window is then added to the result without encoding the previous frames again.
+
+Temporal Upsampling, Spatial Upsampling and Film Grain also apply to the Source Video. It goes through them once, a part at a time, so it still does not need to fit in memory, and each new window then processes only its own frames. A Source Video that already has the final size and frame rate (for example the result of an earlier generation with the same settings) is not processed again: its pictures are copied, so Film Grain is not added twice and nothing is upscaled a second time.
+
+A few choices still need the whole Source Video in memory: HDR output, an upsampler that works on the whole video at once (the LTX-2 upscalers and Detail Refiner, the face refiners), and frame interpolation combined with an AI upscaler. The console then reports why and how much RAM this takes, and the generation (or an extra window) is refused when the Source Video and the new frames together exceed 3000 frames. Apply these steps afterwards in Post Processing, or keep fewer frames of the Source Video, to continue a very long video.
+
 How sliding windows work:
 
 - Each window uses the matching time segment of the Control Video.
@@ -168,6 +178,8 @@ Postprocessing is applied after media exists. It can run immediately after gener
 
 Use postprocessing when the content is good but the final media needs a technical or finishing pass.
 
+A long video does not need to fit in memory: Late Post Processing reads, processes and saves it a part at a time, whatever its length. This applies to Lanczos, FlashVSR, SeedVR2, RelayVSR, DLSS 5, RIFE, DLSS frame generation and Film Grain. The exceptions listed under Continue Video (the LTX-2 upscalers and Detail Refiner, the face refiners, frame interpolation combined with an AI upscaler) load the video whole and keep its first 3000 frames. For pausing and resuming a long job, or choosing the length of the parts yourself, use Media Flow.
+
 Common postprocessing jobs:
 
 - Spatial upsampling for images or videos.
@@ -178,6 +190,8 @@ Common postprocessing jobs:
 
 SeedVC voice replacement, also used by Scenema Audio for reference voices, is distributed separately under the GPL-3.0 license. WanGP downloads it automatically from https://github.com/deepbeepmeep/WanGP-SeedVC the first time you use it, so that first use needs internet access.
 
+**SeedVC Voice Replacement** in **Configuration > Extensions** defaults to **v1.0 Singing**, which Showrunner requires for changing a song's singer or duet voices. **v1.0 Speech** and **v2 Speech** remain available for spoken audio. There is no Off choice; existing Off selections become v1.0 Singing.
+
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
 
 ### Face Refinement
@@ -186,6 +200,15 @@ Face refiners find and follow up to five faces, restore each one and paste it ba
 
 - **H3 Face Refiner** restores faces with the H3 model, a text description and the soundtrack, which the model hears as it does when generating. Mouths stay closer to the source's, and it reuses H3 when H3 is already loaded.
 - **TaoMate-FVSR Face Refiner** restores speaking and singing faces from the soundtrack: lips and teeth come out sharp and follow the audio, with more skin and eye detail. It takes no prompt and pushes the mouth toward the audio much harder than H3 Face Refiner, so it is the one to try when a mouth looks wrong, and the mouth can differ more from the source.
+
+| | H3 Face Refiner | TaoMate-FVSR Face Refiner |
+|---|---|---|
+| **Choose it for** | Keeping the source's mouth movements; small or distant faces | Close-ups; a mouth that looks wrong |
+| **Detail** | Less skin, eye and teeth detail on close-ups | Sharpest lips and teeth, most skin and eye detail on close-ups |
+| **Mouth** | Stays close to the source; does little to correct a wrong mouth | Pushed toward the soundtrack: closed lips may open, and a face following the soundtrack mouths its words even if that person is only listening |
+| **Rest of the face** | Expressions and the upper face can change | On close-ups the upper face and identity stay close to the source; on small or distant faces, mouths open wider and the face is less faithful than with H3 |
+| **Control** | Accepts a prompt (Late Post Processing) | No prompt; you choose which faces follow the soundtrack |
+| **Speed and memory** | Faster with several faces, a little less VRAM; reuses H3 when it is already loaded | Faster on a single close-up; faces large in the frame take several times longer; SeedVR2 downloads with it |
 
 TaoMate-FVSR choices:
 

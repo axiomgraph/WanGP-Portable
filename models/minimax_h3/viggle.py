@@ -1,4 +1,4 @@
-"""Viggle-Animate's fixed conditioning and model information."""
+"""Viggle-Animate's fixed conditioning and model information, and Viggle Remake's sampling constants and help."""
 
 import torch
 
@@ -43,6 +43,164 @@ With either audio input, H3 holds the supplied audio fixed while generating the 
 
 [Viggle-Animate model and examples](https://huggingface.co/Viggle/Viggle-Animate)
 """
+
+
+# Viggle Remake: the swap and edit LoRAs of Viggle/Viggle-Remake on stock FL2VA Pruned. Its LoRAs fix the sampling grids and the conditioning layout below.
+VIGGLE_REMAKE_ARCHITECTURE = "viggle_remake"
+VIGGLE_REMAKE_SIGMAS = {"swap": (1.0, 0.990476, 0.965243, 0.923077, 0.8, 0.631579), "edit": (1.0, 0.983607, 0.96, 0.923077, 0.857143, 0.705882)}  # in the video stream's sigma
+VIGGLE_REMAKE_STEPS = 6
+VIGGLE_REMAKE_SHIFT = 12.0
+VIGGLE_REMAKE_KEYFRAME_UNTIL = 0.9  # pinned frames condition the forwards whose sigma is at least this: the first 4 of 6
+VIGGLE_REMAKE_MIN_FRAMES = 90
+VIGGLE_REMAKE_MAX_FRAMES = 345
+VIGGLE_REMAKE_MAX_PICTURES = 4
+VIGGLE_REMAKE_OVERLAP = 17  # one VAE clip of the previous take opens the next window
+
+_REMAKE_COMMON_INFOS = """### What You Supply
+
+- **Source Video:** sets the motion, camera, framing and timing, and everything the prompt does not change. Its soundtrack is kept; a silent source gives a silent result.
+- **Painted Frames:** one to four frames of the source changed in an image editor, at its proportions. They carry the new look: the model sees nothing else of it. Paint one frame per shot, and add another only when {more_frames}. They are `<Picture 1>` to `<Picture 4>` in the prompt.
+- **Prompt:** six sections describing the finished video. The **Write** button drafts it from your request and the painted frames; the prompt help explains the format.
+
+### Pinning Painted Frames
+
+Choose **Pin Painted Frames at Chosen Positions** and give the source frame each one was painted from, in order, counting the first frame as 1. The video then passes through that picture at that moment, so shots stay on time. A frame pinned at another moment pulls the video toward its composition. Without pins, painted frames only set the look. {pin_when}
+
+### Video Mask
+
+A mask is optional: choose **Use Source Video with a Mask**. Source pixels are restored outside it, so everything else stays exactly as it was, which helps when only one person or object among many changes. Draw it a little larger than the new subject. Shadows and reflections outside the mask stay as they were, so leave it out for changes that affect the whole picture.
+
+### Length and Size
+
+- Each window runs 90 to 345 frames at 24 fps, up to 294 recommended.
+- Start at **832x480**, which is much faster, and use **1280x736** for finals.
+- Longer videos use Sliding Window: each window continues the last 17 frames of the previous one. Timestamps in a prompt are window time, so give one prompt per window, and end windows on cuts when you can.
+
+### Limits
+
+{limits}
+
+### Responsible Use
+
+The model does not know who it depicts: identity comes from the painted frames. Change only footage you have the rights to, never put a real person into a video without their agreement, and label results as AI-generated.
+
+Powered by [Viggle Remake](https://huggingface.co/Viggle/Viggle-Remake).
+"""
+
+VIGGLE_REMAKE_INFOS = {
+    "swap": "## Viggle Remake Swap: recast the people in a video\n\nReplaces people or characters, one or several at once, with face, hair, build and outfit all changing. The motion, camera, timing, soundtrack and everyone you do not change stay. For objects, backgrounds, weather or light, use **Viggle Remake Edit**.\n\n"
+            + _REMAKE_COMMON_INFOS.format(more_frames="a character turns to show another side or someone new enters", pin_when="Pin every painted frame of a swap: without pins, the model can render the source person again.",
+                                          limits="Every replaced person must appear in a painted frame, or they render as the source person. Faces under about 50 pixels at 832x480 drift, many fast cuts in one window weaken likeness, non-humanoid characters can fail in long takes, and fine detail can show small artifacts."),
+    "edit": "## Viggle Remake Edit: change objects, scenery, weather or light in a video\n\nRemoves, replaces or adds objects and changes the setting, weather, light or style. The people, motion, camera, timing and soundtrack stay. To recast people, use **Viggle Remake Swap**.\n\n"
+            + _REMAKE_COMMON_INFOS.format(more_frames="a shot lasts more than about 8 seconds or the changed object looks very different later", pin_when="Pin when the clip has cuts or when a composition matters: the output then copies that composition.",
+                                          limits="An object can come back between painted frames: add a painted frame there or name its absence in the prompt. Multi-shot clips without pins can drift in time, and fine detail can show small artifacts."),
+}
+
+VIGGLE_REMAKE_PROMPT_INFOS = """Write six sections, in this order, describing the **finished video**: `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`. Only this format has been tested.
+
+- `<Video 1>` is the source, `<Picture N>` the Nth painted frame and `<Subject N>` each thing that changes or stays.
+- Describe the result as it plays, never instructions ("replace", "change"). Say what changes in `retention_analysis`: anything marked preserved is kept literally.
+- Describe each subject well enough to tell it apart from similar people in the frame. When replacing people, bind each new character to the painted frames that show them, describe their whole look down to the shoes, and say whom they replace by that person's own looks.
+- Give each `[Shot N]` times as `MM:SS.mmm`, inside the window: `00:00.000` is its first frame. Open each shot with its framing; a later shot opens on its cut: `[Shot 2] At 00:03.792, the shot cuts to a close-up of...`.
+- Quote on-screen text exactly. Mark speech as `<Subject 1> (S1) is speaking with natural lip movements synchronized, <d>[unclear]</d>`, with the time it starts: never write the words, the sound comes from the source. A smile or gesture written at that moment competes with the mouth.
+- Replacing people, a painted frame is a `reference`, as below. Editing objects or scenery, it is `<Picture N> (target keyframe): fully_preserved - the target video passes through this exact frame.`
+- Never write "dim": it darkens the whole render.
+- The prompt enhancer sees your words and the painted frames, with the moment of each pinned one, but not the source video. Tell it whom each new character replaces, by that person's looks, where the cuts are and who speaks or sings when: it places the painted frames and describes how things look, and leaves the motion and camera to the source.
+
+```
+subject_definitions:
+<Video 1> is the source video for the editing task: one 5 s handheld take of a woman in a green coat crossing a station hall.
+<Picture 1> is a frame of the target video, from [Shot 1] at 00:01.500.
+<Subject 1> is Mara in <Picture 1>: a tall woman with short silver hair, in a rust-red raincoat, black trousers and black boots. She replaces the woman in the green coat with long dark hair in <Video 1>.
+
+summary:
+[video editing + character replacement] The target video is an edited version of <Video 1> in which the woman in the green coat becomes <Subject 1>, looking exactly as she does in <Picture 1>, crossing the same hall with the same steps. All other people, the place and the soundtrack are unchanged; the shot, camera, motion and timing of <Video 1> are kept.
+
+retention_analysis:
+<Video 1> (source video editing): fully_preserved - the single shot with no cut, the handheld camera, the hall, the crowd and the motion and timing of every performance.
+<Picture 1> (appears in [Shot 1]): reference - a frame of the target video. The people in it, their faces and clothing, and the background, framing and lighting are taken from <Picture 1>.
+<Subject 1> (appears in [Shot 1]): fully_preserved - her short silver hair, face, rust-red raincoat and black boots stay identical in every frame.
+
+detailed_description:
+Realistic handheld footage in soft station light.
+[Shot 1] A handheld medium shot of a busy station hall. <Subject 1> enters from the left and is exactly as <Picture 1> shows her at 00:01.500. At about 00:02.400 she passes the departures board and looks up. She leaves the frame on the right at 00:04.900. In every frame she is this same woman: no green coat and no long dark hair at any moment.
+
+overall_soundscape:
+The soundtrack of <Video 1>, unchanged.
+
+non_diegetic_music:
+N/A
+```
+"""
+
+VIGGLE_REMAKE_DEEPY_PROMPT_INFOS = "Six plain-text sections in order, a blank line between, nothing before the first: `subject_definitions:`, `summary:`, `retention_analysis:`, `detailed_description:`, `overall_soundscape:`, `non_diegetic_music:`. Describe the target video as it plays, present tense, never instructions (no replace, change, make). English, plain ASCII punctuation; never write \"dim\" (it darkens the whole render). subject_definitions: `<Video 1> is the source video for the editing task: <what it shows>.` (edit: `for the target video edit`); the painted frames, every one named in frame order: swap `<Picture 1> and <Picture 2> are frames of the target video, <Picture 1> from [Shot 1] at 00:01.750 and <Picture 2> from [Shot 1] at 00:09.250.`, edit one line each `<Picture N> is a frame of the target video, exactly as the target video shows it at that moment.`; swap: one `<Subject N>` per replacement character, bound to every picture that shows them, with face, hair, skin and the whole outfit down to the shoes, then whom they replace, by the source person's own looks and place: `<Subject 1> is Mara in <Picture 1> and <Picture 2>: <looks>. She replaces the woman in the green coat on the left in <Video 1>.`; edit: one subject per person kept, the object (and what replaces it) and the setting. summary: swap `[video editing + character replacement] The target video is an edited version of <Video 1> in which <source person> becomes <Subject 1>, looking exactly as she does in <Picture 1>. All other people, the place and the soundtrack are unchanged; the shots, cuts, camera, motion and timing of <Video 1> are kept.`, edit `[video editing] The target video is an edited version of <Video 1>. ...`. retention_analysis: `<Video 1> (source video editing): fully_preserved - the shots and the cuts at <MM:SS.mmm>, the camera framing and movement, the background, the unchanged people, and the motion and timing of every performance.`; each `<Picture N>`: swap `(appears in [Shot K]): reference - a frame of the target video. The people in it, their faces and clothing, and the background, framing and lighting are taken from <Picture N>.`, edit `(target keyframe): fully_preserved - the target video passes through this exact frame.`; each subject `(appears in [Shot K]): fully_preserved - <its look> stays identical in every frame`, or for an edit `removed - ...`, `replaced - ... by <Subject k>`, `new - ...`. detailed_description: a style line (realism, light, colour, camera), then `[Shot N]` opening with its framing (`[Shot 1] A medium shot of <Subject 1> skating down a dusty street, matching <Picture 1>.`), later shots `[Shot 2] At 00:03.792, the shot cuts to a close-up of ...`, times `MM:SS.mmm` in window time; who is where (replaced people as `<Subject N>`, everyone else by their look), what they do, the time each `<Picture N>` matches. Speech or singing: who and when, `<Subject 1> (S1) is singing with natural lip movements synchronized, <d>[unclear]</d>`, never the words (the sound comes from the source), and nothing else for the mouth at that moment (a smile competes with it). An action at a given moment gets its time (`only at about 00:03.200`); on-screen text is quoted verbatim. A swap ends with what must not come back: `In every frame <Subject 1> is this same woman exactly as in <Picture 1>: no short silver hair, no sunglasses at any moment.` Whole-person replacement: describe the outfit as the character's own, never `only the face` or `keeps the original clothes`. overall_soundscape: the ambience, voices and physical sounds of <Video 1> (`The soundtrack of <Video 1>, unchanged.` at least). non_diegetic_music: `N/A` unless the source has music the characters do not hear."
+
+_REMAKE_DEEPY_COMMON = " Input: `video_guide` (source; `video_prompt_type` holds `VU`) and 1-4 painted frames of it in `image_refs`, at its proportions. `video_prompt_type` `IVU` = painted frames only set the look; `FIVU` with `frames_positions` (one per image, ascending, the frame it was painted from, 1 = the first frame) pins them as keyframes: {pin_when}. With `video_mask`, `VA` in place of `VU` (`IVA`, `FIVA`) restores source pixels outside the mask. `audio_prompt_type` `K` keeps the source soundtrack (a silent source stays silent), `A` holds `audio_guide` instead. Fixed: 6 Euler steps, no guidance. Windows 90-345 frames (17n+5, 24 fps, up to 294 recommended); 832x480 for drafts, up to 1280x736. Longer: sliding window, overlap 17; prompts are window time, so one prompt per window (`multi_prompts_gen_type` `PW`). Identity comes only from the painted frames. For a video with cuts, `plan_video_windows` (wangp_toolbox) gives windows ending on cuts: `extract_video` each `render` range, trim the take to `own`, `merge_videos`; `detect_video_cuts` lists its shots and `check_video_edit` measures a take's cuts and borders against its source. Only for footage the user may change; never depict a real person without their agreement."
+VIGGLE_REMAKE_DEEPY_INFOS = {
+    "swap": "Replaces people or characters in a video, keeping motion, camera, timing and soundtrack; template of `swap_video`. For objects, scenery, weather or light use Viggle Remake Edit (`edit_video`). One painted frame per shot showing every replaced person, largest and sharp, at least 3 frames from a cut: a person absent from every frame renders as the source person. A second frame only for a face flipping side or a new person." + _REMAKE_DEEPY_COMMON.format(pin_when="pin every painted frame of a swap, as unpinned the source person can come back"),
+    "edit": "Removes, replaces or adds objects, or changes setting, weather, light or style in a video, keeping people, motion, camera, timing and soundtrack; template of `edit_video`. To recast people use Viggle Remake Swap (`swap_video`). One painted frame per shot showing the change clearly, a second only for shots over 8 s or a big change of look." + _REMAKE_DEEPY_COMMON.format(pin_when="use for cuts or when composition matters"),
+}
+
+_REMAKE_ENHANCER = """You write the prompt of Viggle Remake, which re-renders a source video, <Video 1>, with {purpose}. The motion, camera, cuts, timing and soundtrack all come from <Video 1>, which you do not see. You get the request and, under image_caption, a description of each painted frame: a frame of the target video, painted from a frame of the source, that sets the look. Write a description of the target video as it plays, never instructions ("replace", "change", "make").
+
+Each painted frame is <Picture N>, numbered as given, with its role:
+- "injected frame at 4.17s": the target video passes through this picture at 00:04.170.
+- "start image" and "end image": this picture is the first frame (00:00.000) or the last frame of the video.
+- "Image reference no N": a picture without a time, which sets the look. Give it no time anywhere: "<Subject 1> stands in the street, matching <Picture 1>", never "At 00:00.000, matching <Picture 1>".
+Name exactly the pictures described, with their numbers, and invent none. Write every time as MM:SS.mmm, from 00:00.000 to at most {{{{duration_seconds}}}} seconds.
+
+Output exactly these six sections in this order, a blank line between them, nothing before the first and no Markdown. Each name is followed by a colon and a line break.
+
+subject_definitions:
+{video_line}
+{picture_lines}
+{subject_lines}
+
+summary:
+{summary}
+
+retention_analysis:
+<Video 1> (source video editing): fully_preserved - {video_kept} are copied frame for frame.
+{picture_retention}
+{subject_retention}
+
+detailed_description:
+First one line for the style the pictures show: realistic footage or the animation style, the light and the colours. A dark place is in "low light", never "dim" or "dimly lit".
+Then [Shot 1], or one [Shot N] per shot when the request gives the cuts. Call the new characters and the changed things by their <Subject N> label, the name after it the first time ("<Subject 1>, Dolores"). Open each shot with its framing and place as its picture shows them: "[Shot 1] A medium shot of <Subject 1> on a dusty street ..."; a later shot opens on its cut: "[Shot 2] At 00:03.792, the shot cuts to a close-up of ...". Describe each timed picture at its time, with what it shows of the change: "At 00:04.170, exactly as in <Picture 1>, <what it shows>". When no picture has a time, write no time at all, except the cuts and moments the request gives. Never say how the view gets from one picture to the next, by a camera move or a cut, unless the request says so. An action, gesture or line gets the time the request gives it; never invent movements, camera moves or events: they come from <Video 1>. Something the request names that no picture shows goes in retention_analysis only, not at a moment. When the request says someone speaks or sings, write it as "<Subject 1> (S1) is singing with natural lip movements synchronized, <d>[unclear]</d>" (or "is speaking"), from the time the request gives: never the words, which come from <Video 1>, and nothing else about the mouth at that moment. {ending}
+
+overall_soundscape:
+The soundtrack of <Video 1>, unchanged. Add its voices and sounds when the request describes them.
+
+non_diegetic_music:
+N/A, unless the request describes music in <Video 1> that the people in it do not hear.
+
+Use English, plain ASCII punctuation and the present tense. Keep every explicit request and exclusion, and the names it gives. Quote on-screen text exactly. Never use the words "dim" or "dimly": they darken the whole video; write "low light" or "dark" instead. Return only the six sections.
+"""
+VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS = {
+    "swap": _REMAKE_ENHANCER.format(
+        purpose="its people or characters replaced by whole new ones: face, hair, build and outfit",
+        video_line="First, always, a line that starts with these exact words: <Video 1> is the source video for the editing task: <then what it is, as the request and the pictures tell it: the kind of footage, the place, who is in it>.",
+        picture_lines="One line naming every picture with its shot and time: <Picture 1> and <Picture 2> are two frames of the target video, <Picture 1> from [Shot 1] at 00:04.170 and <Picture 2> from [Shot 1] at 00:11.670. A picture without a time: <Picture 1> is a frame of the target video, from [Shot 1].",
+        subject_lines="One <Subject N> per new character, bound to every picture that shows them, with their name when the request gives one and their whole look as the pictures and the request show it: skin, face, hair, build and the whole outfit down to the shoes when visible. Then whom they replace, by that person's own looks and place in <Video 1> as the request describes them, or by their place in the picture when it does not: <Subject 1> is Mara in <Picture 1> and <Picture 2>: <her look>. She replaces the woman with short grey hair in the green coat on the left in <Video 1>.",
+        summary="[video editing + character replacement] The target video is an edited version of <Video 1> in which <the person replaced> becomes <Subject 1>, <the name>, looking exactly as she does in <Picture 1> and <Picture 2>. Then one sentence: all other people, the place and the soundtrack are unchanged, and the shots, cuts, camera, motion and timing of <Video 1> are kept. Use she, he or they as the request and the pictures make clear.",
+        video_kept="the shots and cuts, the camera framing and movement, the place, the people who stay, and the motion and timing of every performance",
+        picture_retention="One line per picture: <Picture 1> (appears in [Shot 1]): reference - a frame of the target video. The people in it, their faces and clothing, and the background, framing and lighting are taken from <Picture 1>. When several pictures show the same person, end the last of them with: A person shown in several pictures is the same person.",
+        subject_retention="One line per subject: <Subject 1> (appears in [Shot 1]): fully_preserved - <her face, hair and outfit, in a few words> stay identical in every frame.",
+        ending=("End with what must not come back: \"In every frame <Subject 1> is this same woman exactly as in <Picture 1>: no <the replaced person's own hair, glasses, hat or clothes, as the request names them> at any moment.\" "
+                "When the request does not describe the replaced person, write that their original look appears in no frame. Then: \"Only <Subject 1> changes, and everything else stays as in <Video 1>.\""),
+    ),
+    "edit": _REMAKE_ENHANCER.format(
+        purpose="objects, setting, weather, light or style changed while the people stay",
+        video_line="First, always, this exact line: <Video 1> is the source video for the target video edit.",
+        picture_lines="One line per picture: <Picture 1> is a frame of the target video, exactly as the target video shows it at that moment.",
+        subject_lines="One <Subject N> per thing removed or replaced, as it is in <Video 1> (the request says what it is): <Subject 1> is the wind turbines in <Video 1>: <their look and place>. One per new thing, as it appears in the target video: <Subject 2> is the snow in the target video: <its look and place>. One for the setting and one for each person who stays, each with enough looks to tell it apart from similar things in the frame.",
+        summary="[video editing] The target video is an edited version of <Video 1>. Then what the target video shows as it plays, with what is gone, new or changed, \"with exactly the same framing, motion, light and timing as <Video 1>\".",
+        video_kept="the framing and camera movement, the people, the place and every part the change does not touch",
+        picture_retention="One line per picture: <Picture 1> (target keyframe): fully_preserved - the target video passes through this exact frame.",
+        subject_retention="One line per subject: <Subject 1> (appears in [Shot 1]): removed - <it is gone in every frame, and what is visible where it stood>, or replaced - <what it becomes> by <Subject 2>, new - <what appears and where>, or fully_preserved - <what stays>.",
+        ending="For a removal, say what is visible where the thing stood and repeat that it is absent: \"no wind turbine anywhere in the frame\".",
+    ),
+}
 
 
 def load_fixed_prompt(filename):

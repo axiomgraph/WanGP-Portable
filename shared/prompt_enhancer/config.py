@@ -1,23 +1,28 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 
 PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY = "prompt_enhancer_speculative_decoding"
 PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO = 2
 PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT = PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO
-PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6))
-PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
+PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6, 7))
+PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8, 7: 12}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
 MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
 MTP_AUTO_FOUR_DRAFTS_VRAM_GB = 24  # Auto on Qwen3.8 27B: 4 draft tokens from this size, from MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai, 2 otherwise
 MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
+MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count of 4 on Qwen3.8 27B: this many while the recent drafts are accepted (tool calls, summaries, lists), 4 on the rest
+MTP_AUTO_LONG_BACKENDS = ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1")  # where the long chain was measured faster
 MTP_AUTO_NO_OFFLOAD_VRAM_GB = range(13, 17)  # Auto on GPUs of these sizes: MTP only when the whole model stays in VRAM with it. Below, the fit rule: part of the model often streams there anyway
+OTHER_PROGRAMS_VRAM_GIB = 1.5  # the VRAM the desktop and the other programs are expected to hold: Configuration's estimates count it, and a load that more than it slows down says so (other_programs_vram_advice)
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
-BLOCK_DRAFT_METHODS = ("dspark", "dflash2")
-SPECULATIVE_METHOD_LABELS = {"auto": "Auto", "disabled": "Disabled", "mtp": "MTP", "dspark": "DSpark", "dflash2": "DFlash2"}
-SPECULATIVE_MAX_TOKENS = {"mtp": 8, "dspark": 7, "dflash2": 7}
-SPECULATIVE_DEFAULT_TOKENS = {"mtp": 2, "dspark": 7, "dflash2": 5}
+BLOCK_DRAFT_METHODS = ("dspark", "dflash2", "dspine")
+SPECULATIVE_METHOD_LABELS = {"auto": "Auto", "disabled": "Disabled", "mtp": "MTP", "dspark": "DSpark", "dflash2": "DFlash2", "dspine": "DSpine"}
+SPECULATIVE_MAX_TOKENS = {"mtp": 8, "dspark": 7, "dflash2": 7, "dspine": 7}
+SPECULATIVE_DEFAULT_TOKENS = {"dspark": 7, "dflash2": 5, "dspine": 7}  # the block drafters' automatic draft count (MTP's follows the model and the GPU: mtp_auto_drafts)
+SPECULATIVE_AUTO_TOKENS = 0  # the automatic draft count in the settings form; saved as tokens None
 PROMPT_ENHANCER_SPECULATIVE_DECODING_CHOICES = [
     ("Auto (MTP)", PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO),
     ("Disabled", 0),
@@ -45,11 +50,12 @@ def normalize_prompt_enhancer_speculative_decoding(value: Any) -> int | str | di
 
 
 def speculative_decoding_config(method, tokens=None):
+    """The saved setting. tokens None (or SPECULATIVE_AUTO_TOKENS): the draft count is automatic, chosen when the model loads (resolve_prompt_enhancer_speculative_decoding)."""
     method = str(method).lower()
     if method not in SPECULATIVE_METHOD_LABELS:
         raise ValueError(f"Unknown speculative decoding method: {method}")
-    if method in SPECULATIVE_MAX_TOKENS:
-        tokens = SPECULATIVE_DEFAULT_TOKENS[method] if tokens is None else int(tokens)
+    if method in SPECULATIVE_MAX_TOKENS and tokens not in (None, SPECULATIVE_AUTO_TOKENS):
+        tokens = int(tokens)
         if not 1 <= tokens <= SPECULATIVE_MAX_TOKENS[method]:
             raise ValueError(f"{SPECULATIVE_METHOD_LABELS[method]} supports 1 to {SPECULATIVE_MAX_TOKENS[method]} draft tokens.")
     else:
@@ -58,6 +64,7 @@ def speculative_decoding_config(method, tokens=None):
 
 
 def split_speculative_decoding(value):
+    """(method, draft tokens) of a setting; tokens None: no drafts (Auto, Disabled) or an automatic draft count."""
     value = normalize_prompt_enhancer_speculative_decoding(value)
     if isinstance(value, dict):
         return value["method"], value["tokens"]
@@ -70,13 +77,25 @@ def split_speculative_decoding(value):
     return "mtp", 2 if value == 1 else value
 
 
+def mtp_auto_drafts(enhancer_enabled, qwen_backend, total_vram_gb) -> int:
+    """MTP's automatic draft count: 4 on Qwen3.8 Flash-Next and, from MTP_AUTO_FOUR_DRAFTS_VRAM_GB (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai), on Qwen3.8 27B; 2 otherwise."""
+    enhancer_no, vram_gb = int(enhancer_enabled or 0), max(0, int(float(total_vram_gb) + 0.5))
+    return 4 if enhancer_no == 7 or enhancer_no == 5 and vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if qwen_backend == "gguf_ptq1" else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
+
+
+def mtp_auto_long_drafts(enhancer_enabled, qwen_backend, drafts) -> int:
+    """The draft tokens of the long chain of an automatic draft count, 0 without one: where it was measured on Deepy's own passes
+    (Qwen3.8 27B, RTX 5090: Q4_K_M 7% faster, tool calls 12% and summaries 17%; Q3 2.5%; Bonsai PTQ1 1.6%; prose unchanged)."""
+    return MTP_AUTO_LONG_DRAFTS if int(enhancer_enabled or 0) == 5 and qwen_backend in MTP_AUTO_LONG_BACKENDS and int(drafts or 0) == 4 else 0
+
+
 def speculative_decoding_runtime(value):
     method, tokens = split_speculative_decoding(value)
     return {"auto": 2, "disabled": 0, "mtp": 1}.get(method, method), tokens
 
 
 def block_drafters_supported() -> bool:
-    """DSpark and DFlash2 run on Triton and FlashAttention 2 (the LLM engine uses each one wherever it is supported)."""
+    """DSpark, DFlash2 and DSpine run on Triton and FlashAttention 2 (the LLM engine uses each one wherever it is supported)."""
     from shared.llm_engines.lmgp.vllm_support import resolve_prompt_enhancer_lm_features
     features = resolve_prompt_enhancer_lm_features()
     return features.triton and features.flash
@@ -87,7 +106,7 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
     if prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         methods.append("mtp")
     if int(enhancer_enabled or 0) == 5 and quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") and block_drafters_supported():
-        methods.extend(BLOCK_DRAFT_METHODS)
+        methods.extend(method for method in BLOCK_DRAFT_METHODS if method != "dspine" or quantization != "gguf_ptq1")
     if isinstance(value, str) and value in SPECULATIVE_METHOD_LABELS:
         method, count = value, tokens
     else:
@@ -98,17 +117,19 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
     if method in BLOCK_DRAFT_METHODS:
         from .block_draft import block_draft_spec
         maximum = min(maximum, block_draft_spec(method, bonsai=quantization == "gguf_ptq1")["drafts"])
-    count = min(maximum, max(1, int(count or SPECULATIVE_DEFAULT_TOKENS[method]))) if maximum else None
+    count = (min(maximum, int(count)) if count else SPECULATIVE_AUTO_TOKENS) if maximum else None  # a method just selected starts on the automatic count
+    counts = [("Auto", SPECULATIVE_AUTO_TOKENS), *[(str(item), item) for item in range(1, maximum + 1)]] if maximum else []
     # Additional residency near 32K context, including draft weights/cache/state.
     # These are approximate ranges, not a capacity check (see BONSAI_VRAM.md).
     costs = {
         "auto": "0 to ~1 GiB" if "mtp" in methods else "0 GiB",
         "disabled": "0 GiB",
         "mtp": "~0.5–1 GiB",
-        "dspark": "~4–5 GiB",
-        "dflash2": "~4–5 GiB",
+        "dspark": "~3–4 GiB",
+        "dflash2": "~2.5 GiB",
+        "dspine": "~3 GiB",
     }
-    return [(f"{SPECULATIVE_METHOD_LABELS[item]} [+{costs[item]} VRAM]", item) for item in methods], method, list(range(1, maximum + 1)), count
+    return [(f"{SPECULATIVE_METHOD_LABELS[item]} [+{costs[item]} VRAM]", item) for item in methods], method, counts, count
 
 
 def prompt_enhancer_supports_speculative_decoding(enhancer_enabled: Any) -> bool:
@@ -122,22 +143,26 @@ def validate_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: 
     enabled = normalize_prompt_enhancer_speculative_decoding(value)
     runtime_mode, _ = speculative_decoding_runtime(enabled)
     if runtime_mode in BLOCK_DRAFT_METHODS and int(enhancer_enabled or 0) != 5:
-        raise ValueError("DSpark and DFlash2 require Qwen3.8-27B or Bonsai 2 27B.")
+        raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8-27B (DSpark and DFlash2 also Bonsai 2 27B).")
     if runtime_mode not in (0, PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO) and not prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         if int(enhancer_enabled or 0) == 3:
             raise ValueError("Speculative decoding is not available with Qwen3.5-4B.")
-        raise ValueError("Speculative decoding requires the Qwen3.5-9B, Qwen3.8-9B or Qwen3.8-27B prompt enhancer.")
+        raise ValueError("Speculative decoding requires the Qwen3.5-9B, Qwen3.8-9B, Qwen3.8-27B or Qwen3.8 Flash-Next prompt enhancer.")
     return enabled
 
 
 def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: Any, total_vram_gb: float | None = None, *, qwen_backend: str = "", fit=None) -> tuple[int | str | dict, str]:
-    """The speculative decoding a setting runs, and the message explaining an automatic choice. fit: a function giving (VRAM the model
+    """The speculative decoding a setting runs, and the message explaining an automatic choice: Auto decides whether MTP runs and with how many
+    draft tokens; a method with an automatic draft count always runs, with the count Auto would give MTP or the block drafter's own. fit: a function giving (VRAM the model
     needs without MTP, VRAM MTP adds, VRAM available) in bytes, or None if unknown. Auto then takes MTP unless it would push a model that
     fits in VRAM without it out of VRAM: measured on Qwen3.8 27B IQ2_M, MTP decodes 2.1x faster when both fit (15 GiB) and 1.5-1.7x when
     the weights stream either way (an 11 GB RTX 2080 Ti, a VRAM-limited RTX 4090 after a video), but 20% slower when the model fits
     only without it (11 GiB). On GPUs of MTP_AUTO_NO_OFFLOAD_VRAM_GB, it takes MTP only when nothing is offloaded with it. Without fit, a fixed VRAM size per model decides."""
     mode = validate_prompt_enhancer_speculative_decoding(enhancer_enabled, value)
-    if speculative_decoding_runtime(mode)[0] != PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:
+    method, tokens = split_speculative_decoding(mode)
+    if method in BLOCK_DRAFT_METHODS and tokens is None:
+        return speculative_decoding_config(method, SPECULATIVE_DEFAULT_TOKENS[method]), ""
+    if method not in ("auto", "mtp") or tokens is not None:
         return mode, ""
     try:
         enhancer_no = int(enhancer_enabled or 0)
@@ -155,11 +180,15 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
             total_vram_gb = 0
     bonsai = enhancer_no == 5 and qwen_backend == "gguf_ptq1"
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
-    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
+    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next"}.get(enhancer_no, "Qwen3.8-27B")
+    drafts = mtp_auto_drafts(enhancer_no, qwen_backend, total_vram_gb)
+    long_drafts = mtp_auto_long_drafts(enhancer_no, qwen_backend, drafts)
+    enabled, draft_tokens = speculative_decoding_config("mtp", drafts), f"{drafts} draft tokens{f', {long_drafts} on predictable text' if long_drafts else ''}"
+    if method == "mtp":
+        return enabled, f"MTP draft tokens chosen automatically for {model_label}: {draft_tokens}."
     if float(total_vram_gb) <= 8:  # small GPUs: the drafter, its caches and graphs would take room from the model's blocks
         return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
-    drafts = 4 if enhancer_no == 5 and detected_vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if bonsai else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
-    enabled, enabled_for = speculative_decoding_config("mtp", drafts), f"Speculative Decoding enabled automatically for {model_label} ({drafts} draft tokens)"
+    enabled_for = f"Speculative Decoding enabled automatically for {model_label} ({draft_tokens})"
     sizes = None if fit is None else fit()
     if sizes is None and bonsai:
         if float(total_vram_gb) > 10:
@@ -182,3 +211,28 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
     if detected_vram_gb >= required_vram_gb:
         return enabled, f"{enabled_for}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
     return 0, f"Speculative Decoding disabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
+
+
+def other_programs_vram_advice(enhancer_enabled: Any, value: Any, fit, others: int | None, total_vram_gb: float | None = None, *, qwen_backend: str = "") -> str:
+    """What to tell the user when the VRAM the other programs hold costs speed, "" otherwise: with no more than OTHER_PROGRAMS_VRAM_GIB of
+    it, Auto would run MTP, or the model would stay whole in VRAM with the speculative decoding of the setting (a block drafter's own VRAM
+    is not counted). fit: as for resolve_prompt_enhancer_speculative_decoding; others: the VRAM they hold in bytes, None if unknown."""
+    freed = 0 if others is None else others - int(OTHER_PROGRAMS_VRAM_GIB * 2**30)
+    sizes = fit() if freed > 0 else None
+    if sizes is None:
+        return ""
+    needed, extra, available = sizes
+
+    def outcome(available):  # (MTP runs, the model stays whole in VRAM) with this much VRAM
+        mtp = speculative_decoding_runtime(resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, value, total_vram_gb, qwen_backend=qwen_backend, fit=lambda: (needed, extra, available))[0])[0] == 1
+        return mtp, needed + (extra if mtp else 0) <= available
+    (mtp, whole), (expected_mtp, expected_whole) = outcome(available), outcome(available + freed)
+    if expected_mtp and not mtp:
+        gain = "Speculative Decoding would run, and the LLM would answer about twice as fast"
+    elif expected_whole and not whole:
+        gain = "the whole LLM would stay in VRAM, while part of it now runs from RAM, which is slower"
+    else:
+        return ""
+    tool = "scripts\\gpumem.cmd, in the WanGP folder," if sys.platform == "win32" else "nvidia-smi"
+    return (f"Other programs hold {others / 2**30:.1f} GiB of this GPU's VRAM, more than the {OTHER_PROGRAMS_VRAM_GIB:g} GiB expected: without the excess, {gain}. "
+            f"Run {tool} to see which programs hold VRAM, and close those you do not need.")

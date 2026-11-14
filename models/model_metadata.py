@@ -161,7 +161,7 @@ def infer_media_inputs(model_def):
     image_control = image_outputs and not model_def.get("reference_video_enabled", False)
     custom_guide = model_def.get("custom_guide")
     return {
-        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False)),
+        **({"custom_file": {"setting": "custom_guide", "name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False)),
                            **{key: custom_guide[key] for key in ("model_mode", "model_mode_not", "video_prompt_type", "video_prompt_type_not", "audio_prompt_type", "audio_prompt_type_not") if key in custom_guide}}} if custom_guide is not None else {}),
         "image": {
             "start": "S" in image_prompt_types_allowed,
@@ -283,7 +283,7 @@ def store_metadata(model_type, model_def, model_types_handlers, families_infos):
         "capabilities": infer_capabilities(model_def, main_outputs, outputs, inputs, media_inputs),
         "setting_values": infer_setting_values(model_def),
         **(resolution_metadata(model_def) if any(output in ("image", "video") for output in main_outputs) else {}),
-        **{key: copy.deepcopy(model_def[key]) for key in ("accelerated", "size", "specialities") if key in model_def},
+        **{key: copy.deepcopy(model_def[key]) for key in ("accelerated", "size", "specialities", "video_edit") if key in model_def},
     }
     return model_def
 

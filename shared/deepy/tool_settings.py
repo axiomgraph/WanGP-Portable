@@ -24,8 +24,12 @@ from shared.deepy.config import (
     DEEPY_DEFAULT_GEN_3D,
     DEEPY_DEFAULT_GEN_WORLD,
     DEEPY_DEFAULT_TEXTURE_3D,
+    DEEPY_DEFAULT_SWAP_VIDEO,
+    DEEPY_DEFAULT_EDIT_VIDEO,
     DEEPY_TEMPLATE_CONFIG_MIGRATIONS,
     DEEPY_TOOL_EDIT_IMAGE_KEY,
+    DEEPY_TOOL_EDIT_VIDEO_KEY,
+    DEEPY_TOOL_SWAP_VIDEO_KEY,
     DEEPY_TOOL_GEN_IMAGE_KEY,
     DEEPY_TOOL_GEN_SONG_KEY,
     DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY,
@@ -48,6 +52,8 @@ from shared.deepy.config import (
     normalize_deepy_tool_gen_3d,
     normalize_deepy_tool_gen_world,
     normalize_deepy_tool_texture_3d,
+    normalize_deepy_tool_swap_video,
+    normalize_deepy_tool_edit_video,
 )
 
 
@@ -70,6 +76,8 @@ TOOL_DISPLAY_NAMES = {
     "gen_world": "World Generator",
     "gen_3d": "3D Generator",
     "texture_3d": "3D Texturer",
+    "swap_video": "Video Person Replacer",
+    "edit_video": "Video Editor",
 }
 _TOOL_TEMPLATE_VALIDATION_ERRORS = {
     "gen_video": "The settings should generate a video",
@@ -83,6 +91,8 @@ _TOOL_TEMPLATE_VALIDATION_ERRORS = {
     "gen_world": "The settings should generate an explorable world",
     "gen_3d": "The settings should generate a 3D asset",
     "texture_3d": "The settings should texture a mesh",
+    "swap_video": "The settings should generate a video from a Control Video",
+    "edit_video": "The settings should generate a video from a Control Video",
 }
 # The template tasks, in the order of the settings pickers: a new one needs an entry here (config key, built-in default, ui_key: its field
 # in the Deepy tool settings), a display name, a validation rule and its templates folder; the settings forms, the CLI and the MCP catalog
@@ -115,6 +125,8 @@ _TOOL_CONFIG_SPECS = {
     "gen_3d": {"key": DEEPY_TOOL_GEN_3D_KEY, "default": DEEPY_DEFAULT_GEN_3D, "normalize": normalize_deepy_tool_gen_3d, "ui_key": "generator_3d_variant"},
     "texture_3d": {"key": DEEPY_TOOL_TEXTURE_3D_KEY, "default": DEEPY_DEFAULT_TEXTURE_3D, "normalize": normalize_deepy_tool_texture_3d, "ui_key": "texturer_3d_variant"},
     "gen_world": {"key": DEEPY_TOOL_GEN_WORLD_KEY, "default": DEEPY_DEFAULT_GEN_WORLD, "normalize": normalize_deepy_tool_gen_world, "ui_key": "world_generator_variant"},
+    "swap_video": {"key": DEEPY_TOOL_SWAP_VIDEO_KEY, "default": DEEPY_DEFAULT_SWAP_VIDEO, "normalize": normalize_deepy_tool_swap_video, "ui_key": "video_swapper_variant"},
+    "edit_video": {"key": DEEPY_TOOL_EDIT_VIDEO_KEY, "default": DEEPY_DEFAULT_EDIT_VIDEO, "normalize": normalize_deepy_tool_edit_video, "ui_key": "video_editor_variant"},
 }
 _PRESET_SOURCE_BUILTIN = "builtin"
 _PRESET_SOURCE_LINKED = "linked"
@@ -508,6 +520,8 @@ def validate_wangp_settings_payload_for_tool(tool_name: str, payload: dict[str, 
         "gen_video_with_speech": image_mode == 0 and accepts_audio_prompt,
         "gen_song": audio_only and isinstance(model_def, dict) and str(model_def.get("group", "") or "").strip() == "music",
         "gen_video_with_refs": image_mode == 0 and (has_image_refs or (isinstance(model_def, dict) and model_def.get("reference_video_enabled", False))),
+        "swap_video": image_mode == 0 and "V" in payload.get("video_prompt_type", ""),
+        "edit_video": image_mode == 0 and "V" in payload.get("video_prompt_type", ""),
         "gen_image": image_mode == 1,
         "edit_image": image_mode == 1 and has_image_refs,
         "gen_speech_from_description": audio_only,
@@ -821,6 +835,21 @@ def build_generation_task(
     return task
 
 
+def rename_saved_templates(server_config: dict[str, Any], renames: dict[str, dict[str, str]], settings_root: str | None = None) -> bool:
+    """Built-in templates renamed ({task: {old name: new name}}), for a model family's migrate_config: the choice saved in Deepy's settings and
+    the references Showrunner saved (in WanGP's settings folder: --settings unless given). Returns whether server_config changed."""
+    from plugins.showrunner.store import rename_templates, settings_folder
+    changed = False
+    for task, names in renames.items():
+        key = TOOL_CONFIG_KEYS[task]
+        if server_config.get(key) in names:
+            server_config[key] = names[server_config[key]]
+            changed = True
+    rename_templates(settings_folder(sys.modules["wgp"].args.settings if settings_root is None else settings_root),
+                     {f"{task}/{old}": f"{task}/{new}" for task, names in renames.items() for old, new in names.items()})
+    return changed
+
+
 __all__ = [
     "AGENT_TOOL_IDS",
     "GENERATION_TOOL_IDS",
@@ -853,6 +882,7 @@ __all__ = [
     "normalize_tool_loras",
     "load_tool_preset",
     "refresh_tool_presets",
+    "rename_saved_templates",
     "resolve_tool_variant",
     "resolve_wangp_settings_file",
     "validate_wangp_settings_for_tool",

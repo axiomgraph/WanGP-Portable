@@ -61,6 +61,7 @@ A file that fails is recorded and the batch moves on to the next one; the **Run*
 - **Target Ratio:** for outpainting, the aspect ratio of the result. Upscalers and frame interpolators show their **Upsampling** multiplier here instead, such as x2.
 - For **FlashVSR**, select the model and transformer quantization in **Configuration > Extensions > FlashVSR**, then choose One Pass or Two Pass in Media Flow.
 - For **SeedVR2**, select **3B** or **7B** in **Configuration > Extensions > SeedVR2**. The Upsampling control shows the selected model for both image and video processes. Each run or batch keeps the model it started with.
+- **RelayVSR** carries its memory of the previous keyframes from one piece to the next, so its pieces join as if the video were upscaled in one go. A resumed run rebuilds that memory from the frames just before the resume point, which keeps the join smooth but not identical to an uninterrupted run.
 - **Process Strength:** how strongly a restoration is applied. Lower values stay closer to the source, higher values push the effect further.
 - **Upscaler options:** some upscalers add their own settings below, such as the number of passes or tile sizes.
 - **Live Preview:** shows the last frame of the latest finished piece, so you can judge the result early and stop if it is not what you want.
@@ -70,7 +71,7 @@ A file that fails is recorded and the batch moves on to the next one; the **Run*
 
 Long videos are processed in **chunks**, short pieces processed one after the other and joined without visible seams. Only the current chunk is held in memory, so a two-hour video needs no more memory than a short clip.
 
-- **Chunk Size:** the length of each piece, in seconds. Shorter chunks need less memory and give earlier previews; longer chunks give the model more context and fewer joins.
+- **Chunk Size:** the length of each piece, in seconds. Shorter chunks need less memory and give earlier previews; longer chunks give the model more context and fewer joins. A chunk cannot be longer than what the process generates in one pass (481 frames for the LTX processes, 16 seconds at 30 FPS); a longer value is reduced to that length when the run starts.
 - **Sliding Window Overlap:** the number of frames each chunk shares with the previous one so that the joins stay seamless. The default suits most videos; increase it if you notice jumps at chunk boundaries.
 - **Start** and **End:** process only part of the video. Enter seconds (`90`), minutes and seconds (`01:30`) or hours, minutes and seconds (`01:02:30.5`). Leave them empty to process the whole video.
 - **Audio Track:** **Auto** keeps every audio track of the source; choose a track number to keep only that one. The audio is copied as it is, without re-encoding.

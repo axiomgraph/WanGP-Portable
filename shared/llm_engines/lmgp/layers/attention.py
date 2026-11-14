@@ -31,6 +31,12 @@ from . import kv_formats as kvf
 from . import attention_mixed
 
 _MIXED_KERNELS = True  # mixed layouts use the Triton kernels of attention_mixed where available (else the dense fallbacks)
+# The dense prefill (Attention.dense_prefill) serves chunks of this many tokens: below, a prefill lasts what its kernel launches take on the host,
+# and the check of the dense output would make each layer wait for the GPU (128 tokens at 8K of context: 129 ms exact, 140 ms dense).
+_DENSE_PREFILL_ROWS = 256
+# It reads a context of three slices or more by slices of this many tokens, merged by their softmax normalizations: what it takes in VRAM no longer
+# follows the context (27B, a 1,024-token chunk: 122 MiB at any length where 61K tokens at once took 282 MiB, for 1.7 % of the chunk's time).
+_DENSE_PREFILL_KEYS = 8192
 
 _DEFAULT_FLASH_ATTN_VARLEN_FUNC = flash_attn_varlen_func
 _DEFAULT_FLASH_ATTN_WITH_KVCACHE = flash_attn_with_kvcache
@@ -201,9 +207,9 @@ if triton is not None and tl is not None:
 
 
     @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
-    def q8_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr,
+    def q8_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr, tree_ptr,
                                   Q_PER_SEQ, H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
-                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr):
+                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr, TREE: tl.constexpr):
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
         group: tl.constexpr = H_Q // H_KV
@@ -215,6 +221,8 @@ if triton is not None and tl is not None:
         q = tl.load(q_ptr + (query_index[:, None] * H_Q + query_head[:, None]) * D + dims[None, :], mask=valid_rows[:, None], other=0.0)
         context_len = tl.load(lengths_ptr + sequence)
         prefix_len = context_len - Q_PER_SEQ
+        if TREE:  # tree verification: each row sees the prefix and the verify rows marked in its ancestor bits (itself included)
+            ancestors = tl.load(tree_ptr + sequence * Q_PER_SEQ + rows // group, mask=valid_rows, other=0)
         tiles_per_split = tl.cdiv(tl.cdiv(context_len, N), SPLITS)
         begin = split * tiles_per_split * N
         end = tl.minimum(context_len, (split + 1) * tiles_per_split * N)
@@ -234,7 +242,12 @@ if triton is not None and tl is not None:
             k_lo = (k - k_hi.to(tl.float32)).to(q.dtype)
             scores = tl.dot(q, k_hi)
             scores = tl.dot(q, k_lo, scores) * SCALE
-            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
+            if TREE:
+                local = columns - prefix_len
+                visible = (local[None, :] < 0) | (((ancestors[:, None] >> tl.maximum(local, 0)[None, :].to(tl.int64)) & 1) != 0)
+                valid = valid_rows[:, None] & valid_columns[None, :] & visible
+            else:
+                valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
             scores = tl.where(valid, scores, -1.0e20)
             new_maximum = tl.maximum(maximum, tl.max(scores, 1))
             correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
@@ -271,7 +284,8 @@ if triton is not None and tl is not None:
         tl.store(out_ptr + row * D + dims, result)
 
 
-def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, softmax_scale):
+def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, softmax_scale, tree_mask=None):
+    """tree_mask: per verify row, int64 bits of the verify rows it sees (tree verification); None: causal rows."""
     queries_per_sequence = q.shape[0] // context_lens.numel()
     groups = q.shape[1] // k_cache.shape[2]
     query_rows = queries_per_sequence * groups
@@ -285,13 +299,18 @@ def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, c
     maximum = torch.empty((*q.shape[:2], splits), device=q.device, dtype=torch.float32)
     denominator = torch.empty_like(maximum)
     output = torch.empty_like(q)
-    if _use_sm120_q8(q):
-        _log_kv_attention_backend_once("sm120_grouped_q8", f"[Deepy][KV cache] SM120 asynchronous copies enabled for Q8 decode/verification ({_SM120_Q8.__name__}).")
-        _SM120_Q8.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale)
+    sm120 = _SM120_Q8 if tree_mask is None else _sm120_tree_kernels()  # the wheel's precompiled SM120 kernel masks chains only
+    if sm120 is not None and _use_sm120_q8(q):
+        _log_kv_attention_backend_once("sm120_grouped_q8" + ("" if tree_mask is None else "_tree"), f"[Deepy][KV cache] SM120 asynchronous copies enabled for Q8 {'decode/verification' if tree_mask is None else 'tree verification'} ({sm120.__name__}).")
+        if tree_mask is None:
+            sm120.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale)
+        else:
+            sm120.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale, tree_mask)
     else:
         q8_grouped_partials_kernel[(context_lens.numel(), k_cache.shape[2], query_blocks * splits)](
-            q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator,
-            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, num_warps=4, num_stages=1)
+            q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, context_lens if tree_mask is None else tree_mask,
+            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, tree_mask is not None,
+            num_warps=4, num_stages=1)
     q8_grouped_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output, splits, q.shape[2], num_warps=4)
     return output
 
@@ -760,6 +779,7 @@ class Attention(nn.Module):
         self.k_min = self.v_min = None  # FP16 minimums of asymmetric body formats
         self.k_overlay = self.v_overlay = None  # exact Q8 overlays (sink and recent ring) of a mixed layout, [rows, H, D]
         self.k_overlay_scale = self.v_overlay_scale = None
+        self.dense_prefill = False  # opt-in (set by the runner): prefill by FlashAttention over the quantized cache dequantized to FP16
 
     def prepare_speculative_metadata(self, max_query_count: int, max_num_blocks: int) -> None:
         if self.k_cache.dtype != torch.int8 or not self.k_cache.is_cuda or _Q8_PAGED_ATTENTION is None:
@@ -793,11 +813,18 @@ class Attention(nn.Module):
         q8_grouped = q8_kernels and use_triton and self.head_dim in (32, 64, 128, 256) and (context.speculative_verify or not context.is_prefill)
         q8_prefill = q8_kernels and context.is_prefill and context.block_tables is not None and use_triton
         q8_speculative = q8_kernels and not mixed and context.speculative_verify and _Q8_PAGED_ATTENTION is not None
+        if context.tree_mask is not None and (bits or not q8_grouped or not (q.is_cuda and q.is_contiguous() and q.dtype in (torch.float16, torch.bfloat16))):
+            raise RuntimeError("Tree verification needs the grouped Q8 paged attention (a Q8 KV cache with Triton): this layer's backend only masks a chain.")
         if bits and quantized_cache and not mixed and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
             _log_kv_attention_backend_once("bf16_bits_q8", "[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention for Turing (BF16 read as bits, FP16 tensor cores, FP32 accumulation).")
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = bf16_bits.q8_paged_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output if context.speculative_verify else output.unsqueeze(1)
+        if (self.dense_prefill and quantized_cache and context.is_prefill and not context.speculative_verify and context.block_tables is not None and q.shape[0] >= _DENSE_PREFILL_ROWS
+                and self.flash_attn_varlen_func is not None and use_triton and attention_mixed.available(q, self, prefill=True)):
+            output = self._dense_prefill(q, context)
+            if output is not None:
+                return output
         if mixed and _MIXED_KERNELS and (use_triton or bits) and attention_mixed.available(q, self, prefill=context.is_prefill and not context.speculative_verify):
             if context.speculative_verify or not context.is_prefill:
                 _log_kv_attention_backend_once("mixed_grouped", f"[Deepy][KV cache] decode/verification backend=grouped paged attention over the {self.kv_layout.value} cache (Triton, FP32 accumulation).")
@@ -811,7 +838,7 @@ class Attention(nn.Module):
             if q8_grouped:
                 _log_kv_attention_backend_once("grouped_triton_q8", f"[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
                 context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
-                output = _q8_grouped_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
+                output = _q8_grouped_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale, context.tree_mask)
                 return output if context.speculative_verify else output.unsqueeze(1)
             if context.speculative_verify:
                 _log_kv_attention_backend_once("speculative_llamacpp_q8", f"[Deepy][Speculative] verification backend=batched llama.cpp fattn-vec Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
@@ -910,6 +937,36 @@ class Attention(nn.Module):
                 )
         return o
 
+    def _dense_prefill(self, q: torch.Tensor, context) -> torch.Tensor | None:
+        """Prefill attention of a chunk by FlashAttention over the keys and values of its context dequantized to FP16, about four times
+        faster than the exact kernels over the quantized cache. Costs: 2 x H_KV x D FP16 values per context token while the call lasts, and
+        operands rounded to FP16 (error of the output against an FP64 reference 1.73e-3 where the exact kernel's is 1.66e-3, the rounding of
+        a BF16 output). None when a value leaves FP16's range: the exact kernel then serves the call."""
+        _log_kv_attention_backend_once("dense_prefill", "[Deepy][KV cache] prefix prefill backend=FlashAttention over the cache dequantized to FP16 (faster prefill option).")
+        keys, slice_keys = int(context.max_seqlen_k), max(_DENSE_PREFILL_KEYS, q.shape[0])
+        if context.cu_seqlens_k.numel() != 2 or keys < 3 * slice_keys:  # several sequences, or a context that takes no more at once than by slices
+            dense_k, dense_v = context.dense_kv = attention_mixed.dense(self, context, torch.float16, context.dense_kv)
+            output = self.flash_attn_varlen_func(q.to(torch.float16), dense_k, dense_v, max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                                 max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k, softmax_scale=self.scale, causal=True)
+            return output.to(q.dtype) if bool(torch.isfinite(output).all()) else None
+        if context.dense_slices is None:  # the last slice holds the chunk's own keys (causal); every query sees the earlier ones whole, in even slices
+            last = (keys - slice_keys) // 32 * 32
+            step = -(-last // (-(-last // slice_keys) * 32)) * 32
+            starts = [*range(0, last, step), last]
+            context.dense_slices = [(start, stop - start, torch.tensor([0, stop - start], dtype=torch.int32, device=q.device)) for start, stop in zip(starts, [*starts[1:], keys])]
+        q16, output, total, capacity = q.to(torch.float16), None, None, max(count for _, count, _ in context.dense_slices)
+        for start, count, bounds in context.dense_slices:
+            dense_k, dense_v = context.dense_kv = attention_mixed.dense(self, context, torch.float16, context.dense_kv, start, count, capacity)
+            part, normalization, _ = self.flash_attn_varlen_func(q16, dense_k[:count], dense_v[:count], max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q, max_seqlen_k=count,
+                                                                 cu_seqlens_k=bounds, softmax_scale=self.scale, causal=start + count == keys, return_attn_probs=True)
+            if output is None:
+                output, total = part.float(), normalization
+            else:  # softmax over both sets of keys: each part weighs its share of the summed exponentials
+                share = (normalization - total).transpose(0, 1).unsqueeze(-1)
+                output.mul_(torch.sigmoid(-share)).addcmul_(part, torch.sigmoid(share))
+                total = torch.logaddexp(total, normalization)
+        return output.to(q.dtype) if bool(torch.isfinite(output).all()) else None
+
     def _dense_caches(self, dtype: torch.dtype, context) -> tuple[torch.Tensor, torch.Tensor]:
         """The quantized cache as dense [pages, page, H, D] tensors for the SDPA / FlashAttention paths, exact overlays applied."""
         layout = self.kv_layout
@@ -942,6 +999,20 @@ if triton is not None:
 
 def _use_sm120_q8(q):
     return torch.version.hip is None and _SM120_Q8 is not None and q.shape[-1] == 256 and torch.cuda.get_device_capability(q.device) == (12, 0)
+
+
+_SM120_TREE = []
+
+
+def _sm120_tree_kernels():
+    """The Gluon source of the SM120 kernel, which also masks trees (None without Gluon: the portable Triton kernel serves trees)."""
+    if not _SM120_TREE:
+        try:
+            from . import attention_sm120
+        except ImportError:
+            attention_sm120 = None
+        _SM120_TREE.append(attention_sm120 if torch.version.hip is None else None)
+    return _SM120_TREE[0]
 
 
 if triton is not None and tl is not None:

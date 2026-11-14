@@ -463,8 +463,8 @@ Depending on your configuration, it either:
 | **Florence 2 + Llama Joy 8B** | Produces richer local rewriting than the 3B option but uses more memory. | Use when you prefer this writing style and do not need Deepy Prime. |
 | **Qwen3.5 VL Abliterated 4B** | Handles text and images in one local model with relatively low memory use. | Recommended local starting point for most users. |
 | **Qwen3.5 VL Abliterated 9B** | Better instruction following and richer prompts than 4B, with higher VRAM/RAM use. | Use when quality matters and it fits comfortably beside your generation model. |
-| **Qwen3.8 VL Uncensored 9B** | Instruction following close to the 27B in about a third of its memory, with less general knowledge, longer thinking and weaker image understanding. It supports Deepy Prime. | Use for Deepy Prime or quality prompts on GPUs with about 8 to 12 GB of VRAM. |
-| **Qwen3.8 VL Uncensored 27B** | Strongest local understanding and rewriting, but much heavier to load and run. It supports Deepy Prime. | Use for quality-first work and complex visual instructions on high-memory systems. |
+| **Qwen3.8 VL Uncensored 27B** | Strongest local understanding and rewriting, but much heavier to load and run. It supports Deepy Prime. | Use for quality-first work and complex visual instructions on high-memory systems; on GPUs with less than 16 GB of VRAM, choose its Bonsai 2 PTQ1_0 quantization. |
+| **Qwen3.8 VL Flash-Next 125B** | The largest local model, kept mostly in RAM and on the drive with what the text needs in VRAM. It supports Deepy Prime. | Use on a PC with about 64 GB of RAM and a fast SSD (an 80 GB download). |
 | **Codex** | Uses the selected external Codex model and does not occupy WanGP's local GPU memory. | Use when you already have Codex configured and want strong remote instruction following. |
 | **Claude Code** | Uses the selected external Claude model and does not occupy WanGP's local GPU memory. | Use when Claude is your preferred writing/reasoning provider. |
 | **OpenCode** | Connects through OpenCode to its configured provider, including supported cloud or local OpenAI-compatible services. | Use when you need provider flexibility or already manage models through OpenCode. |
@@ -511,7 +511,7 @@ She steps onto the dimly lit stage, spotlight cutting through haze. "Welcome guy
 
 ### Images And Window Commands During Enhancement
 
-Local Qwen enhancement can use all Reference Images together with the current Start Image, End Image, and Control Image where supported. You can refer to them in your prompt as `Image reference no 1`, `start image`, `end image`, and `Control Image`. When the first reference is selected as the main image, it is named `Main Ref. Image`; subsequent references keep their numbers. Injected references also have a time label, such as `Image reference no 2 (Frame 2s/15s)`; a reference at the window's endpoint is identified as `end image`. Florence-based enhancers use one image caption per prompt.
+Local Qwen enhancement and remote LLMs can use all Reference Images together with the current Start Image, End Image, and Control Image where supported; a remote LLM receives the images of each prompt with their names. You can refer to them in your prompt as `Image reference no 1`, `start image`, `end image`, and `Control Image`. When the first reference is selected as the main image, it is named `Main Ref. Image`; subsequent references keep their numbers. Injected references also have a time label, such as `Image reference no 2 (Frame 2s/15s)`; a reference at the window's endpoint is identified as `end image`. Florence-based enhancers use one image caption per prompt.
 
 When continuing a video, its last retained frame (after source trimming) is available to the enhancer as `start image`. `[/new_shot]` omits this visual anchor.
 
@@ -542,7 +542,8 @@ Speculative decoding can make supported local Qwen text generation faster by pre
 
 - **Auto** is recommended. It normally enables acceleration with at least 12 GB VRAM for Qwen3.5 9B or 24 GB for Qwen3.8 27B.
 - **Disabled** saves the additional VRAM and is appropriate when the generation model needs that memory.
-- **2, 3, or 4 draft tokens** allows manual tuning. More draft tokens are not always faster; start with 2 and compare repeated prompts if you want to tune it.
+- **A method with Number of Tokens on Auto** keeps that method on and lets WanGP choose the draft count for your model and GPU.
+- **A method with a fixed Number of Tokens** allows manual tuning. More draft tokens are not always faster; compare repeated prompts if you want to tune it.
 
 Qwen3.5 4B and the Florence/Llama engines do not support this option. Quantization, speculative decoding, local sampling controls, and local VRAM-loading controls are hidden when an external engine is selected because the external provider owns its runtime behavior.
 

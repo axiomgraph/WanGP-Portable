@@ -70,6 +70,7 @@ class Showrunner:
         self.store, self.host = store, host
         self.director = Director(store, host, settle=self.settle)
         self._renders: dict[tuple[str, str], Any] = {}
+        self._voice_changes: set[str] = set()  # productions whose song is changing voice
         self._render_lock = threading.Lock()
         self._analysis_lock = threading.Lock()
 
@@ -87,8 +88,9 @@ class Showrunner:
         return facts
 
     def upload(self, production_id: str, filename: str, data_path: Path, role: str = "bin", target: str | None = None) -> dict[str, Any]:
-        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id),
-        track (narration, score or effects over the edit) or subtitles (an SRT file)."""
+        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id; a sound
+        plays over the edit from that shot), shot (a video or a picture as a new shot, target = its position or the end), painted (target = "shot:frame",
+        a remake's painted frame), track (narration, score or effects over the edit, from shot target or 0 s) or subtitles (an SRT file)."""
         production = self.store.get(production_id)
         suffix = Path(filename).suffix.lower()
         if role == "subtitles":
@@ -106,6 +108,10 @@ class Showrunner:
         if role == "song":
             production.apply([{"op": "brief", "fields": {"song": relative}}])
             self.analysis(production_id, refresh=True)
+        elif role == "source":
+            if facts["kind"] != "video":
+                raise ValueError("A remake's source is a video.")
+            production.apply([{"op": "brief", "fields": {"source": relative}}])
         elif role == "reference":
             references = production.snapshot()["brief"]["references"] + [relative]
             production.apply([{"op": "brief", "fields": {"references": references}}])
@@ -119,21 +125,33 @@ class Showrunner:
                 production.apply([{"op": "update_cast", "cast": member["id"], "fields": {"voice": relative}}])
             else:
                 production.apply([{"op": "update_cast", "cast": member["id"], "fields": {"images": member["images"] + [relative], "master": member["master"] or relative}}])
+        elif role == "track" or role == "take" and facts["kind"] == "audio":  # a sound dropped on a shot plays over the edit from that shot, never as its take
+            doc = production.snapshot()
+            start = next((part["start_s"] for part in model.timeline(doc) if part["shot"] == target), 0.0)
+            tracks = doc["edit"]["audio_tracks"] + [{"path": relative, "start_s": round(start, 3), "gain_db": 0.0}]
+            production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if doc["edit"]["audio_mode"] == "song" else {})}}])
         elif role == "take":
             production.apply([{"op": "add_take", "shot": target, "take": {**facts, "note": "Uploaded"}}])
-        elif role == "track":
-            tracks = production.snapshot()["edit"]["audio_tracks"] + [{"path": relative, "start_s": 0.0, "gain_db": 0.0}]
-            production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if production.snapshot()["edit"]["audio_mode"] == "song" else {})}}])
+        elif role == "shot":  # a video or a picture of the user's as a new shot (target: its position, else the end)
+            if facts["kind"] == "audio":
+                raise ValueError("A shot is a video or a picture: drop a sound on a shot to play it from there.")
+            position, fields = model.media_shot(production.snapshot(), {**facts, "name": filename}, int(target) if str(target or "").isdigit() else None)
+            target = production.apply([{"op": "add_shots", "position": position, "shots": [fields]}])[0]["shots"][0]
+        elif role == "painted":  # target "shot:frame": the user's own picture of that frame of a remake's shot
+            shot_id, _, frame = str(target or "").rpartition(":")
+            if facts["kind"] != "image" or not frame.isdigit():
+                raise ValueError("A painted frame is a picture, for one frame of a shot.")
+            ShowrunnerToolbox(self).place_picture(production, shot_id, int(frame), stored)
         else:
             production.apply([{"op": "bin_add", "item": {**facts, "name": Path(filename).name, "by": "user"}}])
         return {"path": relative, "role": role, "target": target, **facts}
 
     def add_take(self, production_id: str, shot_id: str, path: str | Path, *, by: str, settings: dict[str, Any] | None = None, media_id: str | None = None,
-                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None) -> dict[str, Any]:
+                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None, tier: str | None = None, kept_source: bool = False, choose: bool = True) -> dict[str, Any]:
         production = self.store.get(production_id)
         facts = self.take_facts(production, production.resolve(production.adopt(path)))  # a take from outside the production is copied in
-        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras}
-        result = production.apply([{"op": "add_take", "shot": shot_id, "take": take}], by=by)
+        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras, "tier": tier, "kept_source": kept_source}
+        result = production.apply([{"op": "add_take", "shot": shot_id, "take": take, "choose": choose}], by=by)
         return {**result[0], **facts}
 
     def hear_take(self, production, shot_id: str, take_id: str, listening=None) -> dict[str, Any] | None:
@@ -195,6 +213,120 @@ class Showrunner:
         production.apply([{"op": "audio", "analysis": analysis}], by="system", record=False)
         return analysis
 
+    def change_singer_voice(self, production, samples: list[Path], *, by: str, on_progress=None) -> dict[str, Any]:
+        """The production's song sung in other voices, by WanGP's SeedVC audio processor as it is (it takes the singing out of the music, converts
+        it and puts the music back). samples: one voice sample, or two for a duet in the order their voices are first heard. The new version
+        becomes the song, the former one goes to the bin."""
+        doc = production.snapshot()
+        song = production.resolve(doc["brief"].get("song"))
+        if song is None or not song.is_file():
+            raise ValueError("This production has no song yet.")
+        if not 1 <= len(samples) <= 2:
+            raise ValueError("One singer, or two for a duet: SeedVC tells two voices apart, not more.")
+        made = production.adopt(self.host.replace_singer_voice(song, samples, self.host.production_workspace(doc["title"], production.folder / "media"), on_progress=on_progress))
+        former = {**self.take_facts(production, song), "name": f"{song.stem} (former voice){song.suffix}"}
+        production.apply([{"op": "bin_add", "item": former}, {"op": "brief", "fields": {"song": made}}], by=by)
+        self.analysis(production.id, refresh=True)
+        return {"song": made, "former": doc["brief"]["song"]}
+
+    @staticmethod
+    def singers(doc: dict[str, Any], members: list[dict[str, Any] | None]) -> None:
+        """Checks who sings: one, or two for a duet, each a cast member with a voice (a sample or a description) or None for a voice sample."""
+        if not 1 <= len(members) <= 2:
+            raise ValueError("One singer, or two for a duet: SeedVC tells two voices apart, not more.")
+        for member in members:
+            if member is not None and not member.get("voice") and not str(member.get("voice_description") or "").strip():
+                raise ValueError(f"{member['name'] or member['id']} has no voice yet: give them a voice sample, or describe their voice, on the Cast page.")
+
+    def change_singer_voice_directly(self, production_id: str, singers: list[str]) -> dict[str, Any]:
+        """Change the song's singing voices without the showrunner, in the background. singers: one, or two for a duet, in the order their voices
+        are first heard in the song: cast ids (their voice sample, made first from their voice description when they have none) or voice samples
+        of the production (their paths)."""
+        production = self.store.get(production_id)
+        if self.director.status(production_id)["running"]:
+            raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")
+        doc = production.snapshot()
+        if not doc["brief"].get("song"):
+            raise ValueError("This production has no song yet.")
+        if unavailable := self.host.singer_voice_unavailable():
+            raise ValueError(unavailable)
+        cast = {member["id"]: member for member in doc["cast"]}
+        entries = [(cast.get(singer), None if singer in cast else singer) for singer in singers]
+        self.singers(doc, [member for member, _ in entries])
+        with self._render_lock:
+            if production_id in self._voice_changes:
+                raise RuntimeError("The singer's voice is already changing.")
+            self._voice_changes.add(production_id)
+        threading.Thread(target=self._change_singer_voice, args=(production, entries), daemon=True).start()
+        return {"status": "changing"}
+
+    def _change_singer_voice(self, production, entries):
+        publish = lambda **fields: self.store.publish({"type": "song_voice", "production": production.id, **fields})
+        context = _DirectContext(self, production)
+        try:
+            publish(progress=0, status="Waiting for the GPU")
+            with self.host.gpu_turn(context.cancelled):  # never beside a language model, after the showrunners at work
+                publish(progress=0, status="Changing the singer's voice")
+                toolbox, doc = ShowrunnerToolbox(self), production.snapshot()
+                catalog = self.catalog(doc)  # a voice made from its description is kept on the card, as the showrunner's are
+                samples = [production.resolve(toolbox._voice(context, production, member, catalog, templates.effective(doc, catalog))[0] if member else path) for member, path in entries]
+                self.change_singer_voice(production, samples, by="user", on_progress=lambda update: publish(progress=getattr(update, "progress", None), status=getattr(update, "status", "")))
+            publish(done=True)
+        except Exception as failure:
+            publish(done=True, error=str(failure))
+        finally:
+            with self._render_lock:
+                self._voice_changes.discard(production.id)
+
+    @staticmethod
+    def _delivered(shot: dict[str, Any], fps: float) -> tuple[int, int]:
+        """The frames of a remake's shot that the edit keeps, from the start of what it renders: its first and how many."""
+        keep_from, keep_to = (list(shot.get("trim") or []) + [0.0, None])[:2]
+        first, last = round(float(keep_from or 0.0) * fps), shot["source_range"][1] - shot["source_range"][0] if keep_to is None else round(float(keep_to) * fps)
+        return first, last - first
+
+    def shot_size(self, production, doc: dict[str, Any], shot: dict[str, Any], *, final: bool = False) -> str:
+        """The size a video shot renders at, final or as a draft. A shot made from a video keeps that video's shape, below its model's largest size."""
+        name = model.tier_name(doc["brief"], final)
+        if not shot.get("source_range"):
+            return model.RESOLUTIONS[doc["brief"]["aspect"]][name]
+        entry = templates.resolve(self.catalog(doc), shot["generation"].get("template"))
+        return media.fitted_canvas(production.resolve(doc["remake"]["path"]), name, (entry or {}).get("pixels"))
+
+    def media_of(self, production_id: str, media_id: str) -> Path | None:
+        """The file a Gallery media id the showrunner names: the take or the bin item that recorded it, else its media in the production's
+        workspace Gallery (a picture used as a shot's start, say); None when neither has it."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        path = next((item["path"] for item in [*doc["bin"], *(take for shot in doc["shots"] for take in shot["takes"])] if item.get("media") == media_id), None)
+        if path:
+            return production.resolve(path)
+        found = doc["director"].get("workspace") and self.host.gallery_media(doc["director"]["workspace"], media_id)
+        return Path(found) if found else None
+
+    def source_part(self, production_id: str, shot_id: str) -> Path:
+        """What a remake's shot delivers, as a video of its own for the page's player: cut once, the first time it is looked at."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        shot, fps = model.find(doc["shots"], shot_id, "shot"), doc["remake"]["fps"]
+        first, frames = self._delivered(shot, fps)
+        return media.video_window(production.resolve(doc["remake"]["path"]), shot["source_range"][0] + first, frames, fps, production.folder / "media" / "source")
+
+    def source_frame(self, production_id: str, shot_id: str, frame: int) -> Path:
+        """One frame of a remake's source, numbered as in the source, for the user to paint elsewhere."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        ShowrunnerToolbox._shot_frame(doc, shot_id, frame)
+        return media.video_frame(production.resolve(doc["remake"]["path"]), frame, production.folder / "media" / "painted")
+
+    def take_part(self, production_id: str, shot_id: str, take_id: str) -> Path:
+        """The same of a take: a render runs on past its shot's cut, and those frames, never in the edit, show the next camera shot as it was."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        shot, fps = model.find(doc["shots"], shot_id, "shot"), doc["remake"]["fps"]
+        first, frames = self._delivered(shot, fps)
+        return media.video_window(production.resolve(model.find(shot["takes"], take_id, "take")["path"]), first, frames, fps, production.folder / "media" / "parts")
+
     def waveform(self, production_id: str, path: str) -> dict[str, Any]:
         production = self.store.get(production_id)
         file = production.resolve(path)
@@ -226,7 +358,7 @@ class Showrunner:
     def template_roles(self, production_id: str) -> dict[str, Any]:
         """The template picker: each Deepy category with its templates, the automatic one (Deepy's selection) and the user's pick."""
         doc = self.store.get(production_id).snapshot()
-        return {"roles": templates.choices(doc, self.catalog(doc))}
+        return {"roles": templates.choices(doc, self.catalog(doc), self.host.prompt_rules())}
 
     def choose_template(self, production_id: str, role: str, template: str | None) -> dict[str, Any]:
         production = self.store.get(production_id)
@@ -242,11 +374,20 @@ class Showrunner:
 
     def default_template_roles(self) -> dict[str, Any]:
         """The same picker for the templates new productions start with."""
-        return {"roles": templates.choices(self._defaults(), self.catalog(self._defaults()))}
+        return {"roles": templates.choices(self._defaults(), self.catalog(self._defaults()), self.host.prompt_rules())}
 
     def choose_default_template(self, role: str, template: str | None) -> dict[str, Any]:
         self.host.save_default_templates(templates.pick(self.host.default_templates(), self.catalog(self._defaults()), role, template))
         return self.default_template_roles()
+
+    def set_prompt_rules(self, template: str, text: str) -> dict[str, Any]:
+        """The user's rules for the prompts the showrunner writes with a template, in every production (empty text: none)."""
+        entry = templates.resolve(self.host.template_catalog([template]), template)
+        if entry is None:
+            raise ValueError(f"{template} is not one of Deepy's templates.")
+        name, text = templates.entry_name(entry), text.strip()
+        self.host.save_prompt_rules({key: value for key, value in self.host.prompt_rules().items() if key != name} | ({name: text} if text else {}))
+        return {"template": name, "rules": text}
 
     def frame_sizes(self, production_id: str) -> dict[str, Any]:
         """What the shots of the edit come out at: their take's real size (shot true); not shot yet, what their model makes of the brief's format or of
@@ -261,7 +402,7 @@ class Showrunner:
                 sizes[shot["id"]] = {"size": f"{take['width']}x{take['height']}", "shot": True}
                 continue
             entry = templates.resolve(catalog, shot["generation"].get("template"))
-            requested = shot["generation"].get("settings", {}).get("resolution") or model.resolution(doc["brief"])
+            requested = shot["generation"].get("settings", {}).get("resolution") or self.shot_size(self.store.get(production_id), doc, shot)
             size = None if entry is not None and entry.get("sized_by_ref") and entry["task"] != "edit_image" else self.host.frame_size(entry, requested) if entry is not None and entry.get("model_type") else requested
             sizes[shot["id"]] = {"size": size, "shot": False}
         return {"sizes": sizes}
@@ -411,9 +552,9 @@ class Showrunner:
         production = self.store.get(production_id)
         with self._render_lock:
             busy = {shot for key, shot in self._renders if key == production_id}
-        stale = [shot for shot in production.snapshot()["shots"] if shot["status"] in ("rendering", "queued") and shot["id"] not in busy]
+        stale = [shot for shot in production.snapshot()["shots"] if shot["status"] in ("rendering", "queued") and shot["id"] not in busy and shot.get("rendering_with") not in busy]  # a remake's shot rendering with another is as busy as it
         if stale:
-            production.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendered" if shot["takes"] else "planned"}} for shot in stale], by="system", record=False)
+            production.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendered" if shot["takes"] else "planned", "rendering_with": None}} for shot in stale], by="system", record=False)
         return [shot["id"] for shot in stale]
 
     def undo(self, production_id: str, redo: bool = False) -> dict[str, Any]:
@@ -430,9 +571,13 @@ class Showrunner:
         production = self.store.get(production_id)
         doc = production.snapshot()
         shot = model.find(doc["shots"], shot_id, "shot")
+        if shot.get("source_range") and shot["takes"]:  # a remake's shot renders from its own settings, with the neighbours it renders together with
+            self.render_directly(production_id, [shot_id])
+            return {"shot": shot_id, "status": "rendering"}
         take = model.chosen_take(shot)
         if take is None or not take.get("settings"):
             raise ValueError("This shot has no take with saved settings yet: use Render now.")
+        tier = take.get("tier")
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
         if take.get("base_loras"):  # the cast cards say which LoRAs of the cast this take gets, as they are now
@@ -443,41 +588,45 @@ class Showrunner:
             settings = {"template": template, **{key: value for key, value in settings.items() if key in CONTENT_SETTINGS}}
             if entry is not None and not entry["refs"]:
                 settings.pop("image_refs", None)
-            if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide"):
-                settings["audio_prompt_type"] = "AS"  # as render: a reference template follows the driving audio as its soundtrack
+        if letters := templates.soundtrack_letters(shot, entry, settings):
+            settings["audio_prompt_type"] = letters  # as render: the driving audio kept as the soundtrack the picture follows
         settings.update(templates.planned_length(doc, shot, entry))  # the shot as it is now, not its last take's length
         if not settings.get("audio_guide") and templates.model_speaks(doc, shot, entry) and settings.get("prompt"):
             settings["prompt"] = templates.with_spoken_lines(doc, shot, entry, settings["prompt"])  # the shot's prompt does not hold its lines
         settings, base_loras = self.with_cast_loras(doc, shot, entry, settings)
         if new_seed:
             settings["seed"] = random.randint(0, 2 ** 31 - 1)
-        key = (production_id, shot_id)
+        key, context = (production_id, shot_id), _DirectContext(self, production)  # cancels it while it waits for its turn as while it renders
         with self._render_lock:
             if key in self._renders:
                 raise RuntimeError("This shot is already rendering.")
-            workspace = self.host.production_workspace(doc["title"], production.folder / "media")
-            job = self.host.submit_generation(settings, workspace, on_progress=lambda update: self.store.publish(
-                {"type": "render", "production": production_id, "shot": shot_id, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
-            self._renders[key] = job
+            self._renders[key] = context
+        workspace = self.host.production_workspace(doc["title"], production.folder / "media")
         production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "rendering"}}], by="user", record=False)
-        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, job, settings, base_loras), daemon=True).start()
+        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, context, workspace, settings, base_loras, tier), daemon=True).start()
         return {"shot": shot_id, "status": "rendering"}
 
-    def _finish_rerun(self, production_id, shot_id, job, settings, base_loras=None):
+    def _finish_rerun(self, production_id, shot_id, context, workspace, settings, base_loras=None, tier=None):
         production = self.store.get(production_id)
-        started = time.time()
         try:
-            result = job.result()
-            files = list(getattr(result, "generated_files", None) or [])
-            if getattr(result, "success", False) and files:
-                taken = self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras)
-                production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
-                self.hear_take(production, shot_id, taken["take"])
-            else:
-                errors = list(getattr(result, "errors", None) or [])
-                status = "planned" if getattr(result, "cancelled", False) else "failed"
-                production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": status}}, *([{"op": "log", "text": f"Rerun of {shot_id} failed: {errors[0]}"}] if errors else [])],
-                                 by="system", record=False)
+            with self.host.gpu_turn(context.cancelled):  # after the showrunners at work in other productions, never beside a language model
+                if context.stopped:
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "planned"}}], by="system", record=False)
+                    return
+                started = time.time()
+                context.job = self.host.submit_generation(settings, workspace, on_progress=lambda update: self.store.publish(
+                    {"type": "render", "production": production_id, "shot": shot_id, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
+                result = context.job.result()
+                files = list(getattr(result, "generated_files", None) or [])
+                if getattr(result, "success", False) and files:
+                    taken = self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras, tier=tier)
+                    production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
+                    self.hear_take(production, shot_id, taken["take"])
+                else:
+                    errors = list(getattr(result, "errors", None) or [])
+                    status = "planned" if getattr(result, "cancelled", False) else "failed"
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": status}}, *([{"op": "log", "text": f"Rerun of {shot_id} failed: {errors[0]}"}] if errors else [])],
+                                     by="system", record=False)
         except Exception as error:
             production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}, {"op": "log", "text": f"Rerun of {shot_id} failed: {error}"}], by="system", record=False)
         finally:
@@ -485,9 +634,17 @@ class Showrunner:
                 self._renders.pop((production_id, shot_id), None)
             self.store.publish({"type": "render", "production": production_id, "shot": shot_id, "done": True})
 
-    def render_directly(self, production_id: str, shot_ids: list[str]) -> dict[str, Any]:
+    def render_groups(self, production_id: str, shots: list[str] | None = None) -> list[list[str]]:
+        """The renders of a remake's shots asked for (all by default), one list of ids each (remake_groups); nothing for another kind of production."""
+        doc = self.store.get(production_id).snapshot()
+        catalog = self.catalog(doc)
+        entry = templates.resolve(catalog, templates.effective(doc, catalog).get("people_edits"))
+        return [[shot["id"] for shot in group] for group in ShowrunnerToolbox._render_groups(doc, entry, shots)] if doc.get("remake") and entry is not None else []
+
+    def render_directly(self, production_id: str, shot_ids: list[str], final: bool = False, new_seed: bool | None = None) -> dict[str, Any]:
         """Render shots now, one after the other, without the showrunner: the render action's own work (the cast's pictures, spoken lines, lengths) with no language model and no verdict.
-        A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited."""
+        A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited.
+        new_seed: None draws a new seed for a draft and keeps the take's for a final (its draft at the target size); True, a new one either way (Reshoot)."""
         production = self.store.get(production_id)
         if self.director.status(production_id)["running"]:
             raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")
@@ -510,16 +667,22 @@ class Showrunner:
                 raise RuntimeError(f"Already rendering: {', '.join(busy)}.")
             self._renders.update({(production_id, shot_id): context for shot_id in shot_ids})
         production.apply(ops, by="user", record=False)
-        threading.Thread(target=self._render_directly, args=(production, shot_ids, statuses, context), daemon=True).start()
+        threading.Thread(target=self._render_directly, args=(production, shot_ids, statuses, context, final, not final if new_seed is None else new_seed), daemon=True).start()
         return {"shots": shot_ids, "status": "rendering"}
 
-    def _render_directly(self, production, shot_ids, statuses, context):
-        toolbox = ShowrunnerToolbox(self)
+    def _render_directly(self, production, shot_ids, statuses, context, final=False, new_seed=True):
+        with self.host.gpu_turn(context.cancelled):  # after the showrunners at work in other productions, never beside a language model
+            self._render_shots(production, shot_ids, statuses, context, final, new_seed)
+
+    def _render_shots(self, production, shot_ids, statuses, context, final, new_seed=True):
+        toolbox, covered = ShowrunnerToolbox(self), set()  # covered: shots a render of this run already gave a take (remake shots rendered together)
         for shot_id in shot_ids:
             context.shot = shot_id
             try:
                 try:
-                    error = None if context.stopped else toolbox.render_shot(context, production, shot_id, new_seed=True, by="user").get("error")
+                    render = {} if context.stopped or shot_id in covered else toolbox.render_shot(context, production, shot_id, new_seed=new_seed, by="user", final=final, requested=shot_ids)
+                    covered.update(item["shot"] for item in render.get("rendered_with") or [])
+                    error = render.get("error")
                 except Exception as failure:
                     error = str(failure)
                 if context.stopped:  # as it was: a shot marked for a redo stays marked

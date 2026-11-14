@@ -316,6 +316,20 @@ class _PinningMemoryError(RuntimeError):
     """Allocation or host-registration failure, distinct from loading callbacks and copy errors."""
 
 
+def _transpose_to(dst, source):
+    """source (rows, columns) written as (columns, rows) at the address dst. By tiles that stay in the cache, about 1.6x faster than column by
+    column. numpy releases the GIL while it copies; a PyTorch copy here would start a thread team per call."""
+    rows, columns = source.shape
+    integers = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[source.element_size()]
+    array = source.view(integers).numpy()
+    buffer = (ctypes.c_char * (rows * columns * array.itemsize)).from_address(dst)
+    out = numpy.ndarray((columns, rows), dtype=array.dtype, buffer=buffer)
+    for row in range(0, rows, 4096):
+        part = array[row:row + 4096]
+        for column in range(0, columns, 64):
+            out[column:column + 64, row:row + 4096] = part[:, column:column + 64].T
+
+
 class _PinningCopier:
     # Copies a model into its pinned blocks on several threads while the next blocks are allocated. Each block's copies are awaited
     # before the block two allocations later, which reports the block as pinned. A source is released as soon as it is copied, which
@@ -345,6 +359,20 @@ class _PinningCopier:
             future = self.executor.submit(ctypes.memmove, dst + offset, source.data_ptr() + offset, min(STAGING_CHUNK_SIZE, length - offset))
             future.add_done_callback(copied)
             futures.append(future)
+
+    def transpose(self, dst, source):
+        # source (rows, columns) written as (columns, rows) at dst, on a copy thread: a joined LoRA factor, read once and copied once
+        length = source.numel() * source.element_size()
+        cold = cold_ranges([(source.data_ptr(), length)])
+        if cold:
+            prefetch_ranges(cold)
+        mapped = _mapped_pages([(source.data_ptr(), length)])
+
+        def transposed():
+            _transpose_to(dst, source)
+            if mapped:
+                _drop_mapped_pages(mapped)
+        self.blocks[next(reversed(self.blocks))].append(self.executor.submit(transposed))
 
     def start_block(self, block_no):
         self.blocks[block_no] = []
@@ -901,6 +929,11 @@ def _pcie_rate():
     return builtins.max(_pcie_probe(), _pcie_observed)
 
 
+def _cuda_graphs():
+    from . import cuda_graphs
+    return cuda_graphs
+
+
 def _call_rows(args, kwargs):
     # rows of a block call: those of its first tensor argument (or the first tensor of a list argument), its last dimension apart
     for value in (*args, *kwargs.values()):
@@ -1257,12 +1290,11 @@ ONCE_PER_GENERATION_MODELS = ("text_encoder", "text_encoder_2", "vae") # unless 
 DROP_UNREFERENCED_PAGES = True # comparison switch: once the models are profiled, the checkpoint pages that nothing reads any more (sources of the copies made at load) leave the working set
 
 if os.name == "nt":
-    class _MemoryInformation(ctypes.Structure):
-        _fields_ = [("BaseAddress", ctypes.c_size_t), ("AllocationBase", ctypes.c_void_p), ("AllocationProtect", ctypes.c_ulong), ("PartitionId", ctypes.c_ushort),
-                    ("RegionSize", ctypes.c_size_t), ("State", ctypes.c_ulong), ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong)]
-    _virtual_query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQuery
-    _virtual_query.argtypes = (ctypes.c_void_p, ctypes.POINTER(_MemoryInformation), ctypes.c_size_t)
-    _virtual_query.restype = ctypes.c_size_t
+    class _RegionInformation(ctypes.Structure): # WIN32_MEMORY_REGION_INFORMATION
+        _fields_ = [("AllocationBase", ctypes.c_size_t), ("AllocationProtect", ctypes.c_ulong), ("Flags", ctypes.c_ulong), ("RegionSize", ctypes.c_size_t), ("CommitSize", ctypes.c_size_t)]
+    _query_region = ctypes.WinDLL("kernelbase", use_last_error=True).QueryVirtualMemoryInformation
+    _query_region.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_RegionInformation), ctypes.c_size_t, ctypes.c_void_p)
+    _query_region.restype = ctypes.c_int
     _virtual_unlock = ctypes.WinDLL("kernel32", use_last_error=True).VirtualUnlock
     _virtual_unlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
     _mapped_file_name = ctypes.WinDLL("psapi", use_last_error=True).GetMappedFileNameW
@@ -1279,17 +1311,28 @@ def _drop_mapped_pages(ranges):
         for start, end in ranges:
             _virtual_unlock(start, end - start)
 
+_PRIVATE, _MAPPED_FILE, _MAPPED_PAGE_FILE = 0x1, 0x2, 0x8 # WIN32_MEMORY_REGION_INFORMATION flags
+
+def _allocation(pointer):
+    # (start, end, flags) of the allocation holding pointer (a view of a file or of shared memory, private RAM), (0, 0, 0) for none: the record of
+    # the allocation itself (Windows 10 1607 and later). VirtualQuery instead walks the page table from the address to the end of the range of
+    # pages alike: 0.4-0.7 s from the start of a 51 GiB view of a checkpoint whose pages were read, on the thread that asks
+    info = _RegionInformation()
+    if not _query_region(ctypes.c_void_p(-1), pointer, 0, ctypes.byref(info), ctypes.sizeof(info), None) or not info.AllocationBase: # MemoryRegionInfo
+        return 0, 0, 0
+    return info.AllocationBase, info.AllocationBase + info.RegionSize, info.Flags
+
 def _mapped_pages(leaves):
     # the pages of the tensors (address, bytes) mapped from a checkpoint file, to drop once copied: rounded out to whole pages, a range per
     # run of tensors that follow each other in a view of the file (one call each). A page shared with a tensor not read yet, dropped, comes
     # back from the standby list without reading the drive when that tensor is read (and is dropped again with it). Windows only
     if os.name != "nt":
         return []
-    info, ranges, region = _MemoryInformation(), [], (0, 0, None)
+    ranges, region = [], (0, 0, None)
     for pointer, nbytes in sorted(leaves):
         if not region[0] <= pointer < region[1]:
-            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type != 0x20000 else None) if found else (0, 0, None) # not MEM_PRIVATE: its view
+            start, end, flags = _allocation(pointer)
+            region = (start, end, start if end and not flags & _PRIVATE else None) # not private: its view
         if region[2] is None or nbytes == 0:
             continue
         start, end = pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
@@ -1315,20 +1358,19 @@ def _unreferenced_pages(spans):
     # them. A page shared with a tensor stays. Dropping pages that are not in the working set costs almost nothing. Windows only
     if os.name != "nt":
         return []
-    info, views, region = _MemoryInformation(), {}, (0, 0, None)
+    views, ends, region = {}, {}, (0, 0, None)
     for pointer, nbytes in sorted(spans):
         if not region[0] <= pointer < region[1]:
-            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type == 0x40000 else None) if found else (0, 0, None) # MEM_MAPPED: its view
+            start, end, flags = _allocation(pointer)
+            region = (start, end, start if flags & (_MAPPED_FILE | _MAPPED_PAGE_FILE) else None) # a view
+            ends[start] = end
         if region[2] is not None and nbytes:
             views.setdefault(region[2], []).append((pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE))
     ranges, name = [], ctypes.create_unicode_buffer(260)
     for base, used in views.items():
         if not _mapped_file_name(ctypes.c_void_p(-1), base, name, 260): # a view of a file, not of shared memory
             continue
-        end = base
-        while _virtual_query(end, ctypes.byref(info), ctypes.sizeof(info)) and info.AllocationBase == base:
-            end = info.BaseAddress + info.RegionSize
+        end = ends[base]
         position = base
         for start, stop in sorted(used):
             if start > position:
@@ -1338,16 +1380,61 @@ def _unreferenced_pages(spans):
             ranges.append((position, end))
     return ranges
 
+_file_mappings = {} # Windows: the allocation base of a view of a whole file -> a read-only mapping of that file (its handle), or None for a view of part of a file
+
+def file_mapping(address):
+    """For an address in a view of a whole file mapped here (Windows): the handle of a read-only mapping of that file, which another process may duplicate and map
+    (the copy helper of the GPU's share of the experts, mmgp.experts._Level2), and the address's offset in the file. None for other memory, or for a view of part of a
+    file, whose offset in the file is not known here."""
+    if os.name != "nt":
+        return None
+    base, end, flags = _allocation(address)
+    if not flags & _MAPPED_FILE:
+        return None
+    if base not in _file_mappings:
+        _file_mappings[base] = _map_whole_file(base, end)
+    mapping = _file_mappings[base]
+    return None if mapping is None else (mapping, address - base)
+
+def _map_whole_file(base, end):
+    import ctypes.wintypes as wt
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes, kernel32.CreateFileW.restype = [ctypes.c_wchar_p, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE], wt.HANDLE
+    kernel32.CreateFileMappingW.argtypes, kernel32.CreateFileMappingW.restype = [wt.HANDLE, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_wchar_p], wt.HANDLE
+    kernel32.GetFileSizeEx.argtypes, kernel32.CloseHandle.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_int64)], [wt.HANDLE]
+    name = ctypes.create_unicode_buffer(1024)
+    if not _mapped_file_name(ctypes.c_void_p(-1), base, name, 1024):
+        return None
+    file = kernel32.CreateFileW("\\\\?\\GLOBALROOT" + name.value, 0x80000000, 0x7, None, 3, 0, None) # GENERIC_READ, any sharing, OPEN_EXISTING (an NT device path)
+    if file in (None, wt.HANDLE(-1).value):
+        return None
+    size, mapping = ctypes.c_int64(0), None
+    # the view holds the file's last byte: it covers the whole file, from its start (a view never reaches past the file's end)
+    if kernel32.GetFileSizeEx(file, ctypes.byref(size)) and size.value and end - base >= size.value:
+        mapping = kernel32.CreateFileMappingW(file, None, 0x02, 0, 0, None) or None # PAGE_READONLY
+    kernel32.CloseHandle(file)
+    return mapping
+
+def close_file_mappings():
+    """Once no helper maps them (the checkpoints may be unloaded, and another file mapped at the same address)."""
+    if os.name == "nt":
+        close = ctypes.WinDLL("kernel32").CloseHandle
+        close.argtypes = [ctypes.c_void_p]
+        for mapping in _file_mappings.values():
+            if mapping is not None:
+                close(mapping)
+    _file_mappings.clear()
+
 def _private_memory(pointers):
     # whether each address (in increasing order) lies in RAM the process allocated (PyTorch's allocators, the heap), rather than in a mapping
     # of a file (a checkpoint). One query per region of memory: each call from a thread waits for the GIL on return, a few ms while the main
     # thread runs a model
     if os.name == "nt":
-        info, private, region = _MemoryInformation(), [], (0, 0, False)
+        private, region = [], (0, 0, False)
         for pointer in pointers:
             if not region[0] <= pointer < region[1]:
-                found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-                region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.Type == 0x20000) if found else (0, 0, False) # MEM_PRIVATE
+                start, end, flags = _allocation(pointer)
+                region = (start, end, bool(flags & _PRIVATE))
             private.append(region[2])
         return private
     regions = []
@@ -1365,13 +1452,16 @@ def _private_memory(pointers):
 class _PoolEntry:
     # a block in the pinned pool: its locked RAM (registrations), the pinned sources of its VRAM buffer as [(offset, uint8 tensor)] for the
     # layout it was made for, the bytes it locks, its page ranges locked in place and its plain tensors as (address, bytes)
-    __slots__ = ("model_id", "registrations", "sources", "layout", "nbytes", "in_place", "leaves")
+    __slots__ = ("model_id", "registrations", "sources", "layout", "nbytes", "in_place", "leaves", "leave")
 
-    def __init__(self, model_id, registrations, sources, layout, nbytes, in_place, leaves):
-        self.model_id, self.registrations, self.sources, self.layout, self.nbytes, self.in_place, self.leaves = model_id, registrations, sources, layout, nbytes, in_place, leaves
+    def __init__(self, model_id, registrations, sources, layout, nbytes, in_place, leaves, leave=None):
+        self.model_id, self.registrations, self.sources, self.layout, self.nbytes, self.in_place, self.leaves, self.leave = model_id, registrations, sources, layout, nbytes, in_place, leaves, leave
 
     def close(self):
         # unlocks (waits for the work queued on the GPU) and frees its buffer; tensors locked in place stay the model's, in pageable RAM
+        if self.leave is not None:  # its owner stops reading it first
+            self.leave()
+            self.leave = None
         for registration in self.registrations:
             registration.close()
         self.registrations, self.sources = [], None
@@ -1380,8 +1470,11 @@ class _PoolEntry:
 # How a block enters the pinned pool, made once for its layout: the page ranges to lock in place [(start, end, storages)] and their sources
 # [(offset in the block's VRAM buffer, uint8 tensor)], the runs copied into a buffer of locked RAM of its own (_copy_runs), the size of that
 # buffer, its pieces [(offset in the VRAM buffer, offset in the buffer, bytes)], the bytes locked and the plain tensors as (address, bytes)
-_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped") # mapped: the pages of the
-# tensors mapped from a checkpoint file [(start, end)] (_mapped_pages), dropped from the working set once copied
+_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped fill leave added block flags", defaults=(None, None, None, None, 0)) # mapped: the pages of the
+# tensors mapped from a checkpoint file [(start, end)] (_mapped_pages), dropped from the working set once copied. fill(buffer, helpers), if not None, fills the buffer instead of the runs;
+# leave(), if not None, is called before the entry's RAM goes; added, if not None, the RAM the entry takes from the system's available RAM (copy_nbytes: a fill that drops as much of its sources from the working
+# set takes less, none when they all were there); block(nbytes), if not None, makes the buffer instead of pinned.block (e.g. pinned.shared_block); flags: of the
+# buffer's registration (2: mapped for the GPU, which reads it in place)
 
 
 class _PinnedPool:
@@ -1496,10 +1589,13 @@ class _PinnedPool:
         # a page already locked by someone else)
         registrations, device = [], torch.cuda.current_device()
         try:
-            reserved = pinned.fits(plan.nbytes, cap)
-            if reserved and psutil.virtual_memory().available - plan.copy_nbytes < POOL_RAM_FLOOR:
-                self._drop_idle_pages(manager, POOL_RAM_FLOOR + plan.copy_nbytes)
-            if reserved and psutil.virtual_memory().available - plan.copy_nbytes >= POOL_RAM_FLOOR:
+            reserved, added = pinned.fits(plan.nbytes, cap), plan.copy_nbytes if plan.added is None else plan.added
+            if reserved and psutil.virtual_memory().available - added < POOL_RAM_FLOOR:
+                self._drop_idle_pages(manager, POOL_RAM_FLOOR + added)
+                if psutil.virtual_memory().available - added < POOL_RAM_FLOOR: # the pages of its own experts in VRAM, before refusing
+                    for residency in manager.expert_residency.values():
+                        residency.release_copied_pages(wait=True)
+            if reserved and psutil.virtual_memory().available - added >= POOL_RAM_FLOOR:  # also for an entry locked in place: under the floor its pages stay the system's to trim
                 for start, end, storages in plan.ranges:
                     registration = pinned.Registration(storages, start, end - start, device, kind="pool")
                     if int(registration.register()) != 0:
@@ -1507,16 +1603,19 @@ class _PinnedPool:
                     registrations.append(registration)
                 else:
                     if plan.copy_nbytes:
-                        buffer, owner = pinned.block(plan.copy_nbytes)
-                        _copy_runs(buffer.data_ptr(), plan.runs, self.helpers)
-                        _drop_mapped_pages(plan.mapped)
-                        registration = pinned.Registration(owner, buffer.data_ptr(), plan.copy_nbytes, device, kind="pool")
+                        buffer, owner = (plan.block or pinned.block)(plan.copy_nbytes)
+                        if plan.fill is not None:
+                            plan.fill(buffer, self.helpers)
+                        else:
+                            _copy_runs(buffer.data_ptr(), plan.runs, self.helpers)
+                            _drop_mapped_pages(plan.mapped)
+                        registration = pinned.Registration(owner, buffer.data_ptr(), plan.copy_nbytes, device, flags=plan.flags, kind="pool")
                         if int(registration.register()) == 0:
                             registrations.append(registration)
             if len(registrations) == len(plan.ranges) + bool(plan.copy_nbytes):
                 with torch.inference_mode(False):
                     sources = plan.sources + [(offset, buffer[start:start + nbytes]) for offset, start, nbytes in plan.pieces]
-                entry = _PoolEntry(model_id, registrations, sources, plan.layout, plan.nbytes, [(start, end) for start, end, _ in plan.ranges], plan.leaves)
+                entry = _PoolEntry(model_id, registrations, sources, plan.layout, plan.nbytes, [(start, end) for start, end, _ in plan.ranges], plan.leaves, plan.leave)
                 with self.guard:
                     self.entries.setdefault(manager, {})[entry_name] = entry
                     self.version += 1
@@ -1734,9 +1833,10 @@ def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
             print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
     return tied_weights
 
-def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
+def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1, transposed = {}):
     # the tensors of the state dicts (LoRAs) moved into buffers of locked RAM of their own, as far as the reserved RAM budget allows: each
-    # tensor is swapped in place with its pinned copy (its tied names follow it), which frees its source
+    # tensor is swapped in place with its pinned copy (its tied names follow it), which frees its source. transposed: id -> tensor to store
+    # transposed (_prepare_joined_loras): they are written so directly, and leave this dictionary
     names_list = sd_name if isinstance(sd, list) else [sd_name]
 
     if 0 < pinned.limit_bytes <= pinned.total_bytes:
@@ -1824,7 +1924,11 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
                 if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
                     current_big_tensor = big_tensors[big_tensor_no]
                     length = torch.numel(p.data) * p.data.element_size()
-                    q = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length, copier)
+                    if transposed.pop(id(p), None) is not None:
+                        copier.transpose(current_big_tensor.data_ptr() + offset, p.data)
+                        q = current_big_tensor[offset:offset + length].view(p.dtype).view(p.shape[1], p.shape[0])
+                    else:
+                        q = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length, copier)
                     torch.utils.swap_tensors(p, q)
                     del q
                 tensor_no += 1
@@ -1920,16 +2024,17 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     tied_weights_total = 0
     tied_weights_last = None
 
-    for n, (p, _) in params_dict.items():
+    for n, (p, is_buffer) in params_dict.items():
         ref = _get_tensor_ref(p)
         match = ref_cache.get(ref, None)
         if match != None:
             match_name, match_size = match
-            tied_weights_count += 1
-            tied_weights_total += match_size
-            if verboseLevel >=1:
-                tied_weights_last = f"{match_name} <-> {n}"
             tied_weights[n] = match_name
+            if not is_buffer or verboseLevel >= 2: # shared buffers (the scalar scales of split projections) are not tied weights
+                tied_weights_count += 1
+                tied_weights_total += match_size
+                if verboseLevel >=1:
+                    tied_weights_last = f"{match_name} <-> {n}"
         else:
             sub_tensors = _get_quantized_subtensors(p)
             if sub_tensors:
@@ -3036,8 +3141,10 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     
     model._loras_errors = errors
     if not check_only:
+        transposed = _prepare_joined_loras(loras_model_data) if len(adapters) > 1 else {}
         if pinnedLora and len(pinned_sd_list) > 0:
-            _pin_sd_to_memory(pinned_sd_list, pinned_names_list, pinned_tied_weights_list)
+            _pin_sd_to_memory(pinned_sd_list, pinned_names_list, pinned_tied_weights_list, transposed=transposed)
+        _transpose_in_ram(transposed)
         model._loras_adapters = adapters
     if activate_all_loras:
         activate_loras(model, loras_nos, loras_multi)
@@ -3841,7 +3948,7 @@ def _mm_lora_linear_forward(module, *args, **kwargs):
                 kwargs = dict(kwargs)
                 kwargs["input"] = inp
     loras_data = getattr(module, "_mm_lora_data", None)
-    if not loras_data:
+    if not lora_active(module):
         return module._mm_lora_old_forward(*args, **kwargs)
     if not hasattr(module, "_mm_manager"):
         pass
@@ -3934,6 +4041,51 @@ def _row_lora_adapters(module):
     return adapters
 
 
+def lora_active(module):
+    """Whether a LoRA changes this module at the current step: with its multipliers at 0 it is a plain layer, for its fused kernels as well."""
+    return bool(getattr(module, "_mm_lora_data", None)) and _row_lora_adapters(module) != []
+
+
+_lora_output_kernel = None
+
+
+def register_lora_output(kernel):
+    """kernel(out, y, factor, scale, rank_first) -> whether it added scale * y @ factor to out in place."""
+    global _lora_output_kernel
+    _lora_output_kernel = kernel
+
+
+def _add_lora_output(out, y, factor, scale, rank_first=False):
+    """out += scale * y @ factor: factor (rank, outputs) when rank_first, else (outputs, rank), as stored by a LoRA."""
+    if _lora_output_kernel is None or not _lora_output_kernel(out, y, factor, scale, rank_first):
+        out.addmm_(y, factor if rank_first else factor.T, beta=1, alpha=scale)
+
+
+def linear_output_and_lora(module, x):
+    """For an operation fused with a linear's output: (output of x (rows, in_features) without the LoRAs, (y, factor, scale, rank_first)) when all
+    that its active LoRAs add is one low-rank product, the output being out + scale * y @ factor (see _add_lora_output). Otherwise None: module(x)."""
+    data = getattr(module, "_mm_lora_data", None)
+    adapters = _row_lora_adapters(module) if data else None
+    if not adapters or builtins.any(entry[1][2] is not None or entry[1][5].get("type", "lora") != "lora" for entry in adapters):
+        return None
+    joined = data.get("joined_GPU", None)
+    plain = [entry for entry in adapters if not entry[1][5].get("joined")]
+    weight = module.__dict__.get("_mm_weight_dtype", None) or module.weight.dtype
+    if len(plain) + (joined is not None) != 1 or (plain and plain[0][1][0] is None) or weight != x.dtype:
+        return None
+    if getattr(module, "_mm_requires_native_linear_forward", False):
+        out = module._mm_lora_old_forward(x)
+    else:
+        out = torch.nn.functional.linear(x, module.weight, bias=None if module.bias is None else module.bias.to(x.dtype))
+    if out.dtype != x.dtype:
+        raise RuntimeError(f"A linear of dtype {weight} returned {out.dtype}")
+    if joined is not None:
+        y, alpha = _joined_lora_product(joined, x, _joined_lora_scales(module, joined))
+        return out, (y, joined[1].to(out.dtype), alpha, True)
+    _, entry, scale = plain[0]
+    return out, (x @ entry[0].to(out.dtype).T, entry[1].to(out.dtype), scale, False)
+
+
 class LinearInput:
     """Input prepared once for linear modules computed by ranges of output rows (prepare_linear_input, linear_rows)."""
     def __init__(self, shape, x, prepared, providers, lora):
@@ -3961,7 +4113,17 @@ def prepare_linear_input(x_list, modules):
             keep_x = True
         elif key not in prepared:
             prepared[key] = provider.prepare(module, x)
+        joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
+        if joined is not None:
+            scales = _joined_lora_scales(module, joined)
+            key = (id(joined[0]), scales)
+            product = products.get(key)
+            if product is None:
+                product = products[key] = _joined_lora_product(joined, x, scales)
+            lora[(module, "joined")] = product
         for adapter, data, scaling in _row_lora_adapters(module):
+            if data[5].get("joined"):
+                continue
             if data[5].get("type", "lora") == "diff":
                 keep_x = True
             elif data[0] is not None:
@@ -3972,10 +4134,50 @@ def prepare_linear_input(x_list, modules):
     return LinearInput(shape, x if keep_x else None, prepared, providers, lora)
 
 
-def fusion_with_loras(module):
-    """Whether a fused kernel can compute module's base output, its LoRAs then added to that output (_lora_linear_forward): its own forward
-    takes the fused operands, and each active adapter has a low-rank or diff form."""
-    return getattr(module, "_mm_requires_native_linear_forward", False) and _row_lora_adapters(module) is not None
+def _prepare_joined_loras(loras_model_data):
+    """Several low-rank LoRAs on one linear run as one product over their joined factors, instead of two products and a read-modify-write pass
+    over the whole output per adapter: faster, and one rounding of the output instead of one per adapter (see _joined_lora_product).
+    Their output factors are stored rank x outputs so that the GPU copies are filled range by range, without a second copy in VRAM (_move_loras).
+    Returns those factors, id -> tensor: to transpose while they are pinned, or _transpose_in_ram."""
+    factors = {}
+    for lora_module in loras_model_data.values():
+        adapters = [data for name, data in lora_module.items() if not name.endswith("_GPU")]
+        if len(adapters) > 1 and builtins.all(data[3] is None and data[5].get("type", "lora") == "lora" and data[0] is not None and torch.is_tensor(data[1]) for data in adapters):
+            for data in adapters:
+                factors[id(data[1])] = data[1]
+                data[5]["joined"] = True
+    return factors
+
+
+def _transpose_in_ram(factors):
+    def transposed(factor):
+        out = torch.empty((factor.shape[1], factor.shape[0]), dtype=factor.dtype)
+        _transpose_to(out.data_ptr(), factor.data)
+        return out
+
+    if factors:
+        with ThreadPoolExecutor(max_workers=_staging_copy_threads()) as executor:
+            for factor, out in zip(factors.values(), executor.map(transposed, factors.values())):
+                factor.data = out
+    factors.clear()
+
+
+def _joined_lora_scales(module, joined):
+    model, manager = module._mm_lora_model, module._mm_manager
+    return builtins.tuple(manager._get_lora_scaling(model._loras_scaling, model, adapter) * module._mm_lora_data[adapter + "_GPU"][4] if adapter in model._loras_active_adapters else 0 for adapter in joined[5]["ranges"])
+
+
+def _joined_lora_product(joined, x, scales):
+    """(y, alpha) for the output pass y @ joined output factors, alpha times: y = x @ joined input factors. The largest multiplier stays alpha,
+    applied with the output's single rounding; only the ranges of adapters with another multiplier are scaled in y, which adds a rounding to them."""
+    alpha = builtins.max(scales, key=builtins.abs)
+    if alpha == 0:
+        return None, 0
+    y = x @ joined[0].to(x.dtype).T
+    for (start, stop), scale in zip(joined[5]["ranges"].values(), scales):
+        if scale != alpha:
+            y[:, start:stop].mul_(scale / alpha)
+    return y, alpha
 
 
 class _AliasedLoraSlots:
@@ -3999,12 +4201,17 @@ def linear_rows(module, linear_input, start, stop):
     provider = linear_input.providers[module]
     key = provider.key(module)
     out = provider.rows(module, linear_input.x if key is None else linear_input.prepared[key], start, stop)
+    y, alpha = linear_input.lora.get((module, "joined"), (None, 0))
+    if y is not None:
+        _add_lora_output(out, y, module._mm_lora_data["joined_GPU"][1][:, start:stop].to(out.dtype), alpha, True)
     for adapter, data, scaling in _row_lora_adapters(module):
         lora_A, lora_B, diff_b = data[:3]
-        if data[5].get("type", "lora") == "diff":
+        if data[5].get("joined"):
+            pass
+        elif data[5].get("type", "lora") == "diff":
             out.addmm_(linear_input.x, lora_B[start:stop].to(out.dtype).T, beta=1, alpha=scaling)
         elif lora_A is not None:
-            out.addmm_(linear_input.lora[(module, adapter)], lora_B[start:stop].to(out.dtype).T, beta=1, alpha=scaling)
+            _add_lora_output(out, linear_input.lora[(module, adapter)], lora_B[start:stop].to(out.dtype), scaling)
         if diff_b is not None:
             out.add_(diff_b[start:stop].to(out.dtype), alpha=scaling)
     return out.view(*linear_input.shape, stop - start)
@@ -4449,7 +4656,7 @@ class offload:
             if entry not in self.inflight and (only is None or entry in only):
                 items, layout, sources = self._block_items(entry)
                 # the pageable state attached to the block (mmgp.state_ring) is staged with it, or alone for a block whose parameters are pinned
-                state = [(ring, block, ring.records[block][0], ring.generation) for ring, block in self.state_records.get(entry, ()) if ring.stages(block)]
+                state = [(ring, block, ring.records[block][0], ring.stamp(block)) for ring, block in self.state_records.get(entry, ()) if ring.stages(block)]
                 state_bytes = builtins.sum(-(-source.numel() // BLOCK_ALIGN) * BLOCK_ALIGN for _, _, source, _ in state)
                 if items and sources is None and entry in wanted and not _pool.pending:
                     self.ring.schedule(entry, items, layout, _pool.prepare(self, model_id, entry, self._pool_plan(entry)))
@@ -4550,6 +4757,9 @@ class offload:
                 elif admits and self.needs_staging(entry): # not pinned for good
                     size = self._pool_plan(entry).nbytes
                     whole, need = whole + size, need + (0 if _pool.involved(self, entry) else size)
+            if admits and model_id in self.expert_residency: # the experts it streams, once it streamed some
+                held, short = self.expert_residency[model_id].pool_bytes()
+                whole, need = whole + held + short, need + short
         return need, whole
 
     def _pool_plan(self, entry_name):
@@ -4596,8 +4806,21 @@ class offload:
 
     def _pool_leaves(self, entry_name):
         # the plain tensors of a block as they are now, as (address, bytes)
-        return {(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, _, p, _, tied in self.blocks_of_modules[entry_name] if tied is None
+        return {(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, _, p, _, tied in self.blocks_of_modules.get(entry_name, ()) if tied is None
                 for leaf in _staging_leaves(p.data if type(p) is torch.nn.Parameter else p) or ()}
+
+    def pool_experts(self, model_id, entry_name, nbytes, fill, leave=None, added=None, block=None, flags=0):
+        # a batch of experts that streams enters the pinned pool like a block (Residency): the future of its entry, None if the pool takes no more until the next quiet point.
+        # leave, added, block, flags: see _PoolPlan
+        if not self._pool_admits(model_id) or _pool.full:
+            return None
+        size = (nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        return _pool.prepare(self, model_id, entry_name, _PoolPlan(None, [], [], None, size, [(0, 0, nbytes)], size, (), (), fill, leave, added, block, flags))
+
+    def pool_source(self, entry_name):
+        # the locked copy of a batch of experts, None once it left the pool
+        entry = _pool.entry(self, entry_name)
+        return None if entry is None else entry.sources[0][1]
 
     def _pin_models(self, listed, smart_pinning, partial_pinning, pinned_peft_lora, perc_reserved_mem_max, max_reservable_memory, verboseLevel, loading_callback, cpu_pinning=None):
         # Reserved RAM is shared by the models: the staging ring first if swapped blocks will not be pinned, then the models to pin in the order
@@ -4769,6 +4992,22 @@ class offload:
             alias_cache[cache_key] = resolved
             return resolved
 
+        def _factor_source(value, adapter):
+            while isinstance(value, str):
+                target, slot = value.rsplit("#", 1)
+                value = shortcuts[target][adapter][int(slot)]
+            return value
+
+        def _joined_copy(factors):
+            # filled range by range from the factors in RAM: no second copy of them in VRAM
+            joined = torch.empty((builtins.sum(factor.shape[0] for factor in factors), factors[0].shape[1]), dtype=factors[0].dtype, device="cuda")
+            start = 0
+            for factor in factors:
+                joined[start:start + factor.shape[0]].copy_(factor, non_blocking=True)
+                start += factor.shape[0]
+            return joined
+
+        joined_inputs = {}
         for _, lora_module in loras_modules.items():
             for adapter in loras_active_adapters:
                 lora_data = lora_module.get(adapter, None)
@@ -4777,8 +5016,21 @@ class offload:
                     continue
                 moved_data = list(lora_data)
                 for i in range(min(4, len(moved_data))):
-                    moved_data[i] = _resolve_alias(moved_data[i], adapter)
+                    moved_data[i] = None if i < 2 and lora_data[5].get("joined") else _resolve_alias(moved_data[i], adapter)
                 lora_module[key] = moved_data
+            names = [adapter for adapter in loras_active_adapters if adapter + '_GPU' in lora_module and lora_module[adapter][5].get("joined")]
+            current = lora_module.get("joined_GPU", None)
+            if names and (current is None or builtins.list(current[5]["ranges"]) != names):
+                inputs, outputs = [_factor_source(lora_module[adapter][0], adapter) for adapter in names], [lora_module[adapter][1] for adapter in names]
+                input_key = builtins.tuple(id(factor) for factor in inputs)
+                joined_input = joined_inputs.get(input_key, None)  # q, k and v of LoRAs on a fused projection share their input factors
+                if joined_input is None:
+                    joined_input = joined_inputs[input_key] = _joined_copy(inputs)
+                ranges, start = {}, 0
+                for adapter, factor in zip(names, outputs):
+                    ranges[adapter] = (start, start + factor.shape[0])
+                    start += factor.shape[0]
+                lora_module["joined_GPU"] = [joined_input, _joined_copy(outputs), None, None, 1., {"type": "joined", "ranges": ranges}]
 
     def _graph_weight_tensors(self, model, module):
         """The CUDA tensors a block reads besides its arguments and LoRA copies: its parameters and buffers (their quantized parts and the
@@ -4796,7 +5048,7 @@ class offload:
         if state is None or state[0] != adapters:
             submodules = builtins.list(module.modules())
             holders = [(sub._parameters, name) for sub in submodules for name in sub._parameters] + [(sub._buffers, name) for sub in submodules for name in sub._buffers]
-            loras = [(sub._mm_lora_data, adapter + "_GPU") for sub in submodules if getattr(sub, "_mm_lora_data", None) for adapter in adapters]
+            loras = [(sub._mm_lora_data, name) for sub in submodules if getattr(sub, "_mm_lora_data", None) for name in (*(adapter + "_GPU" for adapter in adapters), "joined_GPU")]
             state = module._mm_graph_state = [adapters, holders, loras, None, None]
         return state
 
@@ -4831,7 +5083,7 @@ class offload:
         self.used[model_id] = memory_pressure.stamp()
         if self.parked:
             self.unpark()
-        return (self.auto_preload is None or self.auto_preload.settled(model_id)) and self.cpu_blocks.get(model_id) is None
+        return (self.auto_preload is None or self.auto_preload.settled(model_id)) and (self.cpu_blocks.get(model_id) is None or _cuda_graphs().cpu_jobs_supported())
 
     def _graph_lora_inputs(self, model, module):
         """The LoRA copies that a block reads, as (list, index): its graphs read them from buffers filled before each replay, so that they come
@@ -5064,13 +5316,16 @@ class offload:
         runtime._load_resources(self, model_id)
         if self.auto_preload is not None:
             self.auto_preload.on_load(model_id)
-        for block_name in [None, *self.preloaded_blocks_per_model[model_id]]:
+        blocks = [None, *self.preloaded_blocks_per_model[model_id]]
+        report_progress("Moving Weights to GPU", 0, len(blocks))
+        for index, block_name in enumerate(blocks):
             # Allocation pressure can shrink the automatic preload even while this loop is copying it.
             if block_name is not None and block_name not in self.preloaded_blocks_per_model[model_id]:
                 continue
             self.gpu_load_blocks(model_id, block_name, True)
             if block_name is not None and block_name not in self.preloaded_blocks_per_model[model_id]:
                 self.gpu_unload_blocks(model_id, block_name)  # left out of the preload by an allocation of its own transfer
+            report_progress("Moving Weights to GPU", index + 1, len(blocks))
 
     def unload_all(self, *, keep=()):
         with self.park_lock:
@@ -5511,10 +5766,12 @@ class offload:
                     x = x.to(compute_dtype)
                 x_2d = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
                 result_2d = result if result.dim() == 2 else result.reshape(-1, result.shape[-1])
-                # A fused kernel (shared.kernels fusion operands) wrote residual + gate * base: the LoRA's output takes the same gate, in its
-                # output factor (no full width output for one addition). can_fuse_linear admits no fused input operation here.
-                fusion = submodule.__dict__.get("_wangp_linear_fusion", None)
-                gate = None if fusion is None or fusion[4] is None else fusion[4].to(result.dtype).unsqueeze(1)
+                joined = loras_data.get("joined_GPU", None)
+                if joined is not None:
+                    y, joined_alpha = _joined_lora_product(joined, x_2d, _joined_lora_scales(submodule, joined))
+                    if y is not None:
+                        _add_lora_output(result_2d, y, joined[1].to(result.dtype), joined_alpha, True)
+                    del y
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
@@ -5554,9 +5811,10 @@ class offload:
                             result_2d.add_(diff_b, alpha=scaling)
                         del y
                         continue
-                    if gate is not None:
-                        lora_B = None if lora_B is None else lora_B * gate
-                        diff_b = None if diff_b is None else diff_b * gate.squeeze(1)
+                    if adapter_meta.get("joined"):
+                        if diff_b is not None:
+                            result_2d.add_(diff_b, alpha=scaling)
+                        continue
                     if adapter_type == "diff":
                         result_2d.addmm_(x_2d, lora_B.T, beta=1, alpha=scaling)
                         if diff_b is not None:
@@ -5567,7 +5825,7 @@ class offload:
                         result_2d.add_(diff_b, alpha=scaling)
                     else:
                         y = x_2d @ lora_A.T
-                        result_2d.addmm_(y, lora_B.T, beta=1, alpha=scaling)
+                        _add_lora_output(result_2d, y, lora_B, scaling)
                         if diff_b is not None:
                             result_2d.add_(diff_b, alpha=scaling)
                         del y
@@ -5962,13 +6220,19 @@ def {fname}(module, *args, **kwargs):
                 timed = self.cpu_measuring.get(model_id) or calls % CPU_COMPUTE_TIMED == 0
                 if timed:
                     torch.cuda.current_stream().synchronize() # the time measured is that of this block
+                graphs = self.cuda_graphs.get(model_id)
+                in_graphs = graphs is not None and _cuda_graphs().cpu_jobs_supported()
+                captures = graphs.captures if in_graphs else 0
                 start = time.perf_counter()
                 try:
                     return check_load_into_GPU_needed_gpu(module, *args, **kwargs)
                 finally:
                     self.cpu_blocks[model_id] = None
                     if timed:
-                        self._cpu_measure(model_id, blocks_name, rows, time.perf_counter() - start)
+                        if in_graphs:
+                            torch.cuda.current_stream().synchronize() # its replay is only queued
+                        if not in_graphs or graphs.captures == captures: # a capture would count as the CPU's time
+                            self._cpu_measure(model_id, blocks_name, rows, time.perf_counter() - start)
             check_load_into_GPU_needed_module = check_load_into_GPU_needed_cpu
         if self.preload_plans and blocks_name is not None:
             check_load_into_GPU_needed_plain = check_load_into_GPU_needed_module
@@ -6244,6 +6508,12 @@ def _report_loading(phase, completed, total, paths):
     callback.report(phase, completed, total, model_id)
 
 
+def report_progress(phase, completed, total=0):
+    """A long step after the checkpoints are loaded (the first transfers to the GPU, graph captures, expert placement, a model's prompt pass),
+    for the loading context of the calling thread (loading_context): nothing without one. total 0: a count without a known end."""
+    _report_loading(phase, completed, total, "")
+
+
 class LoadingCallback:
     def __init__(self, abort_requested=None, progress=None):
         self.abort_requested = abort_requested
@@ -6298,9 +6568,10 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         for state kept in VRAM (mmgp.state_ring). At most vram_safety_coefficient of the VRAM
     preloadExperts: with an explicit budget, use its remaining space for individual GPU experts after ordinary blocks; a model loaded
         whole (budget 0) gives them what its share of minimumBudget leaves beyond its other weights. Dynamic preload applies the same
-        priority independently. False keeps experts on CPU for fixed-budget execution. With pinnedMemory=True,
+        priority independently. False keeps experts on CPU for fixed-budget execution. For a model that pinnedMemory lists,
         the reserved RAM the models leave also holds pinned copies of the experts that can go to the GPU, most used first, so that
-        placing them is a plain transfer; the experts that stay on the CPU are never pinned.
+        placing them is a plain transfer. A model of pinPool keeps in the shared pool the experts that it streams during long passes
+        (its entries give way like those of its blocks). The experts that stay on the CPU without crossing the bus are never pinned.
         (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
         if pinnedMemory is not enabled
     vram_safety_coefficient: float between 0 and 1 (exclusive), default 0.85. Sets the maximum portion of VRAM that can be used for models.
@@ -6772,6 +7043,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         self.expert_residency[model_id] = residency
         def prepare_experts(module, args, model_id=model_id, residency=residency):
             self.ensure_model_loaded(model_id)
+            residency.thread = threading.get_ident()  # the thread calling the model runs its blocks (another one may have run them before)
             # Dynamic block plans coordinate experts after their ordinary blocks.
             if self.auto_preload is None or model_id not in self.auto_preload.plans:
                 residency.prepare()
@@ -6781,8 +7053,8 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         if share == "auto":
             cpu_pinning[model_id] = self._cpu_pinning_share(model_id)
     self._pin_models(listed, smartPinning, partialPinning, pinnedPEFTLora, perc_reserved_mem_max, max_reservable_memory, verboseLevel, loading_callback, cpu_pinning)
-    if pinAllModels: # after the models' own pinning, which has priority for the reserved RAM
-        for model_id, residency in self.expert_residency.items():
+    for model_id, residency in self.expert_residency.items(): # after the models' own pinning, which has priority for the reserved RAM
+        if listed[model_id] and model_id not in self.pool_models:
             residency.pin(lambda module, name: _pin_to_memory(module, name, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel,
                                                               loading_callback=loading_callback))
     if self.auto_preload is not None:

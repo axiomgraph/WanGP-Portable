@@ -12,6 +12,9 @@ def get_system_handler(name: str | None) -> Any:
     if name == "seedvr2":
         from postprocessing.seedvr2.process_handler import HANDLER
         return HANDLER
+    if name == "relayvsr":
+        from postprocessing.relayvsr.process_handler import HANDLER
+        return HANDLER
     if name == "pid":
         from postprocessing.pid.process_handler import HANDLER
         return HANDLER
@@ -25,6 +28,6 @@ def get_system_handler(name: str | None) -> Any:
         from postprocessing.ltx2_upsampler.process_handler import REFINER_HANDLER
         return REFINER_HANDLER
     if name in ("rife", "dlssg", "dlss5"):
-        from .system_upsampler_handler import DLSS5_HANDLER, DLSSG_HANDLER, RIFE_HANDLER
+        from postprocessing.system_upsampler_handler import DLSS5_HANDLER, DLSSG_HANDLER, RIFE_HANDLER
         return {"rife": RIFE_HANDLER, "dlssg": DLSSG_HANDLER, "dlss5": DLSS5_HANDLER}[name]
     return None

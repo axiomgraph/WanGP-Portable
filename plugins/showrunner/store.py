@@ -9,6 +9,7 @@ import re
 import shutil
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +35,35 @@ def _write_json(path: Path, payload: Any) -> None:
             if attempt == 39:
                 raise
             time.sleep(0.05)
+
+
+def settings_folder(settings_root: str | os.PathLike | None) -> Path:
+    """Showrunner's configuration folder, in WanGP's settings folder (--settings)."""
+    return Path(settings_root or "settings").resolve() / "showrunner"
+
+
+def rename_templates(folder: str | os.PathLike, renames: dict[str, str]) -> int:
+    """Deepy templates renamed ("task/old name": "task/new name"): the references Showrunner saved, in its configuration `folder` (the default
+    picks, the keys of the prompt rules) and in every production (its document, versions and undo history). Returns the files rewritten."""
+    def renamed(value):
+        if isinstance(value, str):
+            return renames.get(value, value)
+        if isinstance(value, list):
+            return [renamed(item) for item in value]
+        return {renames.get(key, key): renamed(item) for key, item in value.items()} if isinstance(value, dict) else value
+    config_path, count = Path(folder) / "config.json", 0
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    if (new := renamed(config)) != config:
+        config_path.write_text(json.dumps(new, indent=1), encoding="utf-8")
+        count += 1
+    root = Path(os.path.expanduser(config.get("productions_root") or Path(folder) / "productions"))
+    for production in (path for path in root.iterdir() if (path / DOCUMENT).is_file()) if root.is_dir() else ():
+        for path in (production / DOCUMENT, *(production / "versions").glob("*.json"), *(production / "history").glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (new := renamed(payload)) != payload:
+                _write_json(path, new)
+                count += 1
+    return count
 
 
 def _media_settings(settings: dict[str, Any], convert: Callable[[str], str]) -> dict[str, Any]:
@@ -260,6 +290,55 @@ class ProductionStore:
         self.publish({"type": "productions"})
         return copy_
 
+    def export(self, production_id: str, target: Path) -> Path:
+        """The production as one .zip, to keep or to open in another WanGP (import_zip): its document, media, versions with their saved states,
+        exports and posters. As in a duplicate, the showrunner's conversation and the undo history stay behind."""
+        source = self.get(production_id)
+        doc = source.snapshot()
+        with zipfile.ZipFile(target, "w", allowZip64=True) as archive:
+            for item in doc["deliverables"]:  # versions older than saved states travel with their state from the undo history
+                saved = source.folder / f"history/{int(item.get('revision') or -1):06d}.json"
+                if not item.get("snapshot") and saved.is_file():
+                    item["snapshot"] = f"versions/{saved.name}"
+                    archive.write(saved, item["snapshot"], zipfile.ZIP_DEFLATED)
+            archive.writestr(DOCUMENT, json.dumps({**doc, "director": {"state": "idle"}}, indent=1, ensure_ascii=False), zipfile.ZIP_DEFLATED)
+            for name in ("media", "cache", "versions", "exports"):
+                for path in sorted((source.folder / name).rglob("*")):
+                    if path.is_file():  # media are compressed already: stored as they are
+                        archive.write(path, path.relative_to(source.folder).as_posix(), zipfile.ZIP_DEFLATED if path.suffix.lower() in (".json", ".srt", ".vtt", ".txt", ".svg") else zipfile.ZIP_STORED)
+        return target
+
+    def import_zip(self, path: Path) -> Production:
+        """A production exported as a .zip, as a new production here (its own id; the showrunner starts afresh). The file comes from elsewhere:
+        only a production's own folders are read from it, and nothing outside the new production's folder is written."""
+        with zipfile.ZipFile(path) as archive:
+            if DOCUMENT not in archive.namelist():
+                raise ValueError("This .zip is not a Showrunner production: it has no production.json.")
+            doc = json.loads(archive.read(DOCUMENT).decode("utf-8"))
+            if not isinstance(doc, dict) or not isinstance(doc.get("brief"), dict):
+                raise ValueError("Its production.json is not a Showrunner production.")
+            production = self.create(str(doc.get("title") or "Imported production")[:80], str((doc.get("brief") or {}).get("kind") or "free"))
+            folder = production.folder.resolve()
+            try:
+                for entry in archive.infolist():
+                    top, target = entry.filename.split("/", 1)[0], (folder / entry.filename).resolve()
+                    if entry.is_dir() or top not in ("media", "cache", "versions", "exports") or not target.is_relative_to(folder / top):
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(entry) as source, open(target, "wb") as out:
+                        shutil.copyfileobj(source, out, 1 << 20)
+                with production.lock:
+                    doc.update(id=production.id, title=production.doc["title"], director={"state": "idle"}, created=model.now(), updated=model.now(), archived=False)
+                    production.doc = model.normalize(doc)
+                    production.save()
+            except Exception:  # a broken file leaves no half production behind
+                with self._lock:
+                    self._open.pop(production.id, None)
+                shutil.rmtree(production.folder, ignore_errors=True)
+                raise
+        self.publish({"type": "productions"})
+        return production
+
     def archive(self, production_id: str, archived: bool = True) -> None:
         """Hide a production from the home grid (or show it again): a flag of the production, outside its undo history."""
         production = self.get(production_id)
@@ -286,7 +365,7 @@ class ProductionStore:
             except (OSError, ValueError, KeyError) as error:
                 items.append({"id": production_id, "title": production_id, "error": str(error)})
                 continue
-            posters = [take["poster"] for shot in doc["shots"] if (take := model.chosen_take(shot)) and take.get("poster")][:4]
+            posters = [poster for shot in doc["shots"] if (poster := (model.chosen_take(shot) or {}).get("poster") or shot.get("source_poster"))][:4]  # a remake's shot without a take shows its source
             items.append({"id": production_id, "title": doc["title"], "kind": doc["brief"]["kind"], "stage": doc["stage"], "updated": doc["updated"],
                           "created": doc["created"], "shots": len(doc["shots"]), "approved": sum(shot["status"] == "approved" for shot in doc["shots"]),
                           "rendered": sum(bool(shot["takes"]) for shot in doc["shots"]), "duration_s": model.cut_length(doc),

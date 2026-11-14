@@ -12,7 +12,8 @@ from typing import Any
 from . import production as model
 
 VIDEO_TASKS = ("gen_video", "gen_video_with_speech", "gen_video_with_refs")
-DRAWN = "draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
+EDIT_TASKS = ("swap_video", "edit_video")  # they change a remake's source video: never offered for a shot made from nothing
+DRAWN ="draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
 SHOT_RANGE_MARGIN_S = 0.5  # a model's lengths come in steps: the nearest one to the user's range is not outside it
 LIP_SYNC_WORDS = re.compile(r"\s+with natural lip[- ]movements?(?:\s+synchronized)?", re.I)  # for a face that follows a recording
 WORD_S, SPARE_S = 0.4, 2.0  # a word's time when a model says it, and the time left in a shot past which it adds words of its own (measured on H3)
@@ -21,20 +22,29 @@ LANGUAGE_NAMES = {"ar": "Arabic", "de": "German", "en": "English", "es": "Spanis
 RULE = ("Shots that show a cast member take that member's pictures as reference images (a template whose inputs include references), "
         "not as image_start: a start image becomes the shot's first frame, so its framing, aspect and setting leak into the shot. "
         "Lip-synced shots also need a template that takes the song slice as driving audio.")
+PROMPT_RULES_NOTE = ("user_prompt_rules are the user's own rules for the prompts written with these templates: follow them in every prompt you write for one "
+                     "(shots, pictures, songs, voices). What the user asks in the chat comes first.")
 # The kinds of shots and media the user picks a template for, one per Deepy category in the order of Deepy's settings: the advice key,
 # the category, and what the showrunner makes with its template (shown under the category's name).
 ROLES = (
     {"id": "images", "task": "gen_image", "hint": "Stills, illustrated pages and backgrounds"},
     {"id": "image_edits", "task": "edit_image", "hint": "The cast's reference pictures and looks, made from their photos"},
+    # Its own Auto, not Deepy's image editor: H3-Image keeps poses and expressions and handles several people with someone staying
+    # (12 draws of two remakes: 8 clean against Klein's 9, Viggle Image Swap's 2 and Qwen 2.1 Turbo's swaps that left people unchanged: specs).
+    {"id": "frame_painter", "task": "edit_image", "label": "Frame Painter", "hint": "A remake's frames where people are replaced by the cast, painted before the video",
+     "auto_template": "edit_image/H3-Image Pruned 6 Steps"},
     {"id": "shots_without_cast", "task": "gen_video", "hint": "Shots without the cast: landscapes, objects, crowds, inserts"},
     {"id": "cast_shots_lip_synced", "task": "gen_video_with_speech", "hint": "Shots where someone sings or speaks, lip-synced to the song or to their line"},
     {"id": "cast_shots", "task": "gen_video_with_refs", "hint": "Shots with the cast, keeping each person's face, hair and outfit from their pictures"},
+    {"id": "people_edits", "task": "swap_video", "hint": "A remake's shots where people or characters are replaced"},
+    {"id": "scene_edits", "task": "edit_video", "hint": "A remake's shots where objects, the setting, weather or light change"},
     {"id": "music", "task": "gen_song", "hint": "The songs and scores the showrunner composes"},
     {"id": "voices", "task": "gen_speech_from_description", "hint": "Each speaker's voice, made once from the voice described on their cast card"},
     {"id": "cloned_voices", "task": "gen_speech_from_sample", "hint": "Every spoken line (dialogue, narration), in its speaker's voice"},
 )
 ROLE_IDS = tuple(role["id"] for role in ROLES)
 TASKS = {role["id"]: role["task"] for role in ROLES}
+REMAKE_ROLES = ("people_edits", "scene_edits", "frame_painter")  # used by remakes alone
 
 
 def planned_length(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None) -> dict[str, str]:
@@ -70,8 +80,8 @@ def _fits(role: str, entry: dict[str, Any]) -> bool:
 
 
 def automatic(catalog: list[dict[str, Any]]) -> dict[str, str]:
-    """The template of each role when the user picks none: the one selected in Deepy's settings for its category."""
-    return {role["id"]: entry_name(entry) for role in ROLES if (entry := resolve(catalog, role["task"])) is not None}
+    """The template of each role when the user picks none: the one selected in Deepy's settings for its category, or the role's own."""
+    return {role["id"]: entry_name(entry) for role in ROLES if (entry := resolve(catalog, role.get("auto_template") or role["task"])) is not None}
 
 
 def chosen(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, str]:
@@ -89,11 +99,13 @@ def effective(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, s
     return {**automatic(catalog), **chosen(doc, catalog)}
 
 
-def choices(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The picker: every role under its Deepy category's name, with that category's templates, the automatic one and the user's pick."""
-    auto, picks = automatic(catalog), chosen(doc, catalog)
-    return [{**role, "label": next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
-             "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry)}
+def choices(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """The picker: every role under its Deepy category's name, with that category's templates (and the user's prompt rules for each), the
+    automatic one and the user's pick."""
+    auto, picks, rules = automatic(catalog), chosen(doc, catalog), rules or {}
+    return [{**role, "label": role.get("label") or next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
+             "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry),
+                          "rules": rules.get(entry_name(entry), "")}
                          for entry in catalog if _fits(role["id"], entry)]}
             for role in ROLES if any(_fits(role["id"], entry) for entry in catalog)]
 
@@ -213,9 +225,12 @@ def take_lengths(entry: dict[str, Any], count: int = 5) -> list[float]:
 
 
 def take_lengths_in_range(entry: dict[str, Any], low: float | None, high: float | None) -> list[float]:
-    """The lengths a template's model really makes inside the user's range, up to its longest window; the nearest one when none falls inside."""
+    """The lengths a template's model really makes inside the user's range, up to its longest window unless its model continues a take past it
+    (sliding windows: WanGP joins the windows into one take); the nearest one when none falls inside."""
     first, step, fps = entry["take_frames"]
     last = entry["longest_frames"] or first + 4 * step
+    if entry["sliding_window"] and high:
+        last = max(last, math.ceil(high * fps))
     lengths = [_seconds(frames, fps) for frames in range(first, last + 1, step)]
     margin = step / fps / 2  # what the model makes nearest to the end of the range
     inside = [length for length in lengths if (low is None or length >= low - margin) and (high is None or length <= high + margin)]
@@ -245,9 +260,42 @@ def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[st
     return length if abs(length - planned) > 0.01 else 0.0
 
 
-def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool = False) -> dict[str, Any]:
-    """What the director should choose for this production's shots and media."""
+def soundtrack_choice(model_def: dict[str, Any]) -> str:
+    """A model's audio choice that keeps an audio_guide as the soundtrack its picture follows: the one with S (H3, LTX-2), else A where the input
+    audio is the output's (Viggle); "" when it has none."""
+    choices = (model_def.get("audio_prompt_type_sources") or {}).get("selection") or []
+    return next((choice for choice in choices if "A" in choice and "S" in choice), "") or ("A" if model_def.get("output_audio_is_input_audio") and "A" in choices else "")
+
+
+def soundtrack_letters(shot: dict[str, Any], entry: dict[str, Any] | None, settings: dict[str, Any]) -> str:
+    """The audio choice a shot's settings take from its model, "" to keep theirs: the one that keeps the driving audio as the soundtrack,
+    always on a shot driven by the song (whatever a template or the director chose, its lips must follow the song the cut plays), and on a
+    reference template given audio with no audio choice."""
+    if entry is None or not entry["soundtrack"] or not settings.get("audio_guide"):
+        return ""
+    return entry["soundtrack"] if shot.get("audio_slice") or not entry["audio"] and not settings.get("audio_prompt_type") else ""
+
+
+def shot_entry(doc: dict[str, Any], shot: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The template a shot renders with: one left on gen_video, nobody's choice, takes the brief's Models for what it shows and says."""
+    template = shot["generation"].get("template")
+    return resolve(catalog, template == "gen_video" and template_for(doc, shot, catalog) or template)
+
+
+def rules_in_use(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str, str]) -> dict[str, str]:
+    """The user's prompt rules of the templates this production makes its shots and media with (a remake's editing templates only in a remake)."""
+    if not rules:
+        return {}
+    remake = doc["brief"].get("kind") == "remake"
+    names = [*(template for role, template in effective(doc, catalog).items() if remake or role not in REMAKE_ROLES), *(entry_name(entry) for shot in doc["shots"] if (entry := shot_entry(doc, shot, catalog)))]
+    return {name: rules[name] for name in dict.fromkeys(names) if rules.get(name) and (remake or name.partition("/")[0] not in EDIT_TASKS)}
+
+
+def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool = False, rules: dict[str, str] | None = None) -> dict[str, Any]:
+    """What the director should choose for this production's shots and media, with the user's prompt rules of the templates it uses."""
     picks, user = effective(doc, catalog), chosen(doc, catalog)
+    if doc["brief"].get("kind") != "remake":  # the editing templates are a remake's: nothing about them in any other production
+        user = {role: template for role, template in user.items() if role not in REMAKE_ROLES}
     lip, with_cast = picks.get("cast_shots_lip_synced"), lip_synced_with_cast(picks, catalog)
     result = {"rule": RULE, "cast_with_pictures": cast_with_pictures(doc)}
     result.update({role: picks[role] for role in ("cast_shots", "shots_without_cast") if role in picks})
@@ -261,6 +309,10 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
         result["masters_from_pictures"] = picks["image_edits"]
     if doc["brief"].get("kind") == "story":  # picture-book pages are stills: the cast's go through the image editing template
         result.update({key: picks[role] for key, role in (("pages", "images"), ("pages_with_cast", "image_edits")) if role in picks})
+    if doc["brief"].get("kind") == "remake":  # every shot changes the source: the two editing templates, the painter of frames whose people are replaced, and the image editor for the rest
+        result = {"rule": "Each shot takes the template of what changes in it: people_edits for people or characters, scene_edits for objects, setting, weather or light. Read its input guidance with wangp_templates first. "
+                          "paint_frame paints a frame whose people are replaced with frame_painter, any other frame and the character sheets with image_edits.",
+                  **{role: picks[role] for role in ("people_edits", "scene_edits", "frame_painter", "image_edits") if role in picks}}
     if user:
         result["user_choices"] = user
         result["user_rule"] = "user_choices are the user's picks for these kinds of shots and media: use them, never another template for the same kind."
@@ -294,6 +346,8 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
                                        if cut_on_the_song(doc) else speaking_exception.strip()))
         if "take_lengths_s" in result:
             result["take_lengths_s"] = {template: take_lengths_in_range(resolve(catalog, template), *model.shot_range(doc)) for template in shortest}
+    if used := rules_in_use(doc, catalog, rules or {}):
+        result.update(user_prompt_rules=used, user_prompt_rules_note=PROMPT_RULES_NOTE)
     return result
 
 
