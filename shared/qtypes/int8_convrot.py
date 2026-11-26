@@ -226,7 +226,7 @@ def _regular_hadamard(size, device, dtype):
         h = torch.kron(h, h4)
         current_size *= 4
     h = h.mul(size ** -0.5)
-    _HADAMARD_CACHE[key] = cuda_graphs.register_constant(h)  # kept for the process: CUDA graphs read it at its address
+    h = _HADAMARD_CACHE[key] = cuda_graphs.register_constant(h)  # kept for the process: CUDA graphs read it at its address
     return h
 
 
@@ -292,6 +292,13 @@ def cpu_compute_supported(tensor):
     there (cpuCompute)."""
     from shared.kernels import cpu_linear
     return isinstance(tensor, WeightQBytesTensor) and tensor._data.dtype == torch.int8 and cpu_linear.supported(tensor)
+
+
+def column_input(module, rows, dtype, device, segments=None, residual=None):
+    """An INT8 linear's input taken by ranges of columns (quant_router.column_input: INT8 ConvRot or Quanto qint8), each range kept as
+    the INT8 kernels quantize it, half the 16-bit input; None for other modules and where the selected INT8 backend reads 16-bit rows."""
+    from shared.kernels import int8_backend
+    return int8_backend.column_input(module, rows, dtype, device, segments, residual)
 
 
 def detect(state_dict, verboseLevel=1, metadata=None):

@@ -6,7 +6,9 @@ their bits (shift into FP32 bits; round to nearest even as PyTorch's casts, NaN 
   runs FP64 at 1/32 of the FP32 rate) with the inverse square root in FP64, the gated norm of 128 values computes in FP64; SiLU*mul
   reproduces the PyTorch route bit for bit;
 - the paged Q8 attention of decoding and speculative verification, on FP16 tensor cores (sm_75 has no BF16 ones), each K/V page read
-  once for the query heads of a KV head and all the queries of a verification, every row computed alike whatever the query count."""
+  once for the query heads of a KV head and all the queries of a verification, every row computed alike whatever the query count.
+Also helpers for kernels written once for every GPU (the row kernels of Inkling 2): to_float / round_bf16 / convert take BF16 or its
+bits, and portable_supported / reads_bits / bits_view choose them on the host."""
 import functools
 
 import torch
@@ -131,15 +133,19 @@ if triton is not None:
         y = x * _weight(W, offs, mask, W_BITS).to(tl.float64) * _inverse_rms(x, n_cols, eps) * silu
         tl.store(Y + row * n_cols + offs, fp64_to_bf16_bits(y), mask)
 
-    @triton.jit(do_not_specialize=("TOTAL",), do_not_specialize_on_alignment=("TOTAL",))
-    def _silu_mul_kernel(X, OUT, COLUMNS: tl.constexpr, TOTAL, BLOCK: tl.constexpr):
-        # silu_mul's PyTorch route on BF16: silu(gate) rounded to BF16 (in place), then the product rounded
-        index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        source = index // COLUMNS * (2 * COLUMNS) + index % COLUMNS
-        gate = bf16_bits_to_fp32(tl.load(X + source, index < TOTAL, 0))
-        value = bf16_bits_to_fp32(tl.load(X + source + COLUMNS, index < TOTAL, 0))
+    @triton.jit(do_not_specialize=("ROWS",), do_not_specialize_on_alignment=("ROWS",))
+    def _silu_mul_kernel(X, OUT, ROWS, COLUMNS, R: tl.constexpr, BLOCK: tl.constexpr):
+        # silu_mul's PyTorch route on BF16: silu(gate) rounded to BF16 (in place), then the product rounded. Tiles of R rows and BLOCK
+        # columns with the width at runtime: one compile per tile shape for every FFN width
+        rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+        columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        valid = (rows < ROWS)[:, None] & (columns < COLUMNS)[None, :]
+        row, column = rows[:, None], columns[None, :]
+        source = row * (2 * COLUMNS) + column
+        gate = bf16_bits_to_fp32(tl.load(X + source, valid, 0))
+        value = bf16_bits_to_fp32(tl.load(X + source + COLUMNS, valid, 0))
         activated = bf16_bits_to_fp32(fp32_to_bf16_bits(tl.div_rn(gate, 1.0 + libdevice.exp(-gate))))
-        tl.store(OUT + index, fp32_to_bf16_bits(activated * value), index < TOTAL)
+        tl.store(OUT + row * COLUMNS + column, fp32_to_bf16_bits(activated * value), valid)
 
     @triton.jit
     def _power_of_two(top, offset: tl.constexpr):
@@ -181,10 +187,11 @@ if triton is not None:
     def _store_block(PARTIAL, index, valid_rows, acc, b: tl.constexpr):
         tl.store(PARTIAL + index[:, None] * 256 + b * 32 + tl.arange(0, 32)[None, :], acc, mask=valid_rows[:, None])
 
-    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
+    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"))
     def _q8_attention_partials_kernel(Q, K, V, KS, VS, TABLES, LENGTHS, PARTIAL, MAXIMUM, SUM, Q_PER_SEQ, TABLE_WIDTH,
-                                      H_Q: tl.constexpr, H_KV: tl.constexpr, PAGE: tl.constexpr, SPLITS: tl.constexpr,
-                                      M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr):
+                                      H_Q, H_KV, PAGE: tl.constexpr, SPLITS: tl.constexpr,
+                                      M: tl.constexpr, N: tl.constexpr, SCALE):
+        # H_Q, H_KV and SCALE at runtime: one compile for every model's head counts and attention scale
         # Paged Q8 attention (head_dim 256) of the query heads sharing a KV head and of all the queries of a sequence (decode or
         # verification rows, causal): each K/V page is read once per split. FP16 tensor-core dots with FP32 accumulation on the
         # int8 values (exact in FP16), one per block of 32 values, the FP16 scales applied to the block results: queries scaled
@@ -192,9 +199,10 @@ if triton is not None:
         # remainder) pairs scaled per row. Tiles and splits do not depend on the query count.
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
-        group: tl.constexpr = H_Q // H_KV
+        group = H_Q // H_KV
         rows = query_block * M + tl.arange(0, M)
-        query_index = sequence * Q_PER_SEQ + rows // group
+        row_query = rows // group  # the row's query within the sequence, once (the key tiles below reuse it)
+        query_index = sequence * Q_PER_SEQ + row_query
         query_head = kv_head * group + rows % group
         valid_rows = rows < Q_PER_SEQ * group
         row_offsets = (query_index * H_Q + query_head) * 256
@@ -240,7 +248,7 @@ if triton is not None:
             scores += _scores_block(q5, K, KS, offsets, scale_offsets, valid_columns, 5)
             scores += _scores_block(q6, K, KS, offsets, scale_offsets, valid_columns, 6)
             scores += _scores_block(q7, K, KS, offsets, scale_offsets, valid_columns, 7)
-            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
+            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + row_query[:, None])
             scores = tl.where(valid, scores * row_scale[:, None], -1.0e20)
             new_maximum = tl.maximum(maximum, tl.max(scores, 1))
             correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
@@ -279,6 +287,61 @@ if triton is not None:
         tl.store(OUT + row * D + dims, fp32_to_bf16_bits(tl.div_rn(tl.sum(partial * weights[:, None], 0), tl.maximum(denominator, 1.0e-20))))
 
 
+if triton is not None:
+    # Kernels written once for every GPU: their BF16 tensors arrive as BF16, or as int16 bits where Triton has no BF16 conversions
+    # (reads_bits), and these helpers choose at compile time. With BF16 tensors they are the plain conversions.
+    @triton.jit
+    def to_float(x):
+        """float32 of loaded values: BF16 bits (int16) shifted into place, any other type converted."""
+        if x.dtype == tl.int16:
+            return bf16_bits_to_fp32(x)
+        return x.to(tl.float32)
+
+    @triton.jit
+    def round_bf16(x, BITS: tl.constexpr):
+        """float32 x rounded to BF16, as float32."""
+        if BITS:
+            return bf16_bits_to_fp32(fp32_to_bf16_bits(x))
+        return x.to(tl.bfloat16).to(tl.float32)
+
+    @triton.jit
+    def convert(x, pointer):
+        """x in the element type of pointer, int16 on either side standing for BF16 bits."""
+        if (x.dtype == tl.int16) == (pointer.dtype.element_ty == tl.int16):
+            return x.to(pointer.dtype.element_ty)
+        elif x.dtype == tl.int16:
+            return bf16_bits_to_fp32(x).to(pointer.dtype.element_ty)
+        else:
+            return fp32_to_bf16_bits(x.to(tl.float32))
+
+
+HIP_ARCHS = ("gfx942", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201")  # AMD GPUs for which Triton compiles the kernels written with the helpers above
+
+
+@functools.cache
+def reads_bits(device) -> bool:
+    """Whether BF16 tensors reach Triton kernels on this CUDA device as their int16 bits: NVIDIA GPUs below compute capability 8.0, whose
+    Triton (3.2 for Turing) has no BF16 conversions."""
+    return torch.version.hip is None and torch.cuda.get_device_capability(device) < (8, 0)
+
+
+@functools.cache
+def portable_supported(device) -> bool:
+    """Whether the kernels written with the helpers above run on device: NVIDIA GPUs from compute capability 7.5 (BF16 bits below 8.0),
+    the AMD architectures of HIP_ARCHS."""
+    device = torch.device(device)
+    if device.type != "cuda" or triton is None:
+        return False
+    if torch.version.hip is not None:
+        return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] in HIP_ARCHS
+    return torch.cuda.get_device_capability(device) >= (7, 5)
+
+
+def bits_view(tensor, bits):
+    """A BF16 tensor as its int16 bits when bits (reads_bits), any other tensor as it is."""
+    return tensor.view(torch.int16) if bits and tensor.dtype == torch.bfloat16 else tensor
+
+
 def _bits(tensor):
     return tensor.view(torch.int16) if tensor.dtype == torch.bfloat16 else tensor
 
@@ -310,7 +373,11 @@ def silu_mul(x):
     """BF16 x = [gate, value] on the last dimension: silu(gate) * value."""
     x = x.contiguous()
     output = torch.empty((*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype)
-    _silu_mul_kernel[(triton.cdiv(output.numel(), 256),)](_bits(x), _bits(output), output.shape[-1], output.numel(), 256)
+    columns = output.shape[-1]
+    rows = output.numel() // columns
+    block = min(1024, triton.next_power_of_2(columns))
+    tile_rows = 1024 // block  # narrow rows: several per program
+    _silu_mul_kernel[(triton.cdiv(rows, tile_rows), triton.cdiv(columns, block))](_bits(x), _bits(output), rows, columns, tile_rows, block)
     return output
 
 

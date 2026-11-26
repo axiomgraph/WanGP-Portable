@@ -17,6 +17,7 @@ from shared.utils.media_control import inference_checkpoint
 # Modified for WanGP: raw-checkpoint names, MMGP QKV splitting/offload, pruned
 # AdaLN curves, shared attention backends, chunked FFNs, and early tensor release.
 
+import contextlib
 import math
 import time
 
@@ -210,8 +211,7 @@ class Attention(nn.Module):
 
     def forward(self, x_list, rope=None, transformer_options=None, residual=None, gate=None, segments=None, input_again=None):
         x = _take(x_list)
-        vdn_input = x if hasattr(self, "vdn") else None
-        seq_len = x.shape[0]
+        seq_len = x.rows() if isinstance(x, offload.RowSource) else x.shape[0]  # a RowSource (1, rows, dim): attention_kit.EXTREME_LOW_VRAM
         packed_rope = None
         if isinstance(rope, tuple):
             rope, packed_rope = rope
@@ -219,21 +219,26 @@ class Attention(nn.Module):
         batch = 1 if rope is None else seq_len // rope.shape[1]
         tokens = seq_len // batch
         use_sol = batch == 1 and not hasattr(self, "vdn") and self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
-        use_veda = hasattr(self, "veda") and self.veda.policy.enabled
+        use_veda = hasattr(self, "veda") and self.veda.policy.enabled and self.veda.layer not in self.veda.policy.full_layers
         use_vsa = hasattr(self, "vsa") and self.vsa.policy.enabled
         allow_fusion = not use_sol and not hasattr(self, "vdn")
         split_qkv = hasattr(self, "q_proj")
+        if isinstance(x, offload.RowSource) and not (split_qkv and not use_sol and not hasattr(self, "vdn") and batch == 1):
+            x = x.materialize().view(seq_len, -1)  # read whole by the paths other than the kit's
+        vdn_input = x if hasattr(self, "vdn") else None
         if split_qkv and not use_sol and not hasattr(self, "vdn"):
             x_list, x = [x.view(batch, tokens, x.shape[-1]) if batch > 1 else x], None
             # VSA: q, k, v and the gate are projected by head groups from one prepared input, so the tiled copies stay bounded
-            attention = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim,
+            # the kit applies out_proj: with the heads split, it reads each group's output as its weight format allows (INT8: one byte)
+            output = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim,
                                                     lambda query, key, group: self._norm_rope_(query, key, rope, packed_rope, allow_fusion),
                                                     fused_quant=(lambda query, key, group, core, settings:
                                                                  kernels.split_half_norm_rope_quant_(query, key, rope, self.q_norm, self.k_norm, core, settings)) if allow_fusion else None,
+                                                    sample_query=(lambda q, ids, core: kernels.norm_rope_query_sample(q, ids, rope, self.q_norm, core)) if allow_fusion else None,
                                                     attention_fn=self.vsa if use_vsa else self.veda if use_veda else None,
-                                                    extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None)
-            attention_list, attention = [attention], None
-            return self._out_projection(attention_list, seq_len, residual, gate, segments)
+                                                    extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None,
+                                                    out_proj=self.out_proj, residual=residual, gate=gate, segments=segments)
+            return output if residual is not None else output.view(seq_len, -1)
         vsa_gate = [self.gate_proj(x).view(1, seq_len, self.heads, self.head_dim)] if use_vsa else None
         if split_qkv and hasattr(self, "vdn"):  # VDN projects q, k and v when it needs them: its linear branch reads them raw
             x_list, x, vdn_input = [x], None, None
@@ -347,6 +352,15 @@ def _norm_modulate(norm, hidden, shift_scale, segments):
     return kernels.norm_modulate([hidden], norm, shift, scale, segments)
 
 
+def _norm_modulate_rows(norm, hidden, shift_scale, segments, shape=None):
+    """_norm_modulate as an mmgp RowSource made by ranges of rows of hidden (rows, dim), of the given shape ((1, rows, dim) for the
+    attention kit), for an FFN that reads it chunk by chunk (kernels.mlp) or an attention that makes it again by head group: never
+    whole beside the residual (kernels.norm_modulate_rows, its INT8 form made in one pass for the attention)."""
+    shift, scale = shift_scale
+    shift_scale.clear()
+    return kernels.norm_modulate_rows(hidden, norm, shift, scale, segments, shape)
+
+
 def _gated_residual(hidden_list, gate_list, branch_list, segments):
     hidden = _take(hidden_list)
     gate, branch = gate_list[0].to(hidden.dtype), _take(branch_list)
@@ -382,13 +396,20 @@ class DiTBlock(nn.Module):
     def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
         residual_list = [_take(x_list)]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
-        h_list = [_norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)]
-        if (not residual_signature_elements and not hasattr(self.attn, 'vdn')
-                and kernels.can_linear(self.attn.out_proj, residual_list[0])
-                and kernels.can_linear(self.mlp.fc2, residual_list[0])):
+        if not residual_signature_elements and not hasattr(self.attn, 'vdn'):
+            # The attention and the FFN add their outputs to the residual themselves, on and off the INT8 kernels' fused path (a
+            # LoRA, 16-bit weights): the attention by parts of rows where the kit keeps out_proj's input by head groups, the FFN chunk
+            # by chunk (with a LoRA, its output pass and the update in one kernel), so that no whole branch sits beside the residual.
+            # Extreme low VRAM: the attention's and the FFN's inputs given by ranges of rows (RowSources), never whole beside the
+            # residual: the attention makes its input again for each head group, the FFN chunk by chunk as it reads it (more kernels
+            # in a block's graph: the FFN alone 33 nodes on H3 at 1080p 15 s)
+            extreme, residual = attention_kit.extreme_low_vram(), residual_list[0]
+            h_list = [_norm_modulate_rows(self.norm1, residual, [shift_msa, scale_msa], segments, (1, *residual.shape)) if extreme
+                      else _norm_modulate(self.norm1, residual, [shift_msa, scale_msa], segments)]
             hidden = self.attn(h_list, rope=rope, residual=residual_list[0], gate=gate_msa, segments=segments)
-            h_list = [_norm_modulate(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
+            h_list = [(_norm_modulate_rows if extreme else _norm_modulate)(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
             return self.mlp(h_list, residual=hidden, gate=gate_mlp, segments=segments)
+        h_list = [_norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)]
         if not residual_signature_elements:  # VDN computes its input again rather than keeping it (input_again)
             input_again = (lambda: _norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)) if hasattr(self.attn, 'vdn') else None
             residual_list = [_gated_residual(residual_list, [gate_msa], [self.attn(h_list, rope=rope, input_again=input_again)], segments)]
@@ -421,6 +442,16 @@ def _chunk_rows(start, stop, chunk=CONTROL_ROW_CHUNK):
     return ((offset, min(stop, offset + chunk)) for offset in range(start, stop, chunk))
 
 
+PATCH_PROJ_ROWS = 16384  # rows per call of the FP32 patch projections: their FP32 output never whole (1080p 361f: 4.3 GB beside its 16-bit copy)
+
+
+def _project_into(hidden, indices, projection, rows, dtype):
+    """hidden[indices] = projection(rows).to(dtype), by chunks of PATCH_PROJ_ROWS rows (each row on its own)."""
+    for start in range(0, rows.shape[0], PATCH_PROJ_ROWS):
+        stop = min(rows.shape[0], start + PATCH_PROJ_ROWS)
+        hidden.index_copy_(0, indices[start:stop], projection(rows[start:stop]).to(dtype))
+
+
 class InputPreparation(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -441,16 +472,16 @@ class InputPreparation(nn.Module):
             video_rows = torch.cat((cond_video, video_rows))
         if cond_audio is not None:
             audio_rows = torch.cat((cond_audio, audio_rows))
-        video_embeds = self.video_patch_proj(video_rows).to(dtype)
-        del video_rows
-        audio_embeds = None if self.audio_patch_proj is None else self.audio_patch_proj(audio_rows).to(dtype)  # H3-Image has no audio stream
-        del audio_rows
         hidden = torch.empty((sequence_length, self.hidden_size), device=video_x.device, dtype=dtype)
         hidden.index_copy_(0, text_indices, text_embeds)
-        hidden.index_copy_(0, video_indices, video_embeds)
-        if audio_embeds is not None:
-            hidden.index_copy_(0, audio_indices, audio_embeds)
+        _project_into(hidden, video_indices, self.video_patch_proj, video_rows, dtype)
+        del video_rows
+        if self.audio_patch_proj is not None:  # H3-Image has no audio stream
+            _project_into(hidden, audio_indices, self.audio_patch_proj, audio_rows, dtype)
         return hidden
+
+
+FINAL_CHUNK_ROWS = 8192  # rows of the final layer per chunk while the attention heads are split
 
 
 class FinalLayer(nn.Module):
@@ -469,15 +500,27 @@ class FinalLayer(nn.Module):
             self.audio_out = MiniMaxH3ParallelHead(hidden, audio_dim, pdd_num_steps, device=device) if audio else None
 
     def _head(self, h_list, shift, scale, row, output):
-        rows = row if isinstance(row, list) else [(0, h_list[0].shape[0], row)]
-        value = kernels.norm_modulate(h_list, self.norm, shift, scale, rows, dtype=scale.dtype).to(torch.float32)
-        return output(value)
+        hidden = _take(h_list)
+        rows = row if isinstance(row, list) else [(0, hidden.shape[0], row)]
+        whole = hidden.shape[0] * hidden.shape[1] * (scale.element_size() + 4)  # the norm output and its FP32 copy
+        if hidden.shape[0] <= FINAL_CHUNK_ROWS or not attention_kit.chunking_needed(hidden.device, whole, ("h3 final", hidden.shape[0], hidden.shape[1])):
+            return output(kernels.norm_modulate([hidden], self.norm, shift, scale, rows, dtype=scale.dtype).to(torch.float32))
+        # Smart Inputs Chunker: the norm output and its FP32 copy by chunks of rows, where the whole stream's would be the
+        # generation's VRAM peak. Same time; cuBLAS sums the FP32 output linear in another order per row count.
+        parts = []
+        for start in range(0, hidden.shape[0], FINAL_CHUNK_ROWS):
+            stop = min(start + FINAL_CHUNK_ROWS, hidden.shape[0])
+            spans = [(max(first, start) - start, min(last, stop) - start, index) for first, last, index in rows if first < stop and last > start]
+            parts.append(output(kernels.norm_modulate([hidden[start:stop]], self.norm, shift, scale, spans, dtype=scale.dtype).to(torch.float32)))
+        return torch.cat(parts)
 
     def forward(self, x_list, temb, video_segment, audio_segment):
-        # PDD heads read a sampling plan changed by the scheduler outside this call.
+        # PDD heads read a sampling plan changed by the scheduler outside this call: eager, on the idle memory of the graph pool, whose
+        # chunks would otherwise stay beside the ordinary ones its temporaries take (the reserved VRAM would be their sum)
         with cuda_graphs.scope():
-            return cuda_graphs.run(self, x_list, temb, video_segment, audio_segment, method="_forward",
-                                   enabled=not isinstance(self.video_out, MiniMaxH3ParallelHead))
+            if isinstance(self.video_out, MiniMaxH3ParallelHead):
+                return cuda_graphs.pooled(self, self._forward, x_list, temb, video_segment, audio_segment)
+            return cuda_graphs.run(self, x_list, temb, video_segment, audio_segment, method="_forward")
 
     def _forward(self, x_list, temb, video_segment, audio_segment):
         hidden = _take(x_list)
@@ -522,8 +565,10 @@ class MiniMaxH3Model(nn.Module):
         attention = self.blocks[0].attn
         split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
         modules = dict(self.named_modules())
-        state_dict = convert_lora_keys(state_dict, modules,
-                                      fused_split_map=split_map, split_linear_modules_map=split_map)
+        names = set(modules)
+        if self.audio_patch_proj is None:  # H3-Image: audio adapters resolve whatever their naming, and are skipped below
+            names |= {"audio_patch_proj", "final_layer.audio_out", "final_layer.audio_out.linear"}
+        state_dict = convert_lora_keys(state_dict, names, fused_split_map=split_map, split_linear_modules_map=split_map)
         state_dict = {key.removeprefix("diffusion_model."): value for key, value in state_dict.items()}
         # ComfyUI bundles per-layer backend preferences as uint8 JSON tensors.
         # Keep WanGP's attention selection and leave other unknown keys for MMGP to reject.
@@ -593,6 +638,12 @@ class MiniMaxH3Model(nn.Module):
                 converted.pop(key)
             if ignored:
                 tqdm.write(f"MiniMax H3 LoRA: skipped {len(ignored)} tensors of the blocks this model removed ({', '.join(map(str, self.dropped_blocks))})")
+        if self.audio_patch_proj is None:  # H3-Image: no audio stream for these adapters to act on
+            ignored = [key for key in converted if key.startswith(("audio_patch_proj.", "final_layer.audio_out."))]
+            for key in ignored:
+                converted.pop(key)
+            if ignored:
+                tqdm.write(f"MiniMax H3 LoRA: skipped {len(ignored)} tensors of the audio stream this model does not have")
         if self.endpoint_gate is not None:
             from .hyperflow import convert_adaln_loras as convert_two_time_adaln_loras
 
@@ -647,7 +698,7 @@ class MiniMaxH3Model(nn.Module):
                  adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
                  hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, vdn=False, vsa=False,
                  control_layers=(), control_in_dim=0, dropped_blocks=(), endpoint_gate=None, step_heads=None, audio_enabled=True,
-                 dtype=None, device=None, **kwargs):
+                 dwd_head=False, dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
         self.cache = None
@@ -702,6 +753,11 @@ class MiniMaxH3Model(nn.Module):
                                                       sol_attention=self.sol_attention,
                                                       dtype=dtype, device=device)
         fp32_modules = [module for module in (self.video_patch_proj, self.audio_patch_proj, self.final_layer.video_out, self.final_layer.audio_out) if module is not None]
+        self.dwd_head = None
+        if dwd_head:  # pi-H3 Decoding Without Decoder: the last step's video rows go to a pixel head instead of the latent to the VAE
+            from .dwd import MiniMaxH3DWDHead
+            self.dwd_head = MiniMaxH3DWDHead(hidden_size)
+            fp32_modules += [self.dwd_head.adaln_proj, self.dwd_head.refiner.norm_out, self.dwd_head.refiner.proj_out, self.dwd_head.refiner.first_frame_proj_out]
         if self.control_layers:
             self.control_patch_proj = nn.Linear(control_in_dim * math.prod(self.patch_size), hidden_size, bias=True, dtype=torch.float32, device=device)
             fp32_modules.append(self.control_patch_proj)
@@ -815,12 +871,12 @@ class MiniMaxH3Model(nn.Module):
             video_rows = patchify_video(video_x[item:item + 1].to(torch.float32), self.patch_size)
             if cond_video is not None:
                 video_rows = torch.cat((cond_video.to(device), video_rows))
-            rows.index_copy_(0, video_indices, self.video_patch_proj(video_rows).to(dtype))
+            _project_into(rows, video_indices, self.video_patch_proj, video_rows, dtype)
             if self.audio_patch_proj is not None:
                 audio_rows = pack_audio(audio_x[item:item + 1].to(torch.float32))
                 if cond_audio is not None:
                     audio_rows = torch.cat((cond_audio.to(device), audio_rows))
-                rows.index_copy_(0, audio_indices, self.audio_patch_proj(audio_rows).to(dtype))
+                _project_into(rows, audio_indices, self.audio_patch_proj, audio_rows, dtype)
             del video_rows
         return hidden
 
@@ -914,20 +970,17 @@ class MiniMaxH3Model(nn.Module):
                 video_rows = torch.cat((cond_video.to(device), video_rows))
             if cond_audio is not None:
                 audio_rows = torch.cat((cond_audio.to(device), audio_rows))
-            video_embeds = self.video_patch_proj(video_rows).to(dtype)
-            del video_rows
-            audio_embeds = None if self.audio_patch_proj is None else self.audio_patch_proj(audio_rows).to(dtype)
-            del audio_rows
-
             text_embeds = context[0]
             if text_embeds.shape[-1] != self.hidden_size:
                 text_embeds = self.preprocess_text_embeds(context)[0]
             hidden = torch.empty(layout.sequence_length, self.hidden_size, dtype=dtype, device=device)
             hidden.index_copy_(0, layout.text_indices.to(device), text_embeds)
-            hidden.index_copy_(0, layout.video_indices.to(device), video_embeds)
-            if audio_embeds is not None:
-                hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
-            del text_embeds, video_embeds, audio_embeds
+            del text_embeds
+            _project_into(hidden, layout.video_indices.to(device), self.video_patch_proj, video_rows, dtype)
+            del video_rows
+            if self.audio_patch_proj is not None:
+                _project_into(hidden, layout.audio_indices.to(device), self.audio_patch_proj, audio_rows, dtype)
+            del audio_rows
         else:
             video_x = audio_x = None
 
@@ -1052,7 +1105,13 @@ class MiniMaxH3Model(nn.Module):
                     control_list = None
             return output
 
-        with cuda_graphs.scope():
+        # Smart Inputs Chunker Auto: the extreme mode where the chunked attention would not fit (its inputs given by ranges of rows)
+        attn = self.blocks[self.kept_blocks[0]].attn
+        extreme = (attention_kit.plan_extreme(attn, device, hidden.dtype, hidden.shape[0], hidden.shape[-1], attn.heads, attn.heads, attn.head_dim,
+                                              (attn.q_proj, attn.k_proj, attn.v_proj), attn.out_proj)
+                   if batch == 1 and hasattr(attn, "q_proj") and not hasattr(attn, "vdn") and not self.sol_attention.use_for_layer(hidden.shape[0])
+                   else contextlib.nullcontext())
+        with extreme, cuda_graphs.scope():
             if first_block_cache is None:
                 for block_index in self.kept_blocks:
                     self._check_interrupt()
@@ -1078,6 +1137,8 @@ class MiniMaxH3Model(nn.Module):
                                                            max(audio_t - 1, 0))])
         if spectrum is not None:
             spectrum.observe(hidden[audio_start:], target_audio_rows, self._check_interrupt)
+        dwd_convert = payload.pop("dwd_convert", None)  # the last step of a DWD model: its head reads the video rows the final layer is about to consume
+        dwd_features = None if dwd_convert is None else self.dwd_head.features(hidden[video_start:layout.sequence_length], timestep, video_head_row, dtype)
         h_list = [hidden]
         hidden = None
         final_input, length = temb if final_temb is None else final_temb, layout.sequence_length
@@ -1096,6 +1157,11 @@ class MiniMaxH3Model(nn.Module):
             video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)
         audio = torch.cat([unpack_audio(_to_dtype([audio], audio_dtype)) for audio in audios])
+        if dwd_features is not None:
+            if target_video_inverse_order is not None:
+                dwd_features = dwd_features.index_select(0, target_video_inverse_order)
+            features_list, dwd_features = [dwd_features], None
+            payload["dwd_video"] = self.dwd_head.decode(features_list, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), dwd_convert, self._interrupt)
         return unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size), audio
 
 

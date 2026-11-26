@@ -75,7 +75,12 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
     revision = gr.Number(-1, visible=False, precision=0)
     restored = gr.Textbox(visible=False)
     view = gr.Textbox(visible=False, elem_id='wangp-gallery-view')
+    # Set by the page when its gallery shows other files than its view lists.
+    stale = gr.Textbox(visible=False, elem_id='wangp-gallery-stale')
     interaction = gr.Textbox(visible=False, elem_id='wangp-gallery-interaction')
+    # The media the shared selection shows: changes once that selection is applied, so the media information is
+    # written by its change (returned to the caller) rather than by page events racing the gesture's message.
+    selection = gr.Textbox(visible=False)
 
     def select(payload, state_value):
         payload = json.loads(payload)
@@ -89,17 +94,18 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
 
     interaction.input(select, inputs=[interaction, state], outputs=None, queue=False, show_progress='hidden', trigger_mode='always_last')
 
-    def refresh(state_value, seen, previous_restoration, previous_view):
+    def refresh(state_value, seen, previous_restoration, previous_view, stale_view=''):
         with service._mutation_lock:
             # A page can outlive its Gradio state after a server restart. Its
             # previous revision and gesture counter then belong to another session.
             session = state_value.setdefault('gallery_interaction_id', uuid.uuid4().hex)
-            previous = json.loads(previous_view) if previous_view else {}
+            # A gallery value written by another response leaves the view stale: render everything again.
+            previous = json.loads(previous_view) if previous_view and not stale_view else {}
             same_session = previous.get('session') == session
             current = service.gallery_revision
             restoration = json.dumps(service._restoration)
             if same_session and seen == current and previous_restoration == restoration:
-                return *((gr.update(),) * len(outputs)), current, restoration, gr.update()
+                return *((gr.update(),) * len(outputs)), current, restoration, gr.update(), gr.update()
             updates = list(render_gallery(state_value))
             gen = state_value['gen']
             limit = service._deps.get_server_config()['clear_file_list']
@@ -121,13 +127,14 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
                     if all(previous.get(key) == gallery_view[key] for key in (source.id, source.id + '_offset', source.id + '_selected')):
                         start = outputs.index(strip_states[3 * number])
                         updates[start:start + 3] = [gr.skip()] * 3
-            return *updates, current, restoration, json.dumps(gallery_view)
+            shown = {key: value for key, value in gallery_view.items() if key not in ('revision', 'gallery_sequence')}
+            return *updates, current, restoration, json.dumps(gallery_view), json.dumps({**shown, 'source': gen['current_gallery_source']})
 
     # The patched Gallery applies explicit indices with the value, including its
     # first population. A second response can restore an already obsolete index.
     # The transport's initial snapshot also requests the first view. A separate
     # load request could race it before Gradio marks either request as pending.
-    refreshed = trigger.click(refresh, inputs=[state, revision, restored, view], outputs=[*outputs, revision, restored, view], queue=False, show_progress='hidden', trigger_mode='always_last')
+    refreshed = trigger.click(refresh, inputs=[state, revision, restored, view, stale], outputs=[*outputs, revision, restored, view, selection], queue=False, show_progress='hidden', trigger_mode='always_last')
     refreshed.success(fn=None, inputs=[restored, revision], outputs=None, js='(payload, revision) => window.__wangpAssistantChatNS.galleryRestored?.(JSON.parse(payload), revision)')
     refreshed.then(fn=None, inputs=None, outputs=None, js='() => window.__wangpAssistantChatNS.galleryRefreshFinished?.()')
 
@@ -136,6 +143,7 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
     [preview] = [fn for fn in main.fns.values() if fn.name == 'refresh_preview' and fn.inputs == [state]]
     preview_trigger = gr.Button(visible=False, elem_id='deepy_hybrid_preview_sync')
     gr.on([main.load, preview_trigger.click], preview.fn, inputs=preview.inputs, outputs=preview.outputs, queue=False, show_progress='hidden', trigger_mode='always_last')
+    return selection
 
 
 def bind_settings_sync(service, state, ui, dropdown_updates, catalog_event, preference_view):

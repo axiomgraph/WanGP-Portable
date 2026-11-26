@@ -316,18 +316,18 @@
     "wan2gp_version": "",
     "url": "https://github.com/deepbeepmeep/wan2gp-blender-upsampler"
   }
-,
+  ,
   {
-    "name": "H3 Director",
-    "author": "The-ShadowWalker",
-    "version": "1.3.3",
-    "description": "Timeline director for MiniMax H3 with a React UI, including the Hybrid AV model backend.",
+    "name": "Status Pro",
+    "author": "totideyouover2026-max",
+    "version": "1.3.1",
+    "description": "Persistent generation status, per-step performance and memory telemetry, queue-aware history, exports, live ETA, and plugin-only download telemetry.",
     "type": [
-      "app",
-      "model"
+      "extension"
     ],
-    "date": "",
-    "wan2gp_version": "",
-    "url": "https://github.com/The-ShadowWalker/MiniMax-H3-Director"
-  }
+    "date": "2026-11-03",
+    "wan2gp_version": "0",
+    "url": "https://github.com/totideyouover2026-max/wan2gp-status-pro",
+    "last_check": "2026-11-13T22:49:19"
+  }  
 ]

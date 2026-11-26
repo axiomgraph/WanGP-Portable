@@ -464,10 +464,13 @@ class AutoPreload:
         if not parked and self.thread is None and any(model_id in self.plans or model_id in self.fixed for model_id in m.active_models_ids):
             self.thread = threading.get_ident()  # no cycle ran yet: the thread loading the models is the one that runs their blocks
         # nor while any CUDA graph is captured on this thread's stream (a model's own graphs): unloading blocks would invalidate the capture (a
-        # parked object's blocks are not part of the graph recorded)
-        if self.dropping or need <= 0 or torch.cuda.is_current_stream_capturing() or not parked and (threading.get_ident() != self.thread or cuda_graphs.recording()):
+        # parked object's blocks are not part of the graph recorded). The warmup before a capture runs eagerly: it releases blocks as any call
+        # does, except those of the stage being recorded, whose weights it reads where they are
+        if self.dropping or need <= 0 or torch.cuda.is_current_stream_capturing() or not parked and (threading.get_ident() != self.thread or (cuda_graphs.recording() if cuda_graphs.LEGACY_SHORTAGES else cuda_graphs.capturing())):
             return 0
-        need += MARGIN
+        # beside a running pass, what was missing plus a margin for its activations still to come; for a graph being prepared, what was
+        # missing only: its allocations are once, a later one that runs short asks again
+        need += 0 if cuda_graphs.recording() and not cuda_graphs.LEGACY_SHORTAGES else MARGIN
         for model_id in sorted(m.active_models_ids, key=lambda model_id: m.used.get(model_id, 0)):
             plan = self.plans.get(model_id) or self.fixed.get(model_id)
             if plan is None:
@@ -475,7 +478,8 @@ class AutoPreload:
             self._between_passes(plan)
             plan.pending = set()
             preloaded = m.preloaded_blocks_per_model[model_id]
-            victims = [name for name in reversed(plan.ranking) if name in preloaded and (parked or name != plan.last and model_id + "/" + name not in m.prefetch_futures)]
+            read = () if parked else cuda_graphs.recorded_blocks(m.models[model_id], [name for name in plan.ranking if name in preloaded])
+            victims = [name for name in reversed(plan.ranking) if name in preloaded and name not in read and (parked or name != plan.last and model_id + "/" + name not in m.prefetch_futures)]
             if not victims:
                 continue
             if not parked:  # (parked: its work finished when it was parked)
@@ -581,10 +585,13 @@ class AutoPreload:
         loaded = m.loaded_blocks[model_id]
         if loaded is not None and any(slot[1] == model_id + "/" + loaded for slot in slots):
             m.gpu_unload_blocks(model_id, loaded)
+        freed = False
         for slot_no, slot in enumerate(slots):
             if slot[1] is None and slot[0] is not None:
-                slot[0] = None
+                slot[0], freed = None, True
                 m.slot_views = {key: views for key, views in m.slot_views.items() if key[1] != slot_no or not key[0].startswith(model_id + "/")}
+        if freed:  # slots in the pool of the weights kept for CUDA graphs give their VRAM back
+            m.trim_graph_pool(model_id)
         if all(slot[1] is None for slot in slots):
             del m.block_slots[model_id]
 

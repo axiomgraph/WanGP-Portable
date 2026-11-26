@@ -28,6 +28,9 @@ from ..animate2 import animate2_attention_block, animate2_cached_attention_block
 from ..taomate import audio_attention as taomate_audio_attention
 
 __all__ = ['WanModel']
+HEAD_CHUNK_ROWS = 8192  # rows of the output head per chunk while the attention heads are split
+FFN_BY_ROWS = True  # comparison switch: False makes the FFN's normed and modulated input whole first
+CROSS_BY_CHUNKS = True  # comparison switch: False runs the text cross attention on all tokens at once (WanT2VCrossAttention.add_by_chunks_)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -65,6 +68,13 @@ def modulate_frames(x, norm, shift, scale, dtype=None):
     borrowed; the norm output cast to dtype first when given."""
     segments = frame_segments(x.shape[0], x.shape[1], shift.shape[1])
     return kernels.norm_modulate([x.view(-1, x.shape[-1])], norm, shift[0], scale[0], segments, dtype=dtype).view(x.shape)
+
+def modulate_frames_rows(x, norm, shift, scale, dtype):
+    """modulate_frames(x, norm, shift, scale).to(dtype) as an mmgp RowSource made by ranges of rows of (batch * tokens, dim), for an
+    FFN that reads it chunk by chunk (shared.kernels.ops.mlp) or a self-attention that makes it again by head group (extreme low VRAM):
+    never whole beside x. Rows as from the whole (row-wise operations)."""
+    rows, segments = x.view(-1, x.shape[-1]), frame_segments(x.shape[0], x.shape[1], shift.shape[1])
+    return kernels.norm_modulate_rows(rows, norm, shift[0], scale[0], segments, x.shape, None if dtype == x.dtype else dtype)
 
 def gated_frames_(x, y_list, gate):
     """x += y * gate per latent frame, in place (gate (1, frames, dim), y handed off in y_list); returns x."""
@@ -352,7 +362,9 @@ class WanSelfAttention(nn.Module):
         return kernels.gated_linear(self.o, x_list, rows, gate, frame_segments(residual.shape[0], residual.shape[1], gate.shape[0])).view(residual.shape)
 
     def _norm_rope_(self, query, key, group, freqs):
-        """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place."""
+        """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place (the tokens of group.rows when given)."""
+        if group.rows is not None:
+            freqs = (freqs[0][group.rows.start:group.rows.stop], freqs[1][group.rows.start:group.rows.stop])
         for tensor, norm, heads, index in ((query, self.norm_q, group.q, 0), (key, self.norm_k, group.kv, 1)):
             if tensor is None:
                 continue
@@ -360,8 +372,7 @@ class WanSelfAttention(nn.Module):
             if group.mean_squares is None:
                 norm(rows)
             else:
-                rows.mul_(group.mean_squares[index].add(norm.eps).rsqrt_())
-                rows.mul_(norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
+                kernels.mean_square_scale_(rows, group.mean_squares[index], norm.eps, norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
             apply_rotary_emb_single([tensor], freqs, head_first=False)
 
     def forward(self, xlist, grid_sizes, freqs, block_mask = None, ref_target_masks = None, ref_images_count = 0, standin_phase =-1, lynx_ref_buffer = None, lynx_ref_scale = 0, sub_x_no=0, residual=None, gate=None):
@@ -373,12 +384,17 @@ class WanSelfAttention(nn.Module):
         """
         if (block_mask is None and ref_target_masks is None and standin_phase < 1 and lynx_ref_buffer is None and isinstance(freqs, tuple)
                 and not offload.shared_state.get("_chipmunk", False) and not offload.shared_state.get("_radial", False)):
+            # the kit applies o as _project does: with the heads split, it reads each group's output as o's weight format allows
+            rows = None if residual is None else residual.view(-1, residual.shape[-1])
+            segments = None if residual is None else frame_segments(residual.shape[0], residual.shape[1], gate.shape[0])
             x = attention_kit.qkv_attention(xlist, self.q, self.k, self.v, self.num_heads, self.head_dim,
                                             lambda query, key, group: self._norm_rope_(query, key, group, freqs),
-                                            norm_spans_heads=isinstance(self.norm_q, WanRMSNorm))
-            return self._project(x.flatten(2), residual, gate), None
+                                            norm_spans_heads=isinstance(self.norm_q, WanRMSNorm), norm_rows="heads", out_proj=self.o, residual=rows, gate=gate, segments=segments)
+            return (x if residual is None else residual), None
         x = xlist[0]
         xlist.clear()
+        if isinstance(x, offload.RowSource):  # extreme low VRAM: read whole by the paths other than the kit's
+            x = x.materialize()
 
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -470,6 +486,32 @@ class WanSelfAttention(nn.Module):
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+
+    QUERY_CHUNK_BYTES = 64 << 20  # 16-bit queries of all heads per chunk of tokens (add_by_chunks_)
+
+    def add_by_chunks_(self, x, norm, context, attention_dtype):
+        """x += cross_attn(norm(x)) by chunks of tokens: each chunk normed, projected, attended against the whole context, projected
+        by o and added into its rows, so that neither norm(x) nor q nor the output of all tokens exists. Every step is row-wise: a
+        chunk reads its own rows only, before its output is added to them."""
+        b, tokens, dim = x.shape
+        n, d = self.num_heads, self.head_dim
+        k = self.k(context)
+        self.norm_k(k)
+        k = k.view(context.shape[0], -1, n, d)
+        v = self.v(context).view(context.shape[0], -1, n, d)
+        chunk = max(128, self.QUERY_CHUNK_BYTES // (dim * 2) // 128 * 128)
+        for item in range(b):
+            item_k, item_v = (k[item:item + 1], v[item:item + 1]) if k.shape[0] > 1 else (k, v)
+            for start in range(0, tokens, chunk):
+                rows = x[item:item + 1, start:start + chunk]
+                q = self.q(norm(rows).to(attention_dtype))
+                self.norm_q(q)
+                qkv_list = [q.view(1, -1, n, d), item_k, item_v]
+                q = None
+                attention = pay_attention(qkv_list, recycle_q=True).flatten(2, 3)
+                rows += self.o(attention).to(rows.dtype)
+                attention = None
+        return x
 
     def forward(self, xlist, context, grid_sizes, lynx_ip_embeds = None, lynx_ip_scale = 0, *args, **kwargs):
         r"""
@@ -693,21 +735,25 @@ class WanAttentionBlock(nn.Module):
                      
         e = frame_modulation(self.modulation.weight, e)
         # self-attention
-        x_mod = modulate_frames(x, self.norm1, e[0], e[1])
+        if cam_emb is None and not lynx_feature_extractor and attention_kit.extreme_low_vram():
+            # extreme low VRAM: the input by ranges of rows, made again by the attention for each head group, never whole beside x
+            xlist = [modulate_frames_rows(x, self.norm1, e[0], e[1], attention_dtype)]
+        else:
+            x_mod = modulate_frames(x, self.norm1, e[0], e[1])
 
-        if cam_emb != None:
-            cam_emb = self.cam_encoder(cam_emb)
-            if cam_emb.ndim == 3 and cam_emb.shape[1] == x_mod.shape[1]:
-                x_mod += cam_emb
-            else:
-                cam_emb = cam_emb.repeat(1, 2, 1)
-                cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, grid_sizes[1], grid_sizes[2], 1)
-                cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
-                x_mod += cam_emb
+            if cam_emb != None:
+                cam_emb = self.cam_encoder(cam_emb)
+                if cam_emb.ndim == 3 and cam_emb.shape[1] == x_mod.shape[1]:
+                    x_mod += cam_emb
+                else:
+                    cam_emb = cam_emb.repeat(1, 2, 1)
+                    cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, grid_sizes[1], grid_sizes[2], 1)
+                    cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
+                    x_mod += cam_emb
 
-        xlist = [x_mod.to(attention_dtype)]
-        if lynx_feature_extractor: get_cache("lynx_ref_buffer")[sub_x_no][self.block_no] = xlist[0]
-        del x_mod
+            xlist = [x_mod.to(attention_dtype)]
+            if lynx_feature_extractor: get_cache("lynx_ref_buffer")[sub_x_no][self.block_no] = xlist[0]
+            del x_mod
         gated = cam_emb is None  # the output projection adds its output, gated per latent frame, into x
         y, x_ref_attn_map = self.self_attn( xlist, grid_sizes, freqs, block_mask = block_mask, ref_target_masks = multitalk_masks, ref_images_count = ref_images_count, standin_phase= standin_phase, lynx_ref_buffer = lynx_ref_buffer, lynx_ref_scale = lynx_ref_scale, sub_x_no = sub_x_no,
                                             residual = x if gated else None, gate = e[2][0])
@@ -718,7 +764,9 @@ class WanAttentionBlock(nn.Module):
             x = gated_frames_(x, y_list, e[2])
         del y
 
-        if context is not None:
+        if context is not None and CROSS_BY_CHUNKS and type(self.cross_attn) is WanT2VCrossAttention and lynx_ip_embeds is None and (offload.shared_state.get("_nag_scale", 0) <= 1 or len(context) == 1):
+            self.cross_attn.add_by_chunks_(x, self.norm3, context, attention_dtype)  # no norm3(x), q or output of all tokens
+        elif context is not None:
             y = self.norm3(x)
             y = y.to(attention_dtype)
             ylist= [y]
@@ -744,9 +792,10 @@ class WanAttentionBlock(nn.Module):
                 x = fuse_with_image_ref(x, y, ref_images_count, grid_sizes)
                 del y
 
-        y = modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)
+        # the FFN by chunks of rows, its input normed and modulated chunk by chunk, its output gated per latent frame into x
+        y = modulate_frames_rows(x, self.norm2, e[3], e[4], attention_dtype) if FFN_BY_ROWS else modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)
 
-        y_list, y = [y], None  # the FFN by chunks, its output gated per latent frame into x
+        y_list, y = [y], None
         kernels.mlp(y_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(e[5], x.shape[0], x.shape[1]))
 
         if hints_processed is not None:
@@ -894,10 +943,26 @@ class Head(nn.Module):
         x_list.clear()
 
         e = frame_modulation(self.modulation.weight, e.unsqueeze(1))
-        x = modulate_frames(x, self.norm, e[0], e[1])
-        x= x.to(self.head.weight.dtype)
-        x = self.head(x)
-        return x
+        batch, tokens, dim = x.shape
+        whole = batch * tokens * (dim * x.element_size() + (dim + self.head.out_features) * self.head.weight.element_size())  # the norm output, its copy, the head's output
+        if batch * tokens <= HEAD_CHUNK_ROWS or not attention_kit.chunking_needed(x.device, whole, ("wan head", batch * tokens, dim)):
+            x = modulate_frames(x, self.norm, e[0], e[1])
+            x= x.to(self.head.weight.dtype)
+            x = self.head(x)
+            return x
+        # Smart Inputs Chunker: the norm output and its copy in the head's dtype by chunks of rows, where the whole stream's
+        # (with the other CFG branch's stream) would be the call's VRAM peak. cuBLAS sums the head's output in another order per row count.
+        rows, segments, out = x.view(-1, dim), frame_segments(batch, tokens, e[0].shape[1]), None
+        x = None
+        for start in range(0, rows.shape[0], HEAD_CHUNK_ROWS):
+            stop = min(start + HEAD_CHUNK_ROWS, rows.shape[0])
+            spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+            part = self.head(kernels.norm_modulate([rows[start:stop]], self.norm, e[0][0], e[1][0], spans).to(self.head.weight.dtype))
+            if out is None:
+                out = part.new_empty((rows.shape[0], part.shape[-1]))
+            out[start:stop] = part
+            part = None
+        return out.view(batch, tokens, -1)
 
 
 class MLPProj(torch.nn.Module):
@@ -1555,6 +1620,31 @@ class WanModel(ModelMixin, ConfigMixin):
         return best_threshold
 
     
+    EMBED_CHUNK_BYTES = 64 << 20  # 16-bit output of the patch embedding per chunk of latent frames (extreme low VRAM)
+
+    def _patch_embed(self, x, dtype):
+        """patch_embedding(x).to(dtype); with extreme low VRAM (forced) by chunks of latent frames written into the output (the temporal
+        kernel is one frame), so that the whole 16-bit embedding never sits beside it (Wan 2.1 720p 81 frames: 0.74 GB less at this
+        peak, the first of a call). The output keeps the convolution's own memory format."""
+        conv = self.patch_embedding
+        if not attention_kit.extreme_low_vram() or conv.kernel_size[0] != 1 or conv.stride[0] != 1 or x.shape[2] < 4:
+            return conv(x).to(dtype)
+        first = conv(x[:, :, :2])
+        layout = torch.channels_last_3d if first.is_contiguous(memory_format=torch.channels_last_3d) and not first.is_contiguous() else torch.contiguous_format
+        out = torch.empty((*first.shape[:2], x.shape[2], *first.shape[3:]), dtype=dtype, device=first.device, memory_format=layout)
+        out[:, :, :2] = first
+        step = max(1, self.EMBED_CHUNK_BYTES // (first[:, :, :1].numel() * first.element_size()))
+        first = None
+        for start in range(2, x.shape[2], step):
+            out[:, :, start:start + step] = conv(x[:, :, start:start + step])
+        return out
+
+    def _plan_extreme(self, x):
+        """attention_kit.plan_extreme for the self-attention of the blocks (Smart Inputs Chunker Auto), x (batch, tokens, dim)."""
+        attn = self.blocks[0].self_attn
+        return attention_kit.plan_extreme(attn, x.device, attn.q.weight.dtype, x.shape[0] * x.shape[1], x.shape[-1], attn.num_heads, attn.num_heads,
+                                          attn.head_dim, (attn.q, attn.k, attn.v), attn.o)
+
     def forward(
         self,
         x,
@@ -1710,7 +1800,7 @@ class WanModel(ModelMixin, ConfigMixin):
                         x = torch.cat([x] + source_tokens, dim=1)
                     source_tokens = cos_parts = sin_parts = None
                 elif not steadydancer:
-                    x = self.patch_embedding(x).to(modulation_dtype)
+                    x = self._patch_embed(x, modulation_dtype)
                     if camera_adapter_features is not None:
                         x += camera_adapter_features
                     if scail2_ref_mask is not None:
@@ -1806,7 +1896,9 @@ class WanModel(ModelMixin, ConfigMixin):
             scail2_pose_tokens = build_scail2_pose_tokens(self, scail2_pose_latents, scail2_driving_masks, modulation_dtype)
         
         if face_pixel_values is None: face_pixel_values =  [None] * len(x_list)
-        for i, (x, one_face_pixel_values) in enumerate(zip(x_list, face_pixel_values)):
+        # by index: enumerate(zip()) keeps its last result tuple, the previous branch's embedded tokens beside this branch's copy
+        for i in range(min(len(x_list), len(face_pixel_values))):
+                x, one_face_pixel_values, x_list[i] = x_list[i], face_pixel_values[i], None
                 # animate/scail embeddings
                 motion_vec = None
                 if pose_latents is not None: 
@@ -1819,9 +1911,9 @@ class WanModel(ModelMixin, ConfigMixin):
                     x_og_shape = x.shape
                     x = voxel_chunk_no_padding(x, voxel_shape).squeeze(-1).transpose(1, 2)
                 else:
-                    x = x.flatten(2).transpose(1, 2)
-                    if self.taomate:
-                        x = x.contiguous()  # the rows in order: the fused INT8 kernels write into them
+                    # the tokens' rows in order: a transposed view would be copied by every norm of every block (3 norms a block, each
+                    # a temporary as large as the stream) and updated in place with strided writes; TaoMate's fused INT8 kernels write into them
+                    x = x.flatten(2).transpose(1, 2).contiguous()
 
                 if vista_condition_tokens is not None:
                     x = torch.cat((x, vista_condition_tokens), dim=1)
@@ -2082,68 +2174,70 @@ class WanModel(ModelMixin, ConfigMixin):
                 for i in range(len(x_list)):
                     if x_should_calc[i]: ori_hidden_states[i] = x_list[i].clone()
 
-        if any(x_should_calc):
-            for block_idx, block in enumerate(self.blocks):
-                offload.shared_state["layer"] = block_idx
-                if callback != None:
-                    callback(-1, None, False, True)
-                if pipeline._interrupt:
-                    return [None] * len(x_list)
+        # Smart Inputs Chunker Auto: the extreme low VRAM mode where the chunked self-attention would not fit
+        with self._plan_extreme(x_list[0]):
+            if any(x_should_calc):
+                for block_idx, block in enumerate(self.blocks):
+                    offload.shared_state["layer"] = block_idx
+                    if callback != None:
+                        callback(-1, None, False, True)
+                    if pipeline._interrupt:
+                        return [None] * len(x_list)
 
-                if standin_x is not None:
-                    if not standin_cache_enabled: get_cache("standin").clear()
-                    standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
+                    if standin_x is not None:
+                        if not standin_cache_enabled: get_cache("standin").clear()
+                        standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
 
-                uni3c_block = block.uni3c if uni3c_x is not None and block_idx < self.uni3c_layers else None
-                if uni3c_block is not None: # shared by all the guidance branches: the ControlNet does not see the text
-                    uni3c_x = uni3c_block(uni3c_x, e, uni3c_condition["freqs"])
+                    uni3c_block = block.uni3c if uni3c_x is not None and block_idx < self.uni3c_layers else None
+                    if uni3c_block is not None: # shared by all the guidance branches: the ControlNet does not see the text
+                        uni3c_x = uni3c_block(uni3c_x, e, uni3c_condition["freqs"])
 
-                if animate2_enabled:
-                    animate2_generation = {
-                        "x_list": x_list,
-                        "contexts": context_list,
-                        "should_calc": x_should_calc,
-                        "unconditional": [i > 0 if joint_pass else x_id > 0 for i in range(len(x_list))],
-                        "e": e0,
-                        "grid_sizes": attention_grid_sizes,
-                        "freqs": freqs,
-                        "log_scale": animate2_log_scale,
-                    }
-                    if animate2_cached:
-                        animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
-                        x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
+                    if animate2_enabled:
+                        animate2_generation = {
+                            "x_list": x_list,
+                            "contexts": context_list,
+                            "should_calc": x_should_calc,
+                            "unconditional": [i > 0 if joint_pass else x_id > 0 for i in range(len(x_list))],
+                            "e": e0,
+                            "grid_sizes": attention_grid_sizes,
+                            "freqs": freqs,
+                            "log_scale": animate2_log_scale,
+                        }
+                        if animate2_cached:
+                            animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
+                            x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
+                        else:
+                            if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
+                                cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
+                                animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
+                            elif animate2_cache is not None:
+                                animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
+                            animate2_ref_handoff = [animate2_ref_hidden]
+                            animate2_ref_hidden = None
+                            animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)
+                        animate2_generation = None
+                    elif perturbation_layers is not None and block_idx in perturbation_layers:
+                        if x_id != 0 or not x_should_calc[0]:
+                            continue
+                        x_list[0] = block(x_list[0], context = context_list[0], audio_scale= audio_scale_list[0], e= e0, **kwargs)
                     else:
-                        if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
-                            cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
-                            animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
-                        elif animate2_cache is not None:
-                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
-                        animate2_ref_handoff = [animate2_ref_hidden]
-                        animate2_ref_hidden = None
-                        animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)
-                    animate2_generation = None
-                elif perturbation_layers is not None and block_idx in perturbation_layers:
-                    if x_id != 0 or not x_should_calc[0]:
-                        continue
-                    x_list[0] = block(x_list[0], context = context_list[0], audio_scale= audio_scale_list[0], e= e0, **kwargs)
-                else:
-                    for i, (x, context, hints, audio_scale, multitalk_audio, multitalk_masks, should_calc, motion_vec, lynx_ip_embeds,lynx_ref_buffer) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list, multitalk_audio_list, multitalk_masks_list, x_should_calc,motion_vec_list, lynx_ip_embeds_list,lynx_ref_buffer_list)):
-                        if should_calc:
-                            block_kwargs = kwargs
-                            if bernini_enabled:
-                                block_kwargs = dict(kwargs)
-                                block_kwargs["freqs"] = bernini_freqs_list[i]
-                            elif taomate_audio is not None:
-                                block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
-                            x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
-                            del x
-                    context = hints = None
+                        for i, (x, context, hints, audio_scale, multitalk_audio, multitalk_masks, should_calc, motion_vec, lynx_ip_embeds,lynx_ref_buffer) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list, multitalk_audio_list, multitalk_masks_list, x_should_calc,motion_vec_list, lynx_ip_embeds_list,lynx_ref_buffer_list)):
+                            if should_calc:
+                                block_kwargs = kwargs
+                                if bernini_enabled:
+                                    block_kwargs = dict(kwargs)
+                                    block_kwargs["freqs"] = bernini_freqs_list[i]
+                                elif taomate_audio is not None:
+                                    block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
+                                x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
+                                del x
+                        context = hints = None
 
-                if uni3c_block is not None:
-                    uni3c_hint = uni3c_block.proj_out(uni3c_x)
-                    for i, should_calc in enumerate(x_should_calc):
-                        if should_calc: x_list[i] += uni3c_hint
-                    uni3c_hint = None
+                    if uni3c_block is not None:
+                        uni3c_hint = uni3c_block.proj_out(uni3c_x)
+                        for i, should_calc in enumerate(x_should_calc):
+                            if should_calc: x_list[i] += uni3c_hint
+                        uni3c_hint = None
 
         if animate2_enabled:
             animate2_ref_hidden = animate2_ref_context_emb = animate2_ref_e0 = animate2_ref_freqs = None

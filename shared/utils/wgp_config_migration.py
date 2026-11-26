@@ -7,12 +7,12 @@ from postprocessing.mmaudio import MMAUDIO_DEFAULT_MODE
 from postprocessing.mmaudio.audio_processor import MMAudioProcessor
 from postprocessing.seedvc_processor.audio_processor import SeedVCProcessor
 from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_MIN, DEEPY_ENABLED_KEY, DEEPY_TEMPLATE_CONFIG_MIGRATIONS
-from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
+from shared.remote_llm.config import INKLING2_MINI_VISIBLE, QWEN38_FLASH_NEXT_VISIBLE
 
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.32")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.34")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
@@ -24,6 +24,7 @@ PROMPT_ENHANCER_CHOICES = [
     ("Qwen3.5VL Abliterated 9B (captioning + uncensored high end text enhancement, vllm accelerated if available)", 4),
     ("Qwen3.8VL Uncensored 27B by Jonathan Coletti (highest quality, choose GGUF Q2, Q3 or Q4 below)", 5),
     *([("Qwen3.8VL Flash-Next 125B (80 GB download, 64 GB of RAM)", 7)] if QWEN38_FLASH_NEXT_VISIBLE else []),
+    *([("Inkling 2 Mini VL Uncensored (fast captioning + uncensored text enhancement, 20 GB download, for 24 GB of VRAM)", 8)] if INKLING2_MINI_VISIBLE else []),
 ]
 
 SEEDVC_DEFAULT_MODE = 2
@@ -317,6 +318,15 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
 
     if version < Decimal("1.30") and DEEPY_CONTEXT_TOKENS_KEY in server_config and _to_int(server_config[DEEPY_CONTEXT_TOKENS_KEY]) < DEEPY_CONTEXT_TOKENS_MIN:
         server_config[DEEPY_CONTEXT_TOKENS_KEY] = DEEPY_CONTEXT_TOKENS_MIN  # Deepy context window: 20,480 tokens at least
+        changed = True
+
+    if version < Decimal("1.33"):  # Attention Head Split became the Smart Inputs Chunker under a new key: its Auto (any level) is On
+        head_split = server_config.pop("attention_head_split", 0)
+        server_config.setdefault("inputs_chunker", "off" if _is_off(head_split) else "on")
+        changed = True
+
+    if version < Decimal("1.34") and server_config.get("compile") == "cudagraph":  # CUDA graphs only where they save time
+        server_config["compile"] = "auto"
         changed = True
 
     if workspace_root is not None and version < Decimal('1.28'):

@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from torch import nn
@@ -52,6 +53,12 @@ class TinyVAE(nn.Module):
     def forward(self, latents, image=False, abort_check=None, video=False, duration=None):
         # Input is WanGP's existing C,T,H,W preview contract. Image batches
         # occupy T; temporal video decoders must not mix those images.
+        # A preview runs in the decoder's own dtype, whatever autocast the generation runs under (Kandinsky 5 previews from inside a BF16
+        # autocast: its PyTorch layers then gave BF16 activations to the band kernels, whose weights are FP16).
+        with torch.autocast(latents.device.type, enabled=False):
+            return self._forward(latents, image, abort_check, video, duration)
+
+    def _forward(self, latents, image, abort_check, video, duration):
         value = latents.permute(1, 0, 2, 3).to(next(self.net.parameters()))
         video = video and not image
         count = (len(value) - 1) * self.net.t_upscale + 1 if self.config['kind'] == 'video' and not image else len(value)
@@ -73,30 +80,33 @@ class TinyVAE(nn.Module):
 
         if self.config['kind'] != 'video':
             frames = []
-            for index in indices:
-                if abort_check is not None and abort_check():
-                    return None
-                frames.append(to_pixels(self.net(value[index:index + 1])))
-            pixels = torch.cat(frames)
+            with self.net.kernels(value) as together:  # small frames are decoded several at a time
+                for first in range(0, len(indices), together):
+                    if abort_check is not None and abort_check():
+                        return None
+                    frames.append(to_pixels(self.net(value[indices[first:first + together]])).numpy())
+            pixels = np.concatenate(frames)
         elif image:
             frames = []
             for index in indices:
                 decoded = self.net.decode_video(value[index:index + 1, None], parallel=False, abort_check=abort_check)
                 if decoded is None:
                     return None
-                frames.append(to_pixels(decoded[:, 0]))
-            pixels = torch.cat(frames)
+                frames.append(to_pixels(decoded[:, 0]).numpy())
+            pixels = np.concatenate(frames)
         else:
             decoded = self.net.decode_video(value[None], parallel=False, output_indices=indices, abort_check=abort_check, output_transform=to_pixels)
             if decoded is None:
                 return None
-            pixels = decoded[0]
+            pixels = decoded[0].numpy()
         if abort_check is not None and abort_check():
             return None
+        # frames in RAM assembled by NumPy, on this thread alone: PyTorch's CPU copies wake its pool of threads, which then spin over the
+        # next denoising step
         if video:
-            return [Image.fromarray(frame.permute(1, 2, 0).numpy()) for frame in pixels], len(indices) / duration
-        pixels = pixels.permute(2, 0, 3, 1).flatten(1, 2).numpy()
-        return Image.fromarray(pixels)
+            return [Image.fromarray(np.ascontiguousarray(frame.transpose(1, 2, 0))) for frame in pixels], len(indices) / duration
+        frames, channels, height, width = pixels.shape
+        return Image.fromarray(pixels.transpose(2, 0, 3, 1).reshape(height, frames * width, channels))
 
 
 def load_decoder(name, path):

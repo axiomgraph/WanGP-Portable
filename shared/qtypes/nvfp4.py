@@ -39,6 +39,15 @@ except Exception:
     _lx_gemm = None
     _lx_gemm_available = False
 
+# lightx2v_kernel 0.0.3+: a quantizer writing either nibble order (both checkpoint layouts without a swap) and a cuBLASLt GEMM prepared once per
+# problem, with FP16 / BF16 output; 0.0.2 installs keep the original operators and paths
+_lx_v2 = _lx_gemm_available and all(hasattr(torch.ops.lightx2v_kernel, op) for op in ("scaled_nvfp4_quant_v2_sm120", "nvfp4_mm_v2_sm120"))
+try:  # comfy-kitchen quantizes in either nibble order since 0.2.x: legacy weights then need no swapped copy per call
+    import inspect
+    _ck_hi_first = _ck_cuda_available and "hi_first" in inspect.signature(_ck_cuda.quantize_nvfp4).parameters
+except Exception:
+    _ck_hi_first = False
+
 _NVFP4_QTYPE_NAME = "nvfp4"
 if _NVFP4_QTYPE_NAME not in _quanto_qtypes:
     _quanto_qtypes[_NVFP4_QTYPE_NAME] = _quanto_qtype(
@@ -154,7 +163,7 @@ def _nvfp4_backend_candidates():
 
 def _nvfp4_backend_label(backend):
     if backend == _NVFP4_BACKEND_LIGHTX2V:
-        return "lightx2v"
+        return "lightx2v v2" if _lx_v2 else "lightx2v"
     if backend == _NVFP4_BACKEND_COMFY:
         return "comfy-kitchen"
     return backend
@@ -310,7 +319,7 @@ def _nvfp4_layout(weight):
 
 def _nvfp4_select_backend(input, weight):
     layout = _nvfp4_layout(weight)
-    order = ((_NVFP4_BACKEND_LIGHTX2V, _NVFP4_BACKEND_COMFY) if layout == _NVFP4_LAYOUT_LEGACY
+    order = ((_NVFP4_BACKEND_LIGHTX2V, _NVFP4_BACKEND_COMFY) if layout == _NVFP4_LAYOUT_LEGACY or _lx_v2
              else (_NVFP4_BACKEND_COMFY, _NVFP4_BACKEND_LIGHTX2V))
     k, n = input.shape[-1], weight.size(0)
     for backend in order:
@@ -340,18 +349,9 @@ def _nvfp4_can_use_kernel(input, weight):
         return False
     if not torch.is_tensor(weight._input_global_scale) or not torch.is_tensor(weight._alpha):
         return False
-    if getattr(weight._input_global_scale, "is_meta", False):
-        return False
-    if _is_fake_tensor(input):
-        return True
-    finite = weight.__dict__.get("_finite_input_scale")
-    if finite is None:  # checked once per weight: a device sync on every call otherwise, which CUDA graphs cannot capture
-        try:
-            finite = bool(torch.isfinite(weight._input_global_scale).all())
-        except Exception:
-            finite = False
-        weight._finite_input_scale = finite
-    return finite
+    # a non-finite input scale was refused when the weight was created (create: _allow_kernel), so no check here: a device sync on
+    # every call of a streamed weight otherwise (its GPU copy is a new tensor at each load)
+    return not getattr(weight._input_global_scale, "is_meta", False)
 
 
 def _nvfp4_get_act_scale(device):
@@ -425,17 +425,21 @@ def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
         alpha = alpha.to(device)
     if bias is not None and torch.is_tensor(bias) and bias.dtype != out_dtype:
         bias = bias.to(out_dtype)
+    hi_first = True
     if layout == _NVFP4_LAYOUT_TENSORCORE:
         act_scale = input_scale.to(torch.float32)
         alpha = act_scale * alpha.to(torch.float32)
     else:
         alpha = alpha * input_scale
         act_scale = _nvfp4_get_act_scale(device)
-        weight_fp4 = _nvfp4_swap_nibbles(weight_fp4)
+        if _ck_hi_first:  # activations in the weights' nibble order (low nibble first) instead of a swapped copy of the weights
+            hi_first = False
+        else:
+            weight_fp4 = _nvfp4_swap_nibbles(weight_fp4)
     alpha = alpha.to(torch.float32).reshape(1)
     # cuBLAS takes the activations padded to 16 rows, written to the output rows padded the same way
     out = _nvfp4_rows(x2d, (-(-x2d.shape[0] // 16) * 16, weight.size(0)), out_dtype,
-                      lambda x: _ck_cuda.quantize_nvfp4(x, act_scale, 0.0, x.shape[0] % 16 != 0),
+                      lambda x: _ck_cuda.quantize_nvfp4(x, act_scale, 0.0, x.shape[0] % 16 != 0, *(() if hi_first else (False,))),
                       lambda q, out: _kitchen_scaled_mm_nvfp4(out[:q[0].shape[0]], q[0], weight_fp4, q[1], weight_scale, alpha, bias))[:x2d.shape[0]]
     if out.dtype != orig_dtype:
         out = out.to(orig_dtype)
@@ -477,6 +481,8 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
         input_scale = input_scale.to(torch.float32)
     if alpha.dtype != torch.float32:
         alpha = alpha.to(torch.float32)
+    if _lx_v2:
+        return _nvfp4_linear_cuda_lightx2v_v2(input, x2d, out_dtype, orig_dtype, weight_fp4, weight_scale, input_scale, alpha, layout, weight.size(0), bias)
     if bias is not None and torch.is_tensor(bias):
         if bias.dtype != torch.bfloat16:
             bias = bias.to(torch.bfloat16)
@@ -502,6 +508,30 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
     if out.dtype != orig_dtype:
         out = out.to(orig_dtype)
     return out.reshape(*input.shape[:-1], weight.size(0))
+
+
+def _nvfp4_lx_quantize_v2(x, input_scale, layout):
+    """FP4 activations and their tiled block scales in the weights' nibble order (0.0.3 quantizer: it writes the scale padding itself).
+    Tensorcore weights store the per-tensor decode scale, inverted in the kernel as torch.reciprocal(torch.clamp(s, min=1e-8)) is."""
+    rows, k = x.shape
+    q = torch.empty((rows, k // 2), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((-(-rows // 128) * 128, -(-(k // 16) // 4) * 4), dtype=torch.float8_e4m3fn, device=x.device)
+    tensorcore = layout == _NVFP4_LAYOUT_TENSORCORE
+    torch.ops.lightx2v_kernel.scaled_nvfp4_quant_v2_sm120(q, x, scales, input_scale, tensorcore, tensorcore)
+    return q, scales
+
+
+def _nvfp4_linear_cuda_lightx2v_v2(input, x2d, out_dtype, orig_dtype, weight_fp4, weight_scale, input_scale, alpha, layout, n, bias):
+    if layout == _NVFP4_LAYOUT_TENSORCORE:
+        alpha = alpha * input_scale
+    if bias is not None and bias.dtype != out_dtype:
+        bias = bias.to(out_dtype)
+    mm = torch.ops.lightx2v_kernel.nvfp4_mm_v2_sm120
+    out = _nvfp4_rows(x2d, (x2d.shape[0], n), out_dtype, lambda x: _nvfp4_lx_quantize_v2(x, input_scale, layout),
+                      lambda q, out: mm(out, q[0], weight_fp4, q[1], weight_scale, alpha, bias))
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out.reshape(*input.shape[:-1], n)
 
 
 def _nvfp4_linear_cuda(input, weight, bias=None):
@@ -795,8 +825,11 @@ class _NVFP4RowProjection:
             return x
         x = x.contiguous()
         if backend == _NVFP4_BACKEND_COMFY:
-            scale = weight._input_global_scale.float() if weight._layout == _NVFP4_LAYOUT_TENSORCORE else _nvfp4_get_act_scale(x.device)
-            q, scales = _ck_cuda.quantize_nvfp4(x, scale, 0.0, x.shape[0] % 16 != 0)
+            tensorcore = weight._layout == _NVFP4_LAYOUT_TENSORCORE
+            scale = weight._input_global_scale.float() if tensorcore else _nvfp4_get_act_scale(x.device)
+            q, scales = _ck_cuda.quantize_nvfp4(x, scale, 0.0, x.shape[0] % 16 != 0, *(() if tensorcore or not _ck_hi_first else (False,)))
+        elif _lx_v2:
+            q, scales = _nvfp4_lx_quantize_v2(x, weight._input_global_scale.float(), weight._layout)
         else:
             scale = weight._input_global_scale.float()
             if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
@@ -804,7 +837,18 @@ class _NVFP4RowProjection:
             q, scales = _lx_gemm.scaled_nvfp4_quant(x, scale)
             if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
                 q = _nvfp4_swap_nibbles(q)
-        return q, scales, x.shape[0], x.dtype
+        return q, scales, x.shape[0], x.dtype, 0
+
+    @staticmethod
+    def slice_input(prepared, start, stop):
+        """Rows of the input (offload.linear_input_rows): the quantized rows from the 128-row block holding `start` (the swizzled block
+        scales store 128 rows together, the GEMM takes rows by 16), and the offset of `start` in it: rows() trims its output to them."""
+        if torch.is_tensor(prepared):
+            return prepared[start:stop]
+        q, scales, rows, dtype, offset = prepared
+        start, stop = start + offset, stop + offset
+        first = start // 128 * 128
+        return q[first:min(q.shape[0], -(-stop // 16) * 16)], scales[first:-(-stop // 128) * 128], stop - start, dtype, start - first
 
     @staticmethod
     def rows(module, prepared, start, stop):
@@ -825,23 +869,28 @@ class _NVFP4RowProjection:
                 dense = _dequantize_nvfp4_weight(data, scales, weight._input_global_scale, weight._alpha, prepared.dtype, prepared.device, layout=weight._layout)
                 out = torch.nn.functional.linear(prepared, dense, bias)
         else:
-            q, qs, rows, dtype = prepared
+            q, qs, rows, dtype, offset = prepared
             input_scale, alpha = weight._input_global_scale, weight._alpha
             if backend == _NVFP4_BACKEND_COMFY:
                 if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
                     out = _ck_cuda.scaled_mm_nvfp4(q, data, input_scale.float(), alpha.float(), qs, scales,
                                                   bias=None if bias is None else bias.to(dtype), out_dtype=dtype)
                 else:
-                    out = _ck_cuda.scaled_mm_nvfp4(q, _nvfp4_swap_nibbles(data), _nvfp4_get_act_scale(q.device), input_scale,
+                    out = _ck_cuda.scaled_mm_nvfp4(q, data if _ck_hi_first else _nvfp4_swap_nibbles(data), _nvfp4_get_act_scale(q.device), input_scale,
                                                   qs, scales, bias=None if bias is None else bias.to(dtype), out_dtype=dtype,
                                                   alpha=(alpha * input_scale).float())
+            elif _lx_v2:
+                alpha = alpha.float() * input_scale.float() if weight._layout == _NVFP4_LAYOUT_TENSORCORE else alpha.float()
+                out = torch.empty((q.shape[0], data.shape[0]), dtype=dtype, device=q.device)
+                torch.ops.lightx2v_kernel.nvfp4_mm_v2_sm120(out, q.contiguous(), data.contiguous(), qs.contiguous(), scales.contiguous(), alpha,
+                                                            None if bias is None else bias.to(dtype).contiguous())
             else:
                 alpha = alpha.float()
                 if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
                     alpha = alpha * input_scale.float()
                 out = _lx_gemm.cutlass_scaled_nvfp4_mm(q.contiguous(), data.contiguous(), qs.contiguous(), scales.contiguous(),
                                                        alpha=alpha, bias=None if bias is None else bias.to(torch.bfloat16).contiguous())
-            out = out[:rows].to(dtype)
+            out = out[offset:offset + rows].to(dtype)
         return out[:, start - first:stop - first]
 
 
@@ -1495,3 +1544,36 @@ def validate_nvfp4_kernel(
             )
 
     return {"ok": True, "results": results}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------------
+# Routed experts in NVFP4 rows
+
+from shared.kernels.cpu_experts import NVFP4_ROWS, RowScaledExpertFormat
+
+
+class Nvfp4RowExperts(RowScaledExpertFormat):
+    """Routed experts in NVFP4 whose block scales follow their rows (not the 128x4 tiles of the NVFP4 linears): w13_weight uint8
+    [experts, 2 * intermediate, hidden / 2], rows alternating gate and up (up rows only without a gate), and w2_weight uint8 [experts, hidden, intermediate / 2], two
+    E2M1 codes per byte with the even column in the low nibble; w13_weight_scale and w2_weight_scale E4M3 [experts, rows, columns / 16];
+    w13_factor and w2_factor float32 [experts, 1]. A weight is its E2M1 value times its block scale times the factor of its expert."""
+    name, native, kind, block = "nvfp4_rows", NVFP4_ROWS, 0, 16
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        rows, fp8 = (2 if gated else 1) * intermediate, torch.float8_e4m3fn
+        return {"w13_weight": ((experts, rows, hidden // 2), torch.uint8), "w2_weight": ((experts, hidden, intermediate // 2), torch.uint8),
+                "w13_weight_scale": ((experts, rows, hidden // 16), fp8), "w2_weight_scale": ((experts, hidden, intermediate // 16), fp8),
+                "w13_factor": ((experts, 1), torch.float32), "w2_factor": ((experts, 1), torch.float32)}
+
+    def matches(self, tensors):
+        weight, scale = tensors["w13_weight"], tensors["w13_weight_scale"]
+        return weight.dtype == torch.uint8 and _is_float8_dtype(scale.dtype) and weight.shape[-1] == 8 * scale.shape[-1] and tensors["w13_factor"].dtype == torch.float32
+
+    def dequantize_matrix(self, weight, scale, factor):
+        codes = weight.long()
+        table = _get_fp4_lut(weight.device, torch.float32)
+        values = torch.stack((table[codes & 15], table[codes >> 4]), -1).view(weight.shape[0], -1, 16)
+        return (values * scale.float()[:, :, None] * factor.float()).view(weight.shape[0], -1)
+
+
+EXPERT_FORMATS = (Nvfp4RowExperts(),)

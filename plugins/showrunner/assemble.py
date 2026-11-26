@@ -71,6 +71,9 @@ def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[st
     if not clips:
         raise ValueError("The edit has no shot with a take yet.")
     started = time.time()
+    if layout["copy"]:  # pictures are copied only from takes encoded alike: an x264 take and an NVENC one share a codec name, not their parameter sets
+        from shared.utils.audio_video import video_stream_facts
+        layout["copy"] = len({video_stream_facts(clip["path"])["encoding"] for clip in clips}) == 1
     if layout["copy"]:
         with tempfile.TemporaryDirectory() as folder:
             listing = Path(folder) / "clips.txt"
@@ -277,7 +280,8 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
                 moved = out.with_name(f"{out.stem}-{index}.srt")
                 moved.write_text(_srt(recut_cues(_srt_cues(resolve(item["path"]).read_text(encoding="utf-8")), item["cut"], places)), encoding="utf-8")
                 subtitles[index] = {**item, "path": str(moved)}
-    if not subtitles and any(clip["dialogue"] for clip in clips):  # the shots' lines, timed on this cut (an SRT of the edit's own replaces them)
+    lyrics_off = model.on_the_song(doc) and not doc["edit"].get("song_subtitles")  # on a song, the shots' lines are its lyrics: a track of them only when the user asks
+    if not subtitles and not lyrics_off and any(clip["dialogue"] for clip in clips):  # the shots' lines, timed on this cut (an SRT of the edit's own replaces them)
         srt = out.with_suffix(".srt")
         sung = model.checked_lyrics(doc) if model.on_the_song(doc) else None
         srt.write_text(dialogue_srt(clips, offsets, resolve) if sung is None else sung_srt(sung, float(doc["edit"].get("song_start_s") or 0.0), total), encoding="utf-8")

@@ -388,7 +388,7 @@ class DeepyController:
     def _unload_weights(self) -> None:
         enhancer_offloadobj = self._deps.get_enhancer_offloadobj()
         if enhancer_offloadobj is not None:
-            enhancer_offloadobj.unload_all()
+            enhancer_offloadobj.suspend()  # the VRAM of unload_all(), the CUDA graphs kept for its next load
 
     def answer_visual_query(self, state, media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None) -> dict[str, Any]:
         """The prompt enhancer's Qwen VL model answers an external agent's visual question directly from the images, as Deepy's inspection does.
@@ -1223,7 +1223,7 @@ class DeepyController:
             # Its cards are back; its context comes back when the user writes to it, unless an interrupted action has to go on.
             return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "prefill": session.pending_action_replay is not None}
 
-    def prefill_restored_session_context(self, state, *, replay_pending: bool = False):
+    def prefill_restored_session_context(self, state, *, replay_pending: bool = False, on_status: Callable[[str], None] | None = None):
         session = get_or_create_assistant_session(state)
         with session.turn_lock:
             prefill_tokens = 0
@@ -1234,7 +1234,7 @@ class DeepyController:
                 thinking_enabled = True if session.pending_action_replay is None else bool(session.pending_action_replay["thinking_enabled"])
                 assistant = self._build_local_engine(state, session, tools, send_cmd, system_prompt, custom_system_prompt_key, thinking_enabled=thinking_enabled)
                 with deepy_log_scope(start_if_needed=self._sync_debug_enabled()):
-                    prefill_tokens = assistant.prefill_restored_context()
+                    prefill_tokens = assistant.prefill_restored_context(on_status=on_status)
             else:
                 session.pending_replay_reason = ""
             session_store.schedule_autosave(session)

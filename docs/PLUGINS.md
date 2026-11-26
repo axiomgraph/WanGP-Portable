@@ -10,7 +10,7 @@ The app bar is the main way to move between **Media Generator**, **Mask Generato
 
 **Media Flow** and **Showrunner** come enabled with WanGP. Media Flow restores, upscales and processes long videos or folders; Showrunner plans and assembles complete productions with Deepy Prime. Each app keeps its yellow **New!** badge until its own tab has been opened, even if it was already enabled. Viewing or dismissing an introduction from the app bar does not clear the badge; visits are remembered across restarts. Select one to see an illustrated introduction, then choose **Keep It** to open it or **Remove It** to hide it from your app bar. Removal hides the app immediately and stops it loading at the next startup. Your choice is saved across restarts. The introduction also appears when you first open the app through its folder URL. After a visit, it remains available from the app's **info icon** beside its ID in **Apps & PlugIn Manager**.
 
-Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, where you can reorder or disable them. Disabled apps appear under **Available Locally** on the right; these two are listed first with a subtle highlight. Their info icons open the illustrated information cards; **Featured** appears at the top right of these apps. Restoring an app already loaded in the current session works immediately; otherwise restart WanGP after enabling it. Showrunner requires Deepy Prime, configured in **Configuration → Prompt Enhancer / Deepy**.
+Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, where you can reorder or disable them. Disabled apps appear under **Available Locally** on the right; these two are listed first with a subtle highlight. Their info icons open the illustrated information cards; **Featured** appears at the top right of these apps. Restoring an app already loaded in the current session works immediately; otherwise restart WanGP after enabling it. Showrunner requires Deepy Prime, configured in **Configuration → Deepy / Prompt Enhancer**.
 
 Both apps have a **Full Screen** control. `/media-flow/` and `/showrunner/` on your WanGP address open the corresponding app directly in full screen. The address keeps that folder URL, which you can bookmark or share. **WanGP** returns to the same tab, preserving its form or editor. Expanding and returning reuse the existing page.
 
@@ -244,6 +244,29 @@ def setup_ui(self):
 
 #### `set_global(self, variable_name, new_value)`
 Allows your Plugin to safely modify a global variable in the main `wgp.py` application.
+
+#### `register_custom_settings(self, model_types, definitions)`
+Adds your own generation settings to existing models. Call it in `setup_ui`.
+
+*   `model_types`: one model type or a list of them. An architecture name (for example the base model type a family of finetunes shares) covers every model built on it.
+*   `definitions`: a list of settings, each a dictionary with a unique `id`, a `label` (shown in the form), a `name` (short label used in summaries), a `type` (`text`, `int`, `float` or `dropdown`) and a `default`. Numbers may add `min`, `max` and `inc` (the step) to appear as a slider, and a `dropdown` needs `choices` as `(label, value)` pairs. Optional `model_mode` / `model_mode_not` conditions show a setting only in some of the model's modes.
+
+```python
+def setup_ui(self):
+    self.register_custom_settings("my_architecture", [
+        {"id": "my_plugin_refine_steps", "label": "Refinement Steps", "name": "Refine Steps", "type": "int", "default": 4, "min": 1, "max": 12, "inc": 1},
+        {"id": "my_plugin_mode", "label": "Refinement Mode", "name": "Refine Mode", "type": "dropdown", "choices": [("Fast", "fast"), ("Full", "full")], "default": "fast"},
+    ])
+```
+
+The settings then behave like the model's own custom settings:
+
+*   The generation form shows them with the model's other custom settings, so your plugin needs no controls of its own for them.
+*   Their values are saved with the model's settings, in queues and in the metadata of generated files, and restored from them.
+*   Every generation task carries them in its `custom_settings` dictionary under each `id`, whether it comes from the form, the queue, Deepy, the API or an external agent. Read the values there rather than from your own interface state, so that a task always runs with its own values.
+*   Deepy and agents discover the settings with the model and can set them; a value they send is checked against the type, bounds and choices you declared.
+
+Limits: a model holds five custom settings in total, its own included. Settings that do not fit are ignored and reported in the console when WanGP starts, so prefix your ids with your plugin's name and keep to the settings you really need. An id the model already uses is left to the model.
 
 #### `register_data_hook(self, hook_name, callback)`
 Allows you to intercept and modify data at key points. For example, the `before_metadata_save` hook lets you add custom data to the metadata before it's saved to a file.

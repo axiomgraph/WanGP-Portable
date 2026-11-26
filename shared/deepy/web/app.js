@@ -66,9 +66,12 @@
         : {...data, type: 'status', data: data.description};
     }
     generationProgress = data;
-    const sessionStatus = WAC.restorationStatus || loadingSession || WAC.state.status;
+    const sessionStatus = WAC.effectiveStatus(WAC.state.status);
     const loading = sessionStatus?.kind === 'session_loading' && currentTab !== 'chat';
-    if (loading) data = {type: 'status', data: sessionStatus.text, aborting: false};
+    if (loading) {
+      const {text, progress} = sessionStatus;
+      data = progress ? {type: 'progress', data: [[progress.done, progress.total], text, null, 'tokens']} : {type: 'status', data: text};
+    }
     $('#abort-generation').hidden = loading;
     const node = $('#generation-progress'); node.hidden = !data;
     if (!data) return;
@@ -231,7 +234,7 @@
   function consumeChat(payload, notify = true) {
     const wasLoading = WAC.state.status?.kind === 'session_loading';
     WAC.consumePayload(payload);
-    if (loadingSession) WAC.setStatus(loadingSession);
+    if (loadingSession && !WAC.restorationStatus && WAC.state.status?.kind !== 'session_loading') WAC.setStatus(loadingSession);
     if (wasLoading || WAC.state.status?.kind === 'session_loading') progress(generationProgress);
     const messageId = [...WAC.state.order].reverse().find(id => WAC.state.messages[id].role === 'assistant');
     const message = messageId && WAC.messageNode(messageId);
@@ -313,7 +316,9 @@
           card = document.createElement('article'); card.className = 'media-card'; card.dataset.mediaId = item.id;
           card.dataset.mediaUrl = item.url;
           card.dataset.mediaName = item.name;
-          card.tabIndex = 0; card.setAttribute('aria-label', item.name);
+          card.tabIndex = 0; card.setAttribute('aria-label', item.name); card.draggable = true;
+          // Dropped on the chat, the card attaches its original file, not the thumbnail the browser would drag.
+          card.ondragstart = event => { const source = new URL(item.url, location.href).href; event.dataTransfer.effectAllowed = 'copy'; for (const type of ['application/x-wangp-gallery-media', 'text/uri-list', 'text/plain']) event.dataTransfer.setData(type, source); };
           card.onclick = async event => {
             if (event.target.closest('a, button')) return;
             try { const result = await api('media/' + encodeURIComponent(item.id) + '/select', {}); gallery(result.gallery); }

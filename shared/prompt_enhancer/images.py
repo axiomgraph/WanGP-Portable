@@ -19,9 +19,32 @@ class ImageContext:
 
 
 def enabled(server_config, mode):
-    """Whether the enhancer receives every image of a prompt with its label: the local Qwen3.5 enhancers caption them, remote engines receive them."""
+    """Whether the enhancer receives every image of a prompt with its label: the local vision-language enhancers caption them, remote engines receive them."""
     enhancer = server_config.get("enhancer_enabled", 0)
-    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and (enhancer in (3, 4, 5, 6, 7) or enhancer > 0 and is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer")))
+    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and (enhancer in (3, 4, 5, 6, 7, 8) or enhancer > 0 and is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer")))
+
+
+VISION_MAX_PIXELS = 1024 * 1024  # the reading resolution of a model's vision stage, as Deepy's vision reads images
+VISION_HIGHRES_MAX_PIXELS = 2048 * 2048  # highres: small text stays readable (e.g. the lettering of a 4K poster)
+
+
+def vision_settings(model_def, mode):
+    """A model's own vision stage for an enhancer mode with images, None if it has none: model def image_prompt_enhancer_vision_instructions{N}
+    (N: the mode's profile digit, none for profile 0) replaces the image captions of the local vision-language enhancers. It reads the
+    images with these instructions as system prompt ({{request}} in them: the user's request, otherwise the vision stage does not see it),
+    and its answer takes the caption's place for the rewrite
+    (image_prompt_enhancer_instructions{N}). Optional: image_prompt_enhancer_vision_max_tokens{N} (default 1024), and
+    image_prompt_enhancer_vision_highres{N}, which reads the images at up to VISION_HIGHRES_MAX_PIXELS. Remote engines see the images
+    themselves: they use the rewrite instructions only."""
+    if "I" not in mode:
+        return None
+    digit = next((letter for letter in mode if letter.isdigit()), "0")
+    suffix = "" if digit == "0" else digit
+    instructions = model_def.get(f"image_prompt_enhancer_vision_instructions{suffix}")
+    if instructions is None:
+        return None
+    highres = model_def.get(f"image_prompt_enhancer_vision_highres{suffix}", False)
+    return {"instructions": instructions, "max_tokens": model_def.get(f"image_prompt_enhancer_vision_max_tokens{suffix}", 1024), "max_pixels": VISION_HIGHRES_MAX_PIXELS if highres else VISION_MAX_PIXELS}
 
 
 def image_list(images):
@@ -48,7 +71,7 @@ def resolve_continue_video(video_source, image_prompt_type, file_list, output_di
     return max(files, key=os.path.getmtime) if files else None
 
 
-def continuation_start_image(video_source, keep_frames, fps, max_frames):
+def continuation_start_image(video_source, keep_frames, fps):
     """Read only the last frame selected by generation's source resampler."""
     from PIL import Image
     from shared.utils.video_decode import _read_rate, _resample_frame_indices, decode_video_frames_ffmpeg, probe_video_stream_metadata
@@ -56,7 +79,7 @@ def continuation_start_image(video_source, keep_frames, fps, max_frames):
     metadata = probe_video_stream_metadata(video_source)
     if metadata is None:
         raise ValueError(f"Unable to read continuation video: {video_source}")
-    limit = int(keep_frames) if str(keep_frames or "") else max_frames
+    limit = int(keep_frames) if str(keep_frames or "") else int(metadata["frame_count"] * float(fps) / _read_rate(metadata, fps)) + 2  # no kept frames given: all of them, as the generation reads them
     if limit < 0:
         limit = int(max(metadata["frame_count"] / metadata["fps_float"] * fps + limit, 0)) if metadata["fps_float"] > 0 else 0
     indices = _resample_frame_indices(_read_rate(metadata, fps), metadata["frame_count"], limit, fps, 0)  # the rate the generation's decoder counts the source at

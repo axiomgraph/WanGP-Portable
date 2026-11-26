@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import types
@@ -33,6 +34,7 @@ from .assets import (
     QWEN35_ABLITERATED_TEXT_REQUIRED_FILES,
     QWEN35_TEXT_GGUF_FILENAME,
     QWEN35_TEXT_INT8_FILENAME,
+    INKLING2_VARIANT_MINI,
     QWEN35_VARIANT_4B,
     QWEN35_VARIANT_9B,
     QWEN35_VARIANT_SPECS,
@@ -41,6 +43,7 @@ from .assets import (
     QWEN38_VARIANT_9B,
     QWEN38_VARIANT_FLASH_NEXT,
 )
+from . import chat_formats
 from .qwen3_5 import load_qwen35_model_class
 from .progress import EnhancementProgress
 
@@ -50,12 +53,14 @@ enhancer_quantization_GGUF = "gguf"
 enhancer_quantization_GGUF_Q3 = "gguf_q3"
 enhancer_quantization_GGUF_Q2 = "gguf_q2"
 enhancer_quantization_GGUF_PTQ1 = "gguf_ptq1"
+enhancer_quantization_GGUF_PTQ1_25 = "gguf_ptq1_25"
 enhancer_quantization_GGUF_Q8 = "gguf_q8"
 enhancer_quantization_SAFETENSORS = "safetensors"
 enhancer_quantization_QUANTO_INT8 = "quanto_int8"
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
 QWEN35_PROMPT_MIN_NEW_TOKENS = 4
 QWEN35_IMAGE_CAPTION_MAX_EDGE = 1024
+INKLING2_CAPTION_MAX_IMAGE_TOKENS = 1024  # per captioned image, after the edge limit above (a 1024-pixel square is 676 cells of 40 pixels)
 QWEN35_VARIANT_ALIASES = {
     "": QWEN35_VARIANT_9B,
     "9": QWEN35_VARIANT_9B,
@@ -76,6 +81,7 @@ QWEN35_VARIANT_ALIASES = {
     "qwen3.8-9b": QWEN38_VARIANT_9B,
     "qwen3.8-9b uncensored": QWEN38_VARIANT_9B,
     "qwen3.8 flash-next": QWEN38_VARIANT_FLASH_NEXT,
+    "inkling 2 mini": INKLING2_VARIANT_MINI,
 }
 
 
@@ -91,15 +97,14 @@ def get_qwen35_assets_dir_name(variant: str | None = None) -> str:
 
 
 def get_qwen35_prompt_enhancer_variant(model_no) -> str:
-    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B, 7: QWEN38_VARIANT_FLASH_NEXT}[int(model_no)]
+    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B, 7: QWEN38_VARIANT_FLASH_NEXT, 8: INKLING2_VARIANT_MINI}[int(model_no)]
 
 
 def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
     spec = get_qwen35_variant_spec(variant)
-    if backend in (enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8):
-        quantization = backend.rsplit("_", 1)[-1]
-        if f"text_gguf_{quantization}_filename" not in spec:
-            raise ValueError(f"{spec['display_name']} does not provide a GGUF {quantization.upper()} checkpoint.")
+    if backend in (enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_PTQ1_25, enhancer_quantization_GGUF_Q8):
+        if QWEN_CHECKPOINTS[backend][0] not in spec:
+            raise ValueError(f"{spec['display_name']} does not provide a GGUF {backend.removeprefix('gguf_').upper()} checkpoint.")
         return backend
     return spec.get("backend", backend)
 
@@ -248,7 +253,9 @@ def _load_qwen35_image_processor(assets_dir: str):
 def get_qwen35_text_gguf_path(assets_dir: str, variant: str | None = None, backend: str = enhancer_quantization_GGUF) -> str:
     spec = get_qwen35_variant_spec(variant)
     filename = _get_qwen35_gguf_filename(spec, get_qwen35_quantization(backend, variant=variant))
-    return _resolve_qwen35_checkpoint_file(assets_dir, filename, variant=variant, error_if_none=False)
+    # where the download puts it (the 9B: the GGUF folder of the 27B, beside the 27B's), else beside the tokenizer or at a checkpoint root
+    downloaded = fl.locate_file(f"{spec['gguf_repo_subfolder']}/{filename}", error_if_none=False) if "gguf_repo_subfolder" in spec else None
+    return downloaded or _resolve_qwen35_checkpoint_file(assets_dir, filename, variant=variant, error_if_none=False)
 
 
 def _build_qwen35_vl_gguf_preprocess_sd(patch_shape):
@@ -499,10 +506,95 @@ class _Qwen35CaptionWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self._caption_runtime_model(*args, **kwargs)
 
+    def share_text_embedding(self, shared: bool):
+        """The prompt's text embeddings from the resident language model's own token table (shared), instead of the separate alias MMGP
+        would load with the tower (a second copy)."""
+        adapter = self.model.language_model
+        if shared:
+            object.__setattr__(self, "_alias_embedding_model", adapter._input_embedding_model)
+        object.__setattr__(adapter, "_input_embedding_model", self._prompt_enhancer_text_model.token_embd if shared else self._alias_embedding_model)
+
     def eval(self):
         self._caption_runtime_model.eval()
         self.vision_tower_model.eval()
         return super().eval()
+
+
+class _Inkling2TextEmbedding(torch.nn.Module):
+    """The token table of the shared Inkling 2 language model with its norm, as a model MMGP loads without the blocks: the rows a prompt's
+    text tokens stand for (inputs_embeds)."""
+    def __init__(self, text_model: torch.nn.Module):
+        super().__init__()
+        table = text_model.embed
+        self.embed = torch.nn.Embedding(table.num_embeddings, table.embedding_dim, dtype=table.weight.dtype, device="meta")
+        self.embed.weight = table.weight
+        self.embed_norm = torch.nn.Module()
+        self.embed_norm.weight = text_model.embed_norm.weight
+        self.eps = text_model.c.eps
+
+    def forward(self, input_ids):
+        from shared.llm_engines.lmgp.models.inkling2_core import rms
+        return rms(self.embed(input_ids), self.eps, self.embed_norm.weight).to(self.embed_norm.weight.dtype)
+
+
+class _Inkling2CaptionWrapper(torch.nn.Module):
+    """Inkling 2's vision tower with its shared language model, behind the names the callers of the Qwen wrapper use. An image is a run of
+    placeholder tokens, one per 40-pixel cell, whose rows are the tower's features as they are (after the embedding norm of the text rows);
+    positions are the sequence's."""
+    def __init__(self, vision_tower_model: torch.nn.Module, text_model: torch.nn.Module, embedding_model: torch.nn.Module, tokenizer):
+        super().__init__()
+        from .inkling2 import preprocess_images
+        for name, value in (("vision_tower_model", vision_tower_model), ("_prompt_enhancer_text_model", text_model), ("_embedding_model", embedding_model), ("_text_embedding", embedding_model)):
+            object.__setattr__(self, name, value)
+        self._prompt_enhancer_tokenizer = tokenizer
+        self._prompt_enhancer_processor = preprocess_images
+        self._prompt_enhancer_image_token_id = tokenizer.convert_tokens_to_ids(chat_formats.of(tokenizer).image_token)
+
+    def share_text_embedding(self, shared: bool):
+        object.__setattr__(self, "_text_embedding", self._prompt_enhancer_text_model.embed_ids if shared else self._embedding_model)
+
+    def eval(self):
+        self.vision_tower_model.eval()
+        return super().eval()
+
+    def image_prompt(self, messages, *, max_tokens: int, features: dict | None = None, resize=None, progress=None, image_count: int = 1):
+        """(prompt token ids, prompt embeddings, position ids, position offset, prompt text) of a one-shot prompt whose image parts carry
+        PIL images, each reduced to max_tokens cells at most. The tower encodes one image per call, which bounds its activations;
+        features keeps them by image on the CPU for the prompts that show an image again."""
+        from mmgp import runtime
+        tokenizer, tower = self._prompt_enhancer_tokenizer, self.vision_tower_model
+        device = runtime.execution_device(tower)
+        features = {} if features is None else features
+        rendered, rows = [], []
+        with torch.inference_mode():
+            for message in messages:
+                content = message["content"]
+                if not isinstance(content, str):
+                    parts = []
+                    for part in content:
+                        if part["type"] == "image":
+                            image = part["image"]
+                            if id(image) not in features:
+                                check_cancelled()
+                                inputs = self._prompt_enhancer_processor(image if resize is None else resize(image), max_tokens=max_tokens)
+                                with progress.vision(tower.blocks, len(features), image_count) if progress is not None else nullcontext():
+                                    features[id(image)] = tower(inputs.pixel_patches.to(device), inputs.grids).to("cpu")
+                            rows.append(features[id(image)])
+                            part = {"type": "image", "image_tokens": rows[-1].shape[0]}
+                        parts.append(part)
+                    message = {**message, "content": parts}
+                rendered.append(message)
+            text = chat_formats.of(tokenizer).render_prompt(tokenizer, rendered, False)
+            prompt_token_ids = [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
+            input_ids = torch.tensor(prompt_token_ids, dtype=torch.long, device=device)
+            prompt_embeds = self._text_embedding(input_ids)
+            image_rows = input_ids == self._prompt_enhancer_image_token_id
+            if int(image_rows.sum()) != sum(row.shape[0] for row in rows):
+                raise RuntimeError("The image placeholders of the prompt do not match the image features.")
+            if rows:
+                prompt_embeds[image_rows] = torch.cat(rows).to(device, prompt_embeds.dtype)
+            position_ids = torch.arange(len(prompt_token_ids), dtype=torch.long, device=device).expand(3, -1).contiguous()  # the engine's layout; this model reads the sequence order only
+        return prompt_token_ids, prompt_embeds, position_ids, 0, text
 
 
 def _clean_generated_text(text: str) -> str:
@@ -543,7 +635,7 @@ def _collect_stop_token_ids(tokenizer, *config_objects):
             stop_token_ids.append(token_id)
 
     add(getattr(tokenizer, "eos_token_id", None))
-    for token in ("<|im_end|>", "<|endoftext|>"):
+    for token in chat_formats.of(tokenizer).stop_tokens:
         add(tokenizer.convert_tokens_to_ids(token))
 
     for config_object in config_objects:
@@ -558,7 +650,7 @@ def _collect_stop_token_ids(tokenizer, *config_objects):
 def _collect_suppressed_token_ids(tokenizer):
     suppressed = []
     seen = set()
-    for token in ("<think>", "</think>"):
+    for token in chat_formats.of(tokenizer).thinking_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
         try:
             token_id = int(token_id)
@@ -797,8 +889,6 @@ def vision_beside_text(caption_model, manager):
     read the language model's own token table (the separate embedding alias would load a second copy). Yields unload_vision, which
     releases the tower alone."""
     cotenants = manager.cotenants_map
-    adapter = caption_model.model.language_model
-    input_embedding = adapter._input_embedding_model
 
     def unload_vision():
         if VISION_MODEL_ID not in manager.active_models_ids:
@@ -816,11 +906,11 @@ def vision_beside_text(caption_model, manager):
 
     try:
         manager.cotenants_map = {**cotenants, TEXT_MODEL_ID: [*cotenants.get(TEXT_MODEL_ID, []), VISION_MODEL_ID], VISION_MODEL_ID: [*cotenants.get(VISION_MODEL_ID, []), TEXT_MODEL_ID]}
-        object.__setattr__(adapter, "_input_embedding_model", caption_model._prompt_enhancer_text_model.token_embd)
+        caption_model.share_text_embedding(True)
         yield unload_vision
     finally:
         unload_vision()
-        object.__setattr__(adapter, "_input_embedding_model", input_embedding)
+        caption_model.share_text_embedding(False)
         manager.cotenants_map = cotenants
 
 
@@ -834,12 +924,27 @@ def _captions_beside(self, offload_manager) -> bool:
             and offload_manager.models.get(TEXT_MODEL_ID) is text_model and TEXT_MODEL_ID in offload_manager.active_models_ids)
 
 
-def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None, beside=False):
+def _resize_image_for_vision(image: Image.Image, max_pixels: int) -> Image.Image:
+    # a model's vision stage (images.vision_settings): read at up to max_pixels, e.g. to read small text, never enlarged
+    if image.width * image.height <= max_pixels:
+        return image
+    scale = math.sqrt(max_pixels / (image.width * image.height))
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+
+
+def _vision_message(vision, content):
+    # the model's instructions as system prompt, with the user's request where they ask for it ({{request}}: a request beside the images
+    # can bias what the vision stage reports, e.g. a transcript corrected towards the intended wording)
+    return [{"role": "system", "content": vision["instructions"].replace("{{request}}", vision["request"])}, {"role": "user", "content": content}]
+
+
+def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None, beside=False, vision=None):
     qwen35_text_mod = _get_qwen35_text_runtime_helpers()
     text_model = self._prompt_enhancer_text_model
     tokenizer = self._prompt_enhancer_tokenizer
     processor = self._prompt_enhancer_processor
     live = text_model._prompt_enhancer_vllm_engine if beside else None
+    inkling2 = isinstance(self, _Inkling2CaptionWrapper)
     if not beside:
         # Finish every vision pass before loading the shared decoder. A previous
         # request's graphs must be closed before MMGP can change its weight storage.
@@ -859,13 +964,15 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
             if not group_images:
                 prepared.append(None)
                 continue
-            caption_tokens = 128 if labels is None else 128 * len(group_images) + 128
+            caption_tokens = vision["max_tokens"] if vision is not None else 128 if labels is None else 128 * len(group_images) + 128
             content = []
             for index, image in enumerate(group_images):
                 if labels is not None:
                     content.append({"type": "text", "text": labels[index]})
                 content.append({"type": "image", "image": image})
-            if labels is None:
+            if vision is not None:
+                message = _vision_message(vision, content)
+            elif labels is None:
                 message = [{"role": "user", "content": content + [{"type": "text", "text": "Describe this image accurately in one concise paragraph, focusing on the main subject, setting, and notable objects. Output only the description."}]}]
             else:
                 names = "; ".join(labels)
@@ -873,6 +980,14 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
                 headings = "\n".join(f"{label}: <visible details>" for label in labels)
                 content.append({"type": "text", "text": f"Describe all {len(labels)} separate still images in the order shown. Use each heading below exactly once, without renaming, adding or omitting any heading. Describe only visible details; do not infer movement from still images.\n{headings}"})
                 message = [{"role": "system", "content": instructions}, {"role": "user", "content": content}]
+            resize = _resize_image_for_caption if vision is None else lambda image: _resize_image_for_vision(image, vision["max_pixels"])
+            if inkling2:
+                from .inkling2 import CELL_SIZE
+                image_tokens = INKLING2_CAPTION_MAX_IMAGE_TOKENS if vision is None else math.ceil(math.sqrt(vision["max_pixels"]) / CELL_SIZE) ** 2
+                prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset, text = self.image_prompt(message, max_tokens=image_tokens, features=features, resize=resize, progress=progress, image_count=image_count)
+                prepared.append((prompt_token_ids, prompt_embeds.to("cpu"), prompt_position_ids.to("cpu"), position_offset, caption_tokens, message, text))
+                del prompt_embeds, prompt_position_ids
+                continue
             text = processor.apply_chat_template(
                 message,
                 tokenize=False,
@@ -884,7 +999,7 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
             with torch.device("cpu"):
                 model_inputs = processor(
                     text=[text],
-                    images=[_resize_image_for_caption(image) for image in group_images],
+                    images=[resize(image) for image in group_images],
                     return_tensors="pt",
                     padding=True,
                     return_mm_token_type_ids=True,
@@ -968,14 +1083,14 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
                 position_offset=position_offset,
                 stream_callback=progress.tokens if enhancement_progress is not None else None,
             )
-            raw_text = "" if response is None else response.get("text", "")
+            raw_text = chat_formats.decode_response(tokenizer, response, prompt_token_ids)
             log_llm_io("IN", "local-image-captioner", "qwen-visual-generation", {"text": raw_text, "response": response})
             outputs.append(_clean_generated_text(raw_text))
             reset_context()
     return outputs
 
 
-def _generate_image_captions(self, images, *, image_contexts=None, offload_manager=None, stop_requested=None, enhancement_progress=None):
+def _generate_image_captions(self, images, *, image_contexts=None, offload_manager=None, stop_requested=None, enhancement_progress=None, vision=None):
     qwen35_text_mod = _get_qwen35_text_runtime_helpers()
     if qwen35_text_mod._use_vllm_prompt_enhancer(self._prompt_enhancer_text_model) or qwen35_text_mod._use_legacy_cuda_runner_prompt_enhancer(self._prompt_enhancer_text_model):
         def check_stop():
@@ -985,7 +1100,7 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
         beside = _captions_beside(self, offload_manager)
         try:
             with cancellation_context(check_stop) if stop_requested is not None else nullcontext():
-                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress, beside=beside)
+                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress, beside=beside, vision=vision)
         except BaseException:
             if not beside:  # beside, the tower is already released and the assistant's context stays
                 self._prompt_enhancer_text_model.unload()
@@ -995,11 +1110,12 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
         finally:
             for hook in hooks:
                 hook.remove()
-    images = [_resize_image_for_caption(image) for image in images]
+    images = [_resize_image_for_caption(image) if vision is None else _resize_image_for_vision(image, vision["max_pixels"]) for image in images]
     outputs = []
     processor = self._prompt_enhancer_processor
+    caption_tokens = 128 if vision is None else vision["max_tokens"]
     for image in images:
-        message = [
+        message = _vision_message(vision, [{"type": "image", "image": image}]) if vision is not None else [
             {
                 "role": "user",
                 "content": [
@@ -1032,12 +1148,12 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
                 "image": media_descriptor(image),
                 "input_token_ids": model_inputs["input_ids"].tolist(),
                 "known_token_ids": known_token_ids(self._prompt_enhancer_tokenizer),
-                "generation": {"max_new_tokens": 128, "do_sample": False},
+                "generation": {"max_new_tokens": caption_tokens, "do_sample": False},
             })
         decoded = _generate_and_decode(
             self,
             model_inputs,
-            max_new_tokens=128,
+            max_new_tokens=caption_tokens,
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -1048,6 +1164,17 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
         log_llm_io("IN", "local-image-captioner", "qwen-visual-generation", {"text": decoded})
         outputs.extend(decoded)
     return outputs
+
+
+def load_inkling2_vl_prompt_enhancer(assets_dir: str, text_model: torch.nn.Module, variant: str | None = None):
+    """(caption model, vision tower, text embedding alias) of Inkling 2: the tower is read from its own file, apart from the language model's."""
+    from .inkling2 import load_inkling2_vision_tower
+    assets_dir = _resolve_qwen35_assets_dir(assets_dir, variant=variant)
+    vision_tower_model = load_inkling2_vision_tower(get_qwen35_vision_path(assets_dir, variant=variant), _resolve_qwen35_asset_file(assets_dir, "config.json", error_if_none=True))
+    caption_model = _Inkling2CaptionWrapper(vision_tower_model, text_model, _Inkling2TextEmbedding(text_model).eval(), text_model._prompt_enhancer_tokenizer)
+    caption_model.generate_image_captions = types.MethodType(_generate_image_captions, caption_model)
+    caption_model.unload = types.MethodType(_unload_prompt_enhancer_vl_runtime, caption_model)
+    return caption_model.eval(), vision_tower_model, caption_model._embedding_model
 
 
 def _unload_prompt_enhancer_vl_runtime(self):
@@ -1199,6 +1326,7 @@ __all__ = [
     "enhancer_quantization_GGUF_Q3",
     "enhancer_quantization_GGUF_Q2",
     "enhancer_quantization_GGUF_PTQ1",
+    "enhancer_quantization_GGUF_PTQ1_25",
     "enhancer_quantization_GGUF_Q8",
     "enhancer_quantization_SAFETENSORS",
     "enhancer_quantization_QUANTO_INT8",

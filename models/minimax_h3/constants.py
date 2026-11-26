@@ -21,8 +21,37 @@ H3_MASK_MODE_DEFAULT = H3_MASK_MODE_GROUPED_ROWS
 H3_MASK_MODES = (H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_GROUPED_ROWS)
 
 
+# Veda variants: transformer layers kept on full attention (ComfyUI's Veda node "full attention layers"; "0,1,49" was reported there to remove
+# white flash frames)
+H3_VEDA_FULL_LAYERS_SETTING = "h3_veda_full_attention_layers"
+H3_VEDA_FULL_LAYERS_CHOICES = [("Veda on Every Layer", "none"), ("Full Attention on the First Two and Last Layers (against white flash frames, a little slower)", "0,1,49")]
+H3_VEDA_LAYERS = 50
+
+
+def h3_veda_full_layers(custom_settings):
+    """The layers of a Veda variant that keep full attention: its dropdown's value ("none", or layer numbers from 0 to 49 separated by commas)."""
+    value = str((custom_settings or {}).get(H3_VEDA_FULL_LAYERS_SETTING) or "none")
+    items = [] if value == "none" else value.replace(",", " ").split()
+    if not items and value != "none" or not all(item.isdigit() and int(item) < H3_VEDA_LAYERS for item in items):
+        raise ValueError(f"Veda Full Attention Layers must be 'none' or layer numbers from 0 to {H3_VEDA_LAYERS - 1} separated by commas, such as 0,1,49")
+    return frozenset(map(int, items))
+
+
 def h3_grouped_masking_enabled(custom_settings):
     mode = H3_MASK_MODE_DEFAULT if custom_settings is None else custom_settings.get(H3_MASK_MODE_SETTING, H3_MASK_MODE_DEFAULT)
     if mode not in H3_MASK_MODES:
         raise ValueError(f"Unsupported MiniMax H3 mask denoising mode {mode!r}")
     return mode == H3_MASK_MODE_GROUPED_ROWS
+
+
+# checkpoint names: here, so that the handler reads them without importing the model
+VIDEO_VAE_FILE = "MiniMax-H3-video_vae_fp16.safetensors"
+VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
+VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
+VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
+VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
+VIDEO_VAE_SOL_INT8_FILE = "minimax_h3/minimax_h3_sol_vae_int8_convrot.safetensors"  # the H3 encoder with Sol-H3-VAE's decoder
+AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
+LATENT_UPSCALER_FOLDER = "minimax_h3"
+LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
+TEXT_ENCODER_FOLDER = "Qwen3-VL-32B-Instruct"

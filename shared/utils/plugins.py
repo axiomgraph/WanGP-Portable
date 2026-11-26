@@ -1,3 +1,4 @@
+import copy
 import functools
 import glob
 import os
@@ -18,6 +19,7 @@ import json
 from shared.utils.config_store import config_lock, write_config
 import requests
 from tqdm import tqdm
+from shared.extra_settings import _CUSTOM_SETTINGS_MAX as CUSTOM_SETTINGS_MAX
 from shared.utils.bundled_apps import migrate_featured_apps
 from shared.utils.wgp_config_migration import INSTALLED_REMOTE_PLUGINS_KEY, migrate_bundled_plugin_ids
 media_gen_label = "Media Generator"
@@ -26,6 +28,7 @@ COMMUNITY_PLUGINS_URL = "https://github.com/deepbeepmeep/Wan2GP/raw/refs/heads/m
 PLUGIN_CATALOG_FILENAME = "plugins.json"
 PLUGIN_LOCAL_CATALOG_FILENAME = "plugins_local.json"
 PLUGIN_METADATA_FILENAME = "plugin_info.json"
+GIT_NO_PROMPT = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}  # a removed or private repository fails instead of asking for a GitHub sign-in
 PLUGIN_TYPE_CHOICES = ("app", "extension", "processor", "model")
 PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY = "spatial_upsampler_handlers"
 PLUGIN_TEMPORAL_UPSAMPLER_HANDLERS_KEY = "temporal_upsampler_handlers"
@@ -459,6 +462,7 @@ class WAN2GPPlugin:
         self._deepy_zero_tools: List[PluginDeepyTool] = []
         self._deepy_toolbox: PluginDeepyToolbox | None = None
         self._web_apps: List[PluginWebApp] = []
+        self._custom_settings: List[tuple[List[str], List[Dict[str, Any]]]] = []
         self.app_url = ""
         self.app_tab = ""
         self.fullscreen = False
@@ -524,6 +528,18 @@ class WAN2GPPlugin:
         if hook_name not in self._data_hooks:
             self._data_hooks[hook_name] = []
         self._data_hooks[hook_name].append(callback)
+
+    def register_custom_settings(self, model_types: str | List[str], definitions: List[Dict[str, Any]]) -> None:
+        """Add custom settings to existing models, in a model def's custom_settings syntax (id, label, name, type, default, ...): the form shows
+        them with the model's own, and generation tasks (the form's, Deepy's, the API's and agents') carry their values in custom_settings
+        under each id. model_types: model types, or architectures to cover every model built on them. Call it in setup_ui."""
+        model_types = [model_types] if isinstance(model_types, str) else list(model_types)
+        definitions = [dict(definition) for definition in definitions]
+        if not model_types or not all(isinstance(model_type, str) and model_type for model_type in model_types):
+            raise ValueError("register_custom_settings needs the model types or architectures the settings belong to.")
+        if not all(isinstance(definition.get("id"), str) and definition["id"].strip() for definition in definitions):
+            raise ValueError("Each custom setting needs an 'id'.")
+        self._custom_settings.append((model_types, definitions))
 
     def add_custom_js(self, js_code: str) -> None:
         if isinstance(js_code, str) and js_code.strip():
@@ -656,6 +672,7 @@ class PluginManager:
         if self.plugins_dir not in sys.path:
             sys.path.insert(0, self.plugins_dir)
         self.data_hooks: Dict[str, List[callable]] = {}
+        self._custom_settings_warned: Set[tuple[str, str]] = set()
         self.restricted_globals: Set[str] = set()
         self.custom_js_snippets: List[str] = []
         self.repo_root = os.path.abspath(os.getcwd())
@@ -1527,6 +1544,7 @@ class PluginManager:
             origin = repo.remotes.origin
             
             if progress is not None: progress(0.2, desc=f"Fetching updates for '{plugin_id}'...")
+            repo.git.update_environment(**GIT_NO_PROMPT)
             origin.fetch()
 
             local_commit = repo.head.commit
@@ -1648,7 +1666,7 @@ class PluginManager:
                 return f"[Warning] Plugin '{repo_name}' already exists. Please remove it manually to reinstall."
 
             if progress is not None: progress(0.1, desc=f"Cloning '{repo_name}'...")
-            git.Repo.clone_from(cleaned_url, target_dir)
+            git.Repo.clone_from(cleaned_url, target_dir, env=GIT_NO_PROMPT)
 
             return self._finalize_local_plugin_install(repo_name, target_dir, progress=progress, remove_invalid=True, source_url=cleaned_url)
 
@@ -1657,7 +1675,7 @@ class PluginManager:
             stderr = (e.stderr or str(e)).strip()
             lowered = stderr.lower()
             if any(token in lowered for token in ("not found", "repository", "fatal", "could not read from remote")):
-                return "[Error] Invalid URL."
+                return f"[Error] Could not download {cleaned_url}: the repository does not exist or is private."
             return f"[Error] Git clone failed: {stderr}"
         except Exception as e:
             traceback.print_exc()
@@ -1828,6 +1846,23 @@ class PluginManager:
             return
         self._dispatch_plugin_event("on_model_change", state, model_type)
 
+    def add_custom_settings(self, model_type: str, base_model_type: str, model_def: Dict[str, Any]) -> None:
+        """Append to a model def the custom settings that plugins registered for its model type or architecture."""
+        for plugin_id, plugin in self.plugins.items():
+            for model_types, definitions in plugin._custom_settings:
+                if model_type not in model_types and base_model_type not in model_types:
+                    continue
+                current = [setting for setting in model_def.get("custom_settings") or [] if isinstance(setting, dict)]
+                declared = {setting.get("id") for setting in current}
+                added = [copy.deepcopy(definition) for definition in definitions if definition["id"] not in declared]
+                if not added:
+                    continue
+                model_def["custom_settings"] = current + added  # a new list: model defs of one family may share theirs
+                dropped = [definition["id"] for definition in model_def["custom_settings"][CUSTOM_SETTINGS_MAX:] if definition in added]
+                if dropped and (plugin_id, model_type) not in self._custom_settings_warned:
+                    self._custom_settings_warned.add((plugin_id, model_type))
+                    print(f"[PluginManager] {plugin.name}: {model_type} already has custom settings, so {', '.join(dropped)} exceed{'s' if len(dropped) == 1 else ''} the {CUSTOM_SETTINGS_MAX} a model can hold and {'is' if len(dropped) == 1 else 'are'} ignored.")
+
     def get_custom_js(self) -> str:
         if not self.custom_js_snippets:
             return ""
@@ -1967,6 +2002,8 @@ class WAN2GPApplication:
 
         self.plugin_manager.load_plugins_from_directory(self.enabled_plugins, safe_mode=safe_mode, files_locator=wgp_globals.get("fl"))
         self.plugin_manager.inject_globals(wgp_globals)
+        for model_type, model_def in wgp_globals["models_def"].items():
+            self.plugin_manager.add_custom_settings(model_type, model_def.get("architecture") or wgp_globals["get_base_model_type"](model_type), model_def)
 
     def setup_ui_tabs(self, main_tabs_component: gr.Tabs, state_component: gr.State, set_save_form_event):
         from shared.gradio.app_bar import AppBar

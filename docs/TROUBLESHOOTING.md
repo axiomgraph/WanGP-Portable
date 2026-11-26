@@ -73,7 +73,7 @@ python wgp.py --preload 0
 2. Lower resolution in advanced settings
 3. Use lower batch size
 4. Clear GPU cache between generations
-5. In *Configuration / Performance*, set **Attention Head Split** to *Low*, *Medium* or *High*. For long or high-resolution videos, models that support it compute attention one group of heads at a time, which lowers the VRAM peak of denoising: with MiniMax H3 at 1920x1088 and 362 frames, about 1 GB less with *Low* and about 2 GB less with *Medium* or *High*, for up to about 3% slower denoising steps. It also applies to MiniMax H3 with *Sol* sparse attention and to the H3 VDN models: with *Medium* at 1920x1088 and 362 frames, about 4 GB less with *Sol* and about 2.5 GB less with VDN. The gain depends on the model and is largest when attention dominates its memory use. The result is of the same quality but not identical to *Off*: details, and sometimes the motion, can differ. The setting applies to the next generation without reloading the model.
+5. In *Configuration / Performance*, check the **Smart Inputs Chunker**. For long or high-resolution videos, models that support it process their largest inputs in parts (attention one group of heads at a time, long sequences by chunks of tokens), which lowers the VRAM peak of denoising, and it chooses the parts that cost the least time on your graphics card (it measures the card once, for a few seconds, the first time it is used): with MiniMax H3, about 0.8 GB less at 832x480 and 362 frames and several GB less at 1920x1088 and 362 frames, for denoising steps at most about 3% slower. *Auto* (the default) chunks only when the whole input would not fit in your graphics card's VRAM (or the size given with `--max-vram`), so the generations that fit run at full speed; with MiniMax H3, Wan 2.1 / 2.2, LTX-2, Qwen Image, Qwen Image 2.1, Flux 1 and Flux 2, when even the chunked input would not fit, it switches to the *Extreme* processing for that generation (attention a few heads at a time, the inputs of the attention and the feed-forward made piece by piece: slower, about 1.2 GB less with MiniMax H3 at 1920x1088 and 362 frames; images use it only at large resolutions); *Extreme* uses the lowest VRAM wherever it makes a real difference (long or high-resolution videos) and runs the rest, images and short videos, as *Standard*, at full speed; *Standard* always chunks, which also leaves more VRAM to other programs and to the parts of the model kept loaded; *Off* never chunks. It also applies to MiniMax H3 with *Sol* sparse attention and to the H3 VDN models. The gain depends on the model and is largest when attention dominates its memory use. A chunked result is of the same quality but not identical to an unchunked one: details, and sometimes the motion, can differ. The setting applies to the next generation without reloading the model.
 
 ### System RAM Issues
 
@@ -208,6 +208,12 @@ python wgp.py --attention sage2 --profile 4 --fp16
 ## Network and Server Issues
 
 ### Gradio Interface Problems
+
+#### Gradio Media Cache Uses Too Much Disk Space
+
+Open **Configuration → Outputs → Gradio Media Cache** and select **Check Cache Size**. **Clear Cache Now** removes eligible temporary media copies and video previews. WanGP keeps saved outputs, uploads from the current run, and files used as component defaults. Run manual cleanup with an empty generation queue.
+
+Automatic cleanup defaults to **Manual only**. Choose **Clear on startup** to remove copies from earlier runs, or choose a retention period to remove older copies at startup and every 30 minutes. Select **Save Settings** to apply the policy. The panel shows the cache folder used by Gradio, including a custom `GRADIO_TEMP_DIR`. Other apps using the same folder may need to reload media after cleanup.
 
 #### Port Already in Use
 **Problem**: "Port 7860 is already in use"

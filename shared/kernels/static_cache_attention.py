@@ -7,7 +7,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-_RUNTIME = ["COUNT", "SPLITS"]  # query rows of the call and key splits: one binary whatever their values
+_RUNTIME = ["COUNT", "SPLITS", "GROUPS", "KV_HEADS"]  # rows of the call, key splits and the head counts: one binary whatever their values (ROWS_PAD, always a
+# multiple of 16, keeps that single specialization)
 
 
 @triton.jit
@@ -18,8 +19,8 @@ def _load16(ptrs, mask, BF16: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr,
-                   HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BF16: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS, KV_HEADS,
+                   HEAD_DIM: tl.constexpr, ROWS_PAD, BF16: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     kv, split, row_block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seqlen = tl.load(SEQLENS)
     total = seqlen + COUNT  # the keys written so far, this call's included
@@ -57,8 +58,8 @@ def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr,
-                          HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS, KV_HEADS,
+                          HEAD_DIM: tl.constexpr, ROWS_PAD, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     """_static_decode on tensor cores, for a BF16 cache (sm_80 and newer, approximate kernels): BF16 scores and weights, as FlashAttention. About 6x faster at thousands of keys."""
     kv, split, row_block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seqlen = tl.load(SEQLENS)
@@ -98,7 +99,7 @@ def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, 
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_merge(SEQLENS, PM, PL, PACC, OUT, COUNT, SPLITS, STRIDE_QC, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_merge(SEQLENS, PM, PL, PACC, OUT, COUNT, SPLITS, STRIDE_QC, GROUPS, KV_HEADS, HEAD_DIM: tl.constexpr, ROWS_PAD, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     """The splits of _static_decode_tensor that hold keys into BF16 attention outputs, in the layout of the query."""
     kv, row_block = tl.program_id(0), tl.program_id(1)
     total = tl.load(SEQLENS) + COUNT
@@ -138,17 +139,22 @@ _TENSOR_SPLITS_PER_SM = 1  # at about 100 KB of shared memory, two blocks per SM
 _TENSOR = "draft_tensor" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # until the switches are removed
 
 
+def _shared_memory(device):  # AMD GPUs have no opt-in shared memory (ROCm's PyTorch has no such property): their limit per block is the LDS
+    properties = torch.cuda.get_device_properties(device)
+    return properties.shared_memory_per_block if torch.version.hip else properties.shared_memory_per_block_optin
+
+
 def _fits(config, head_dim, device):
     # the FP32 query and key tiles, plus a little per key (Triton 3.2 and 3.6 for sm_75, head_dim 256: 33.9 / 51.3 / 86.1 KB for 16 / 32 /
     # 64 keys, whatever the stages): Turing's 64 KB take up to 32 keys
     shared = (_BLOCK_R + config[0]) * head_dim * 4 + 128 * config[0]
-    return shared <= torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return shared <= _shared_memory(device)
 
 
 def _fits_tensor(config, head_dim, device):
     # BF16 key and value tiles per stage, BF16 query and FP32 sum (Triton 3.6 for sm_120, head_dim 256, (64, 8, 2): 143 KB)
     shared = 4 * config[0] * head_dim * config[2] + 6 * _BLOCK_R * head_dim
-    return shared <= torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return shared <= _shared_memory(device)
 
 
 def usable(query, cache):
@@ -169,8 +175,10 @@ def attention(query, key_cache, value_cache, seqlens, scale):
     bits = (lambda t: t.view(torch.uint16)) if bf16 else (lambda t: t)
     q, k, v = bits(query), bits(key_cache), bits(value_cache)
     tensor = _TENSOR and bf16 and kernel_policy.allow_approximate() and torch.cuda.get_device_capability(query.device) >= (8, 0)
+    candidates = [config for config in _TENSOR_CONFIGS if _fits_tensor(config, head_dim, query.device)] if tensor else []
+    tensor = bool(candidates)  # none fits 64 KB of shared memory at head_dim 256 (AMD's LDS): the FP32 tiles then
+    candidates = candidates or [config for config in _CONFIGS if _fits(config, head_dim, query.device)]
     splits = max(1, torch.cuda.get_device_properties(query.device).multi_processor_count * (_TENSOR_SPLITS_PER_SM if tensor else _SPLITS_PER_SM) // (kv_heads * row_blocks))
-    candidates = [config for config in _TENSOR_CONFIGS if _fits_tensor(config, head_dim, query.device)] if tensor else [config for config in _CONFIGS if _fits(config, head_dim, query.device)]
 
     def launch(pm, pl, pacc, config):
         block_n, warps, stages = config

@@ -45,7 +45,9 @@ icons = {
     'Resume': '<path d="m8 4 12 8-12 8Z"/>',
     'Early Stop': '<path d="m4 5 10 7-10 7Z"/><path d="M19 5v14"/>',
     'Add New Prompt To Queue': '<path d="M4 5h11M4 10h11M4 15h6M17 13v8m-4-4h8"/>',
+    'Check Cache Size': '<path d="M3 17a9 9 0 1 1 18 0H3Zm9-5 4-4M5 12l2 1m5-8v2m7 5-2 1"/><circle cx="12" cy="13" r="1"/>',
 }
+icons['Clear Cache Now'] = icons['Delete']
 icon_css = []
 for index, (label, paths) in enumerate(icons.items()):
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'
@@ -64,18 +66,16 @@ def style_config(config, theme):
     navigation = {next(node for node in reversed(paths[c['id']]) if components[node]['type'] == 'row') for c in components.values() if c['props'].get('elem_id') == 'family_list'}
     kinds = {kind: 'field' for kind in ('textbox', 'dropdown', 'slider', 'number', 'checkbox', 'checkboxgroup', 'radio', 'hierarchyselector', 'rangeslider', 'file', 'image', 'audio')}
     kinds.update(button='button', uploadbutton='button', downloadbutton='button', accordion='accordion', tabs='tabs', gallery='gallery', video='gallery')
-    selectors = {'wangp-studio-scope': [f'#component-{scope}'], 'wangp-studio-dropdown': []}
+    studio_renderer = getattr(gr.routes.FileResponse, '_wangp_frontend', False)
+    native_targets = {}
     for component_id, component in components.items():
         if component_id not in paths or scope not in paths[component_id]:
             continue
-        if component['type'] == 'dropdown':
-            selectors['wangp-studio-dropdown'].append('#' + (component['props'].get('elem_id') or f'component-{component_id}'))
-        if navigation.intersection(paths[component_id]):
-            continue
-        extra = []
-        if component['type'] in kinds:
+        extra = ['wangp-studio-dropdown'] if component['type'] == 'dropdown' else []
+        in_navigation = bool(navigation.intersection(paths[component_id]))
+        if not in_navigation and component['type'] in kinds:
             extra.append('wangp-studio-' + kinds[component['type']])
-        if component['type'] == 'button':
+        if not in_navigation and component['type'] == 'button':
             # Models can rename the prompt enhancer (Write, Magic Prompt, etc.).
             label = 'Enhance Prompt' if 'btn_centered' in (component['props'].get('elem_classes') or []) else component['props']['value']
             if label in icons:
@@ -84,26 +84,37 @@ def style_config(config, theme):
                 extra.append('wangp-studio-generation-action')
             if label == 'Enhance Prompt':
                 extra.append('wangp-studio-enhancer')
-        if extra:
+        if extra and studio_renderer:
+            component['wangp_studio_classes'] = extra
+        elif extra:
             element_id = component['props'].get('elem_id') or f'component-{component_id}'
-            for name in extra:
-                selectors.setdefault(name, []).append(f'#{element_id}')
-    scope_selector = selectors['wangp-studio-scope'][0]
-    def selector(match):
-        name = match.group()[1:]
-        targets = selectors[name]
-        if name == 'wangp-studio-scope':
-            return scope_selector
-        return f':where({scope_selector}) :is({",".join(targets)})'
-    # Stable component IDs survive explicit elem_classes updates during swaps.
-    # No component metadata, constructors, events or client observers are changed.
+            for role in extra:
+                native_targets.setdefault(role, {})[element_id] = None
+    scope_selector = f'#component-{scope}'
     css = css_path.read_text(encoding='utf8')
     if isinstance(theme, gr.themes.Default):
         css += '\n' + css_path.with_name('ui_studio_classic.css').read_text(encoding='utf8')
     elif theme.name in ('emerald', 'amethyst', 'rose'):
         css += '\n' + css_path.with_name(f'ui_studio_{theme.name}.css').read_text(encoding='utf8')
     css += '\n' + '\n'.join(icon_css)
-    config['css'] = (config['css'] or '') + '\n' + re.sub(r'\.wangp-studio-[a-z0-9-]+', selector, css)
+    css = css.replace('.wangp-studio-scope', scope_selector)
+    if studio_renderer:
+        # The scope ID supplies the same specificity as the old component ID.
+        css = re.sub(r'\.wangp-studio-[a-z0-9-]+', lambda m: f'{scope_selector} :where({m.group()})', css)
+    else:
+        # A standalone Gradio preview has no WanGP renderer. Expand each
+        # role-headed selector in the theme to ordinary, individually indexed
+        # ID selectors. Plugin elem_classes stay entirely application-owned.
+        def native_selector(match):
+            role, suffix = match.groups()
+            suffix = suffix.rstrip()
+            continues = suffix.endswith(',')
+            if continues:
+                suffix = suffix[:-1]
+            selectors = (f':where({scope_selector}) #{element_id}{suffix}' for element_id in native_targets.get(role, ()))
+            return (', '.join(selectors) or ':not(*)') + (',' if continues else ' ')
+        css = re.sub(r'(?m)^[ \t]*\.(wangp-studio-[a-z0-9-]+)([^\n{]*)', native_selector, css)
+    config['css'] = (config['css'] or '') + '\n' + css
     return config
 
 

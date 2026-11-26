@@ -58,7 +58,7 @@ Use the CUDA 12.6 build on Windows and Linux: the Linux CUDA 12.8 build of PyTor
 
 In the configuration menu, **INT8 Math Kernels** selects the backend for INT8 quantized linear layers, including INT8 ConvRot checkpoints:
 
-- **Auto** (default): tries WGPKernels, then Comfy Kitchen CUDA on NVIDIA or HIP on AMD ROCm, then Triton, then PyTorch when no other backend is available.
+- **Auto** (default): tries WGPKernels, then Comfy Kitchen CUDA on NVIDIA or HIP on AMD ROCm, then Triton, then PyTorch when no other backend is available. With **Preserve Precision** (see below), Auto skips the less precise Comfy Kitchen kernels even when they are installed; selecting **Comfy Kitchen Kernels** explicitly still uses them.
 - **WGPKernels**: selects WanGP's own INT8 kernels, with higher precision. See [WGPKernels Installation](#wgpkernels-installation) below.
 - **Triton**: selects WanGP's Triton INT8 kernels. See [Triton Installation](#triton-installation) below.
 - **Comfy Kitchen Kernels**: selects Kitchen's native CUDA or HIP kernels for the current PyTorch runtime.
@@ -78,27 +78,27 @@ For **PyTorch 2.10 / CUDA 13** (NVIDIA R580+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-linux_x86_64.whl
 ```
 
 For **PyTorch 2.7.1 / CUDA 12.8** (NVIDIA R570+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-linux_x86_64.whl
 ```
 
 For **AMD RDNA4 (`gfx1200`, `gfx1201`) with PyTorch 2.13.0 / ROCm 10.0** (experimental):
 
 ```bash
 # Windows
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-win_amd64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-win_amd64.whl
 # Linux
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-linux_x86_64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and Conv3D remain CUDA-only; AMD retains the independent supported backends for those operations. AMD packages pass installation and library-loading checks, but kernel execution on AMD hardware remains unvalidated.
@@ -107,12 +107,26 @@ The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and C
 
 This dropdown controls optional CUDA kernel optimizations:
 
-- **Preserve Precision**: uses kernels at least as accurate as standard PyTorch math; tiny output differences are still possible.
+- **Preserve Precision**: uses kernels at least as accurate as standard PyTorch math; tiny output differences are still possible. With **INT8 Math Kernels** on Auto, it also skips Comfy Kitchen.
 - **Allow Faster Approximate Kernels** (default, `kernel_precision: "fast"`): allows small precision trade-offs for potential speed or VRAM savings.
 
 Changes apply between generations without reloading weights. Saved choices are preserved; missing values use the default. **INT8 Math Kernels** sets the preferred kernel family, with automatic fallback when unavailable. Additional H3 optimizations require validated RTX 50-series (SM120) GPUs. Checkpoint dtypes, FP16 accumulation and attention settings are unchanged.
 
 
+
+### SageGP Attention Modes (RTX 50XX)
+
+With [SageGP](#sage-attention) installed on an RTX 50-series GPU, **Attention Type** in **Configuration → Performance** offers three SageGP modes. SageGP takes priority over SageAttention 2 and 3 when they are installed too. Save the setting to apply it to the next generation.
+
+- **sage2 gp** (recommended) keeps SageAttention 2's precision with WanGP's INT8 attention path, including in-place query packing where supported. Long video attention (more than 8,192 tokens) uses SageGP's INT8 kernel, about 8% faster than SageAttention 2's at about the same error.
+- **sage 2/3 adaptative gp** chooses, for each head, how much of the score and value calculation can use cheaper formats, by comparing candidate outputs on samples of the current activations. Its speed therefore depends on the model and the content: large on blocks whose attention is easy to compress, small on the others. It is less precise than sage2 gp.
+- **sage3 gp** computes every score in FP4 on the RTX 50 series' FP4 tensor cores and keeps the values in FP8. It runs at about the speed of SageAttention 3 on every block, with roughly half of its error. It changes fine detail more than the adaptative mode; with few-step (distilled) models the video can follow a somewhat different path at the same seed.
+
+**Run the First Denoising Step in Precise** (on by default, shown only with SageGP on an RTX 50-series GPU) applies to sage 2/3 adaptative gp and sage3 gp: the first step, which sets the composition, runs with sage2 gp's precision, for a small part of the speed gain.
+
+The adaptative and sage3 gp modes need Triton 3.6 or newer. They handle unmasked, noncausal BF16 attention with batch size 1, 128 channels per head (256 for wide heads, such as Ideogram 4), equal query and KV head counts, and matching sequence lengths within the kernels' indexing limits. Up to 8,192 tokens, both run sage2 gp. Other shapes and masks use the existing backend.
+
+The adaptative mode also applies when **Smart Inputs Chunker** splits eligible video self-attention into head groups. Each group then uses samples from its own heads to select the kernel precision. All queries in a group still attend to the full sequence of keys. Split projections that normalize Q and K across all heads, including LTX-2.5 video self-attention, need extra preparation: the adaptative mode switches from sage2 gp to its own kernels above 32,768 tokens, and sage3 gp hands these split calls to the adaptative kernels, the fastest that support them.
 
 ### H3 Video VAE Selection
 
@@ -178,39 +192,45 @@ Sage Attention accelerates Video / Image Generation up to x2 with very little qu
 Use the version matching your GPU generation:
 
 - **RTX 20XX (Turing):** SageAttention 1.0.6. SageAttention 2 is not supported.
-- **RTX 30XX or newer (Ampere, Ada, and Blackwell):** SageAttention 2.2.0.
+- **RTX 30XX or newer (Ampere, Ada, and Blackwell):** [SageGP](https://github.com/deepbeepmeep/SageGP) with PyTorch 2.10 (SageAttention 2.2.0 with PyTorch 2.7.1). SageGP is SageAttention 2.2 for every GPU plus WanGP's RTX 50XX kernels: the faster **sage2 gp** kernel and the **sage 2/3 adaptative gp** and **sage3 gp** modes (see [SageGP Attention Modes](#sagegp-attention-modes-rtx-50xx)).
+
+On RTX 20XX (Sage1) and RTX 30XX (Sage2), WanGP can pack an owned FP16 or BF16 query into its own rows using Triton. Each eligible projection saves one temporary INT8 buffer, one byte per query element. The attention kernel can then write its output into those rows. Borrowed queries and incompatible strides use separate storage. These cards keep their existing per-block INT8 attention and 16-bit values.
+
+On GeForce RTX 50XX with SageGP, **sage 2/3 adaptative gp** and **sage3 gp** automatically select the wide-head kernel for eligible dense BF16 self-attention with 256 channels per head, including Ideogram 4. The selector reads the tensor dimensions. The kernel checks the channel ranges while preparing each head and uses all 256 score channels wherever the compact calculation exceeds its bounds. **sage2 gp** uses the optimized INT8 path for these wide heads. Dense 128-channel attention, including LTX2 and MiniMax H3, uses its own preset-dependent routing.
 
 #### Windows: Install SageAttention 1 for RTX 20XX
 ```
 pip install sageattention==1.0.6
 ```
 
-#### Windows: Install SageAttention 2 for RTX 30XX-50XX
-For the recommended PyTorch 2.10 environment:
+#### Windows: Install SageGP for RTX 30XX-50XX
+For the recommended PyTorch 2.10 environment (any Python from 3.10). SageGP replaces SageAttention, so remove it first:
 ```
-pip install https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0+cu130torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl
+pip uninstall -y sageattention
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
 ```
-This version (or a later one) is needed for the **CUDA Graph** compilation mode to keep SageAttention's fastest kernels on RTX 40XX/50XX: with older versions, CUDA Graph mode switches the attention to slower SageAttention kernels.
+SageGP keeps SageAttention's fastest kernels in the **CUDA Graph** compilation mode on RTX 40XX/50XX.
 
 #### Linux: Install SageAttention 1 for RTX 20XX
 ```
 pip install sageattention==1.0.6
 ```
 
-#### Linux: Install SageAttention 2 for RTX 30XX-50XX
-Prebuilt wheels come from the [WanGP SageAttention fork](https://github.com/deepbeepmeep/SageAttention), no compilation needed. They also keep SageAttention's fastest kernels in **CUDA Graph** mode.
+#### Linux: Install SageGP for RTX 30XX-50XX
+Prebuilt wheels, no compilation needed. They keep SageAttention's fastest kernels in **CUDA Graph** mode.
 
-For the recommended Python 3.11 / PyTorch 2.10 / CUDA 13 environment:
+For the recommended PyTorch 2.10 / CUDA 13 environment (any Python from 3.10). SageGP replaces SageAttention, so remove it first:
 ```
-pip install https://github.com/deepbeepmeep/SageAttention/releases/download/v2.2.0-linux.cg1/sageattention-2.2.0+cu130torch2.10.0.cg1-cp311-cp311-linux_x86_64.whl
+pip uninstall -y sageattention
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
 ```
-The `cp311` part of the file name (it appears twice) is the Python version (3.11) and must match your environment's Python: with Python 3.10 or 3.12, replace it with `cp310` or `cp312` (see the [release page](https://github.com/deepbeepmeep/SageAttention/releases/tag/v2.2.0-linux.cg1)). These wheels work only with PyTorch 2.10 and CUDA 13, and need a Linux distribution from 2018 or later (glibc 2.28). The 1 click installer picks the right wheel automatically.
+The wheel needs a Linux distribution from 2018 or later (glibc 2.28). The 1 click installer picks the right wheel automatically.
 
-For another PyTorch version, compile the fork instead (this takes a while):
+For PyTorch 2.7.1, use the SageAttention 2.2.0 wheels of the [older release](https://github.com/deepbeepmeep/SageGP/releases/tag/v2.2.0-linux.cg1) (`cu128torch2.7.1`; the SageGP modes need PyTorch 2.10). For another PyTorch version, compile SageGP instead (this takes a while):
 ```
 python -m pip install "setuptools<=75.8.2" ninja wheel --force-reinstall
-git clone https://github.com/deepbeepmeep/SageAttention
-cd SageAttention
+git clone https://github.com/deepbeepmeep/SageGP
+cd SageGP
 pip install --no-build-isolation -e .
 ```
 
@@ -302,7 +322,7 @@ The CUDA 13 builds contain native GPU code for SM75 through the architectures su
 
 ### Experimental AMD HIP wheel: Python 3.12 / PyTorch 2.13 / ROCm 10
 
-For RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer adds this wheel to its AMD environment (Python 3.12, PyTorch 2.13.0+rocm10.0.0). To install it manually in that environment:
+For RDNA3 GPUs (`gfx1100`, `gfx1101`, `gfx1102`, `gfx1103`: RX 7600 to 7900 series, Radeon 780M / 760M) and RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer adds this wheel to its AMD environment (Python 3.12, PyTorch 2.13.0+rocm10.0.0). To install it manually in that environment:
 
 Windows:
 ```bash
@@ -327,12 +347,12 @@ These kernels will offer optimized INT4 / FP4 dequantization.
 ### Lightx2v NVP4 Kernels Wheels for Python 3.11 / Pytorch 2.10 / Cuda 13 (RTX 50xx / sm120+ only !)
 - Windows
    ```
-  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-win_amd64.whl
+  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-win_amd64.whl
    ```
 
 - Linux
    ```
-  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl
+  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-linux_x86_64.whl
    ```
 
 

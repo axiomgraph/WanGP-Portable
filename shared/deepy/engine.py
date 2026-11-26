@@ -70,7 +70,7 @@ _MESH_VIEWS = ("front", "back", "left", "right", "top", "bottom", "three_quarter
 from postprocessing import catalog as postprocessing_catalog
 from shared.utils import mesh_postprocessing
 from shared.gradio import assistant_chat
-from shared.prompt_enhancer import qwen35_text
+from shared.prompt_enhancer import chat_formats, qwen35_text
 from shared.prompt_enhancer.config import PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT, PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, normalize_prompt_enhancer_speculative_decoding
 from shared.prompt_enhancer.qwen35_assistant_runtime import (
     Qwen35AssistantRuntime,
@@ -95,6 +95,7 @@ ASSISTANT_DEBUG = False
 _ENABLE_INCOMPLETE_STOP_ANSWER_HEURISTICS = False
 _THROUGHPUT_BUCKET_SECONDS = 1.0
 _THROUGHPUT_BUCKET_COUNT = 5
+INSPECTION_ZOOM_NOTE_SHRINK = 2.0  # an inspection read at under half the linear resolution of its source names bbox, once per session
 
 _TOOL_TYPE_MAP = {
     "str": "string",
@@ -544,6 +545,7 @@ class AssistantSessionState:
     chat_revision: int = 0
     chat_event_sequence: int = 0
     chat_session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    inspection_zoom_noted: bool = False  # the bbox note on a much-reduced inspection was given
     storage_session_id: str = ""
     storage_session_dir: str = ""
     storage_title: str = ""
@@ -6358,13 +6360,13 @@ class DeepyZeroTools:
             try:
                 input_time_seconds = None if input_time_seconds is None or str(input_time_seconds).strip() == "" else float(input_time_seconds)
             except Exception:
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_snds must be a number."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_s must be a number."}
             if input_frame_no is not None and input_time_seconds is not None:
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] cannot combine frame_no and time_seconds."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] cannot combine frame_no and time_s."}
             if input_frame_no is not None and input_frame_no < 0:
                 return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].frame_no must be non-negative."}
             if input_time_seconds is not None and (not math.isfinite(input_time_seconds) or input_time_seconds < 0):
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_snds must be a finite non-negative number."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_s must be a finite non-negative number."}
             try:
                 input_bbox = deepy_vision.normalize_inspection_bbox(raw_input.get("bbox"))
             except ValueError as exc:
@@ -6398,7 +6400,7 @@ class DeepyZeroTools:
             if requested_input.get("view"):
                 return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": media_record.get("media_type", ""), "question": question, "answer": "", "error": f"media_inputs[{index}].view applies to 3D assets only."}
             if media_inputs is not None and media_record.get("media_type") == "image" and (requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None):
-                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": "image", "question": question, "answer": "", "error": f"media_inputs[{index}] is an image and cannot specify frame_no or time_seconds."}
+                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": "image", "question": question, "answer": "", "error": f"media_inputs[{index}] is an image and cannot specify frame_no or time_s."}
             inspection_record = dict(media_record)
             inspection_record["frame_no"] = (requested_input["frame_no"] if requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None else 0) if media_record.get("media_type") == "video" else None
             inspection_record["time_seconds"] = requested_input["time_seconds"] if media_record.get("media_type") == "video" else None
@@ -6415,6 +6417,10 @@ class DeepyZeroTools:
                 "error": "Deepy vision inspection is not available.",
             }
         result = self._vision_query_callback(media_records[0] if len(media_records) == 1 else media_records, question, frame_no if media_inputs is None else None)
+        shrink = result.pop("_inspection_shrink", 1.0) if isinstance(result, dict) else 1.0
+        if shrink >= INSPECTION_ZOOM_NOTE_SHRINK and not self.session.inspection_zoom_noted and result.get("status") == "done":  # once per session: later answers on large images stay lean
+            self.session.inspection_zoom_noted = True
+            result["note"] = f"The inspector read this at about 1/{shrink:.0f} of its resolution. For small text or details, inspect a region at full detail with bbox=[x_min,y_min,x_max,y_max] (0-1000 of the full image) instead of making crop files."
         if isinstance(result, dict) and result.get("status") == "done":
             image_details = []
             worlds = [record for record in media_records if record.get("source_media_type") == "world"]
@@ -6565,6 +6571,7 @@ class DeepyZeroTools:
         if isinstance(result, dict):
             result.pop("media", None)
             result.pop("media_ids", None)
+            result.pop("_inspection_shrink", None)  # sampled frames are small by design
             result.update({
                 "media_id": media_record.get("media_id", ""), "start_frame_no": start_frame, "end_frame_no": end_frame,
                 "start_s": start_time_seconds, "end_s": sampled_end_seconds,
@@ -6834,6 +6841,8 @@ _CONTEXT_BAR_TOKENS = 12000  # a conversation being rebuilt: Prime's system prom
 
 
 class AssistantEngine:
+    _chat_format = chat_formats.QWEN  # of the model last loaded: the system prompt's wording is needed while no runtime exists
+
     def __init__(self, session: AssistantSessionState, runtime_hooks: AssistantRuntimeHooks, tool_box: Any, send_cmd, debug_enabled: bool | None = None, thinking_enabled: bool = True, vram_mode: str = DEEPY_VRAM_MODE_UNLOAD, system_prompt: str = ASSISTANT_SYSTEM_PROMPT, custom_system_prompt_key: str = DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY):
         self.session = session
         self.runtime_hooks = runtime_hooks
@@ -7048,9 +7057,9 @@ class AssistantEngine:
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
-        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and self.runtime is not None
+        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and runtime is not None and runtime.context_progress is None
         if long_call:
-            self.runtime.context_progress = self._report_context_progress
+            runtime.context_progress = self._report_context_progress
         completed = False
         result = None
         try:
@@ -7059,7 +7068,7 @@ class AssistantEngine:
             return result
         finally:
             if long_call:
-                self.runtime.context_progress = None
+                runtime.context_progress = None
                 self._close_context_progress()
             # the runtime's setup and the call's preparation after a load (experts placed by the first forward's hook) both open the call
             setup_seconds = max(0.0 if runtime is None else runtime.prefill_setup_seconds, self._prepared_at - started_at)
@@ -7075,13 +7084,17 @@ class AssistantEngine:
         if phase != "Reading the Prompt":  # Flash-Next's own prompt pass (qwen4_exp): the reading the prefill speed measures
             self._prepared_at = time.perf_counter()
 
-    def _report_context_progress(self, done: int, total: int) -> None:
+    def _report_context_progress(self, done: int, total: int, *, on_resume_status: Callable[[str], None] | None = None) -> None:
         """A conversation being rebuilt moves the bar of the status line, three times a second at most."""
         now = time.perf_counter()
-        if done < total and now - self._context_progress_at < 0.33:
+        if done < total and now - self._context_progress_at < 1 / 3:
             return
         self._context_progress_at = now
-        self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress={"done": done, "total": total}))
+        progress = {"done": done, "total": total}
+        if on_resume_status is not None:
+            on_resume_status(assistant_chat.build_status_event("Prefilling KV Cache", kind="session_loading", session=self.session, detail=f"{done:,} / {total:,} tokens", progress=progress))
+        else:
+            self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress=progress))
 
     def _close_context_progress(self) -> None:
         """The status line goes back to what it said before the bar."""
@@ -7102,7 +7115,7 @@ class AssistantEngine:
         return normalize_deepy_custom_system_prompt(get_deepy_config_value(self.custom_system_prompt_key, ""))
 
     def _build_reset_base_system_prompt(self) -> str:
-        system_prompt = self.system_prompt.rstrip()
+        system_prompt = self._chat_format.system_prompt(self.system_prompt.rstrip())
         custom_system_prompt = self._get_custom_system_prompt()
         system_context_getter = getattr(self.tool_box, "get_system_context", None)
         system_context = str(system_context_getter() or "").strip() if callable(system_context_getter) else ""
@@ -7116,7 +7129,7 @@ class AssistantEngine:
 
     def _current_reset_base_signature(self) -> str:
         speculative_decoding = normalize_prompt_enhancer_speculative_decoding(get_deepy_config_value(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))
-        return _json_dumps({"system_prompt": self._build_reset_base_system_prompt(), "tools": self.tool_box.get_tool_schemas(), "thinking_enabled": bool(self.thinking_enabled), "speculative_decoding": speculative_decoding})
+        return _json_dumps({"system_prompt": self._build_reset_base_system_prompt(), "tools": self.tool_box.get_tool_schemas(), "thinking_enabled": bool(self.thinking_enabled), "speculative_decoding": speculative_decoding, **({} if self._chat_format is chat_formats.QWEN else {"chat_format": self._chat_format.name})})
 
     def _can_preserve_reset_base(self) -> bool:
         return self.vram_mode in (DEEPY_VRAM_MODE_ALWAYS_LOADED, DEEPY_VRAM_MODE_UNLOAD_ON_REQUEST, DEEPY_VRAM_MODE_UNLOAD)
@@ -7245,6 +7258,14 @@ class AssistantEngine:
 
     def _pending_tool_render_contents(self) -> list[str]:
         return [self._message_render_content(message).strip() for message in self._get_pending_render_messages() if str(message.get("role", "")).strip().lower() == "tool" and len(self._message_render_content(message).strip()) > 0]
+
+    def _tool_render_names(self, tool_messages: list[dict[str, Any]]) -> list[str]:
+        """The tool each result answers, for the chat formats that name it: "" for a result without a call (a rejected request)."""
+        names = {tool_call.get("id"): tool_call["function"]["name"] for message in self.session.messages for tool_call in message.get("tool_calls") or []}
+        return [names.get(message.get("tool_call_id"), "") for message in tool_messages]
+
+    def _pending_tool_render_names(self) -> list[str]:
+        return self._tool_render_names([message for message in self._get_pending_render_messages() if str(message.get("role", "")).strip().lower() == "tool" and len(self._message_render_content(message).strip()) > 0])
 
     def _get_runtime_tool_template_label(self, tool_name: str) -> str:
         try:
@@ -7905,6 +7926,9 @@ class AssistantEngine:
             if loading:
                 self._set_status("Loading Deepy...", kind="loading")
             model, _tokenizer = self.runtime_hooks.ensure_loaded()
+            manager = self.runtime_hooks.get_offload_manager()
+            if manager is not None:  # before its first turn: its graphs are kept when it unloads (_unload_weights suspends it), replayed when it comes back
+                manager.make_suspendable()
             model._prompt_enhancer_min_model_len_hint = self._get_context_window_tokens()
             engine = getattr(model, "_prompt_enhancer_vllm_engine", None)
             llm = None if engine is None else getattr(engine, "_llm", None)
@@ -7914,6 +7938,7 @@ class AssistantEngine:
                 runner.invalidate_graphs_if_model_storage_changed()
             if self.runtime is None or self.runtime.model is not model:
                 self.runtime = Qwen35AssistantRuntime(model, debug_enabled=self.debug_enabled)
+                self._chat_format = self.runtime.chat_format
             if not self._action_budget_logged:
                 context_window_tokens = self._get_context_window_tokens()
                 action_budget_tokens = assistant_action_budget_tokens(context_window_tokens)
@@ -7998,6 +8023,7 @@ class AssistantEngine:
                     )
                 prompt_embeds = prompt_embeds.detach().to("cpu")
                 prompt_position_ids = prompt_position_ids.detach().to("cpu")
+                shrink = deepy_vision.inspection_shrink(images, deepy_vision.local_inspection_pixels(caption_processor, None if max_image_edge is None else max_image_edge * max_image_edge))
             finally:
                 if resident:
                     unload_vision()
@@ -8054,6 +8080,7 @@ class AssistantEngine:
             "question": str(question or "").strip(),
             "answer": answer,
             "error": "",
+            "_inspection_shrink": shrink,
         }
         if len(inspected_media) == 1:
             result.update(inspected_media[0])
@@ -8540,7 +8567,7 @@ class AssistantEngine:
         self._compaction_thinking_block_id = ""
 
     def _generate_compaction_segment(self, max_new_tokens: int):
-        tool_call_token_id = int(self.runtime.tokenizer.convert_tokens_to_ids("<tool_call>"))
+        tool_call_token_id = int(self.runtime.tokenizer.convert_tokens_to_ids(chat_formats.of(self.runtime.tokenizer).tool_open))
         generated_tokens = 0
         remaining_tokens = max(1, int(max_new_tokens))
         # Thoughts share the bounded output budget; leave at least half for the summary.
@@ -9264,7 +9291,7 @@ class AssistantEngine:
                     return
             if restore_mode in ("reused", "restored") and self._can_append_pending_tool_suffix():
                 thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
-                suffix_tokens = render_tool_turn_suffix(runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled)
+                suffix_tokens = render_tool_turn_suffix(runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled, tool_names=self._pending_tool_render_names())
                 if len(suffix_tokens) > 0:
                     prefix_tokens = self._active_sequence_token_count()
                     prefix_tokens = len(self.session.rendered_token_ids) if prefix_tokens is None else prefix_tokens
@@ -9409,7 +9436,7 @@ class AssistantEngine:
         self._snapshot_synchronized_live_context()
         return mode
 
-    def prefill_restored_context(self) -> int:
+    def prefill_restored_context(self, *, on_status: Callable[[str], None] | None = None) -> int:
         if len(self.session.messages) == 0:
             return 0
         runtime = self._acquire_runtime()
@@ -9419,6 +9446,10 @@ class AssistantEngine:
             if len(untrimmed_tokens) > context_window_tokens:
                 raise RuntimeError(f"Saved Deepy session requires {len(untrimmed_tokens):,} context tokens, exceeding the current maximum of {context_window_tokens:,}.")
             target_tokens, _trimmed = self._fit_rendered_messages_to_window(add_generation_prompt=False)
+            if on_status is not None:
+                # The system prefix and the history are separate runtime calls, but prepare one conversation.
+                total = len(target_tokens)
+                runtime.context_progress = lambda done, _target: self._report_context_progress(done, total, on_resume_status=on_status)
             mode = self._extend_context_from_preserved_base(target_tokens)
             if mode is None:
                 mode = self._prefill_from_new_header(target_tokens)
@@ -9430,6 +9461,9 @@ class AssistantEngine:
             self._log(f"Restored session context prepared ({len(target_tokens):,} tokens, mode={mode}).")
             return len(target_tokens)
         finally:
+            if on_status is not None:
+                runtime.context_progress = None
+                self._context_progress_at = 0.0
             self._pause_runtime(pause_reason="idle", preserve_session_snapshot=True)
 
     def _build_tool_error(self, tool_name: str, arguments: dict[str, Any], error_text: str) -> dict[str, Any]:
@@ -9485,7 +9519,7 @@ class AssistantEngine:
         self.runtime._append_action_suffix(suffix)
         active_sequence = self.runtime._get_active_sequence()
         if active_sequence is not None:
-            raw_text = self.runtime.tokenizer.decode(active_sequence.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            raw_text = chat_formats.decode_completion(self.runtime.tokenizer, active_sequence)
             self._stream_generation_update(raw_text=raw_text, token_count=0, stop_reason="loop_warning", is_final=True)
             self._checkpoint_completed_thoughts(raw_text)
         else:
@@ -9758,9 +9792,7 @@ class AssistantEngine:
         assistant_content = str(assistant_message.get("content", "") or "").strip()
         if len(user_content) == 0 or len(assistant_content) == 0:
             return None
-        suffix = f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n{assistant_content}<|im_end|>\n"
-        token_ids = self.runtime.tokenizer.encode(suffix, add_special_tokens=False)
-        return [int(token_id) for token_id in list(token_ids or [])]
+        return chat_formats.of(self.runtime.tokenizer).render_exchange(self.runtime.tokenizer, user_content, assistant_content)
 
     def _append_target_suffix_from_live_runtime(self, target_tokens: list[int]) -> str | None:
         if self.runtime is None:
@@ -9815,15 +9847,16 @@ class AssistantEngine:
             if state == "tool_expected":
                 if role != "tool":
                     return None
-                tool_contents = []
+                tool_contents, tool_messages = [], []
                 while index < len(pending_messages) and str(pending_messages[index].get("role", "")).strip().lower() == "tool":
                     content = self._message_render_content(pending_messages[index]).strip()
                     if len(content) > 0:
                         tool_contents.append(content)
+                        tool_messages.append(pending_messages[index])
                     index += 1
                 if len(tool_contents) == 0:
                     return None
-                suffix_tokens.extend(render_tool_turn_suffix(self.runtime.tokenizer, tool_contents, thinking_enabled=thinking_enabled))
+                suffix_tokens.extend(render_tool_turn_suffix(self.runtime.tokenizer, tool_contents, thinking_enabled=thinking_enabled, tool_names=self._tool_render_names(tool_messages)))
                 state = "assistant_open"
                 continue
             if state == "assistant_open":
@@ -9929,7 +9962,7 @@ class AssistantEngine:
             add_generation_prompt=bool(add_generation_prompt),
             thinking_enabled=thinking_enabled,
         )
-        user_prefix_tokens = self.runtime.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+        user_prefix_tokens = self.runtime.tokenizer.encode(chat_formats.of(self.runtime.tokenizer).user_header, add_special_tokens=False)
         user_prefix_tokens = [int(token_id) for token_id in list(user_prefix_tokens or [])]
         start_idx = self._find_token_subsequence(rendered_tokens, user_prefix_tokens)
         if start_idx < 0:
@@ -9966,7 +9999,7 @@ class AssistantEngine:
         suffix_tokens = None
         if self._can_append_pending_tool_suffix():
             thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
-            suffix_tokens = render_tool_turn_suffix(self.runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled)
+            suffix_tokens = render_tool_turn_suffix(self.runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled, tool_names=self._pending_tool_render_names())
         elif self._can_append_pending_user_suffix():
             thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
             suffix_tokens = render_text_user_turn_suffix(self.runtime.tokenizer, self._pending_user_render_content(), thinking_enabled=thinking_enabled)
@@ -10407,7 +10440,7 @@ class AssistantEngine:
                     if loop_action == "stop":
                         self._commit_loop_stop(raw_text, loop_message)
                         break
-                    self._append_tool_generation_error(raw_text, "malformed_tool_call", f"Deepy's tool call was rejected before execution: {tool_structure_error}", runtime_update=loop_message if loop_action == "warn" else "")
+                    self._append_tool_generation_error(raw_text, "malformed_tool_call", f"Deepy's tool call was rejected before execution: {chat_formats.of(self.runtime.tokenizer).tool_error(tool_structure_error)}", runtime_update=loop_message if loop_action == "warn" else "")
                     self._reset_action_stream_state()
                     action_phase = "thought" if self.thinking_enabled else "statement"
                     continuing_response = False

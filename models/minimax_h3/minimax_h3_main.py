@@ -12,7 +12,6 @@ from tqdm import tqdm
 from mmgp import offload, quant_router, runtime
 from shared.utils import files_locator as fl
 
-from .audio_vae import MiniMaxH3AudioVAE
 from .convrot_layout import get_convrot_layout
 from .hyperflow import replace_low_rank_linears
 from .latent_upscaler import MiniMaxH3LatentUpscaler
@@ -26,16 +25,9 @@ from .viggle import load_fixed_prompt
 from .vae_upsampler import X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_VALUE
 
 
-VIDEO_VAE_FILE = "MiniMax-H3-video_vae_fp16.safetensors"
-VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
-VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
-VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
-VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
+from .constants import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER, VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE,  # noqa: F401 (also read from here)
+                        VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE, VIDEO_VAE_SOL_INT8_FILE)
 VIDEO_VAE_SPLIT_INT8 = True  # comparison switch: the INT8 VAEs split their q / k / v projections too (decoder attention through the attention kit)
-AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
-LATENT_UPSCALER_FOLDER = "minimax_h3"
-LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
-TEXT_ENCODER_FOLDER = "Qwen3-VL-32B-Instruct"
 ADALN_CURVE_DIM = 8
 NUM_TRANSFORMER_BLOCKS = 50
 
@@ -59,6 +51,9 @@ def _hybrid_ref2va_blocks(filename):
 
 def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pdd=False, ref2va_adaln_t_table=None):
     prefixes = ("model.diffusion_model.", "diffusion_model.")
+    # ComfyUI GGUFs pack the step heads in final_layer's projections, [num_steps * out, in]: head 0, then the others already relative to it
+    video_out, width = (next((value for key, value in state_dict.items() if key.endswith(name)), None) for name in ("final_layer.video_out.weight", "video_patch_proj.weight"))
+    packed = pdd and video_out is not None and width is not None and video_out.shape[0] > width.shape[1]
 
     def strip(mapping):
         if mapping is None:
@@ -75,7 +70,7 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
                 key = "blocks." + key[len("transformer_blocks."):].replace(".attn.softmax_gate.", ".attn.vdn.softmax_gate.")
             elif key.startswith("transformer_blocks.") and ".attn.to_out_linear." in key:
                 key = "blocks." + key[len("transformer_blocks."):].replace(".attn.to_out_linear.", ".attn.vdn.to_out_linear.")
-            if pdd and (key.startswith("final_layer.video_out.") or key.startswith("final_layer.audio_out.") or
+            if pdd and not packed and (key.startswith("final_layer.video_out.") or key.startswith("final_layer.audio_out.") or
                         key in ("final_layer.video_out", "final_layer.audio_out")):
                 continue
             if pdd and key.startswith("pdd_heads."):
@@ -89,6 +84,11 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
                     for suffix in ("weight", "bias") if f"final_layer.{head}.{suffix}" in state_dict]:
             head, suffix = key.rsplit(".", 1)
             stacked = state_dict.pop(key)
+            if packed:
+                rows = state_dict[f"{head.split('.')[1].removesuffix('_out')}_patch_proj.weight"].shape[1]
+                stacked = stacked.as_subclass(torch.Tensor).float()
+                state_dict[f"{head}.linear.{suffix}"], state_dict[f"{head}.{'heads' if suffix == 'weight' else 'head_biases'}"] = stacked[:rows], stacked[rows:].unflatten(0, (-1, rows))
+                continue
             base = stacked[0].float()
             state_dict[f"{head}.linear.{suffix}"], state_dict[f"{head}.{'heads' if suffix == 'weight' else 'head_biases'}"] = base, stacked[1:].float() - base
     if ref2va_adaln_t_table is not None:
@@ -116,7 +116,10 @@ def probe_h3_checkpoint(filename):
     separate_qkv = any(key.endswith((".attn.q_proj.weight", ".attn.q_proj.down.weight")) for key in normalized)
     # H3-Image: no audio stream, and one output head per step of its fixed schedule, stacked in the checkpoint
     heads = normalized.get("pdd_heads.video_out.weight")
-    stream = {"audio_enabled": "audio_patch_proj.weight" in normalized, "step_heads": None if heads is None else int(heads.shape[0])}
+    packed = normalized.get("final_layer.video_out.weight") if heads is None else None  # ComfyUI GGUFs: the heads packed in one projection
+    width = None if packed is None else normalized["video_patch_proj.weight"].shape[1]
+    step_heads = int(heads.shape[0]) if heads is not None else packed.shape[0] // width if packed is not None and packed.shape[0] > width else None
+    stream = {"audio_enabled": "audio_patch_proj.weight" in normalized, "step_heads": step_heads}
     table = next((tensor for key, tensor in normalized.items() if key == "adaln_t_table"), None)
     if table is None:
         if hybrid_ref2va_blocks is not None:
@@ -204,16 +207,23 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     if pdd and (int(pdd_num_steps) < 1 or int(pdd_block_size) < 1 or int(pdd_num_steps) % int(pdd_block_size)):
         raise ValueError(f"Invalid MiniMax H3 PDD grid={pdd_num_steps}, block={pdd_block_size}")
     control_layers, control_in_dim = probe_h3_control_module(filenames[1:], checkpoint["time_embed_dim"])
+    dwd_steps = None  # pi-H3 DWD module: the step count its blocks and pixel head were trained for
+    for path in filenames[1:]:
+        state_dict, metadata = quant_router.load_metadata_state_dict(path)
+        if "dwd_head.time_table" in state_dict:
+            dwd_steps = int(metadata["num_inference_steps"])
     if veda:
-        from .veda.attention import VedaAttention, VedaPolicy, read_metadata
-        veda_policy = VedaPolicy(read_metadata(filenames[-1]))
+        from .veda.attention import FORMAT as VEDA_FORMAT, VedaAttention, VedaPolicy, read_metadata
+        # the predictor among the modules, whatever follows it (PTD's step heads); read_metadata names the file when none is
+        veda_file = next((path for path in filenames[1:] if quant_router.load_metadata_state_dict(path)[1].get("format") == VEDA_FORMAT), filenames[-1])
+        veda_policy = VedaPolicy(read_metadata(veda_file))
     with init_empty_weights(include_buffers=True):
         transformer = MiniMaxH3Model(adaln_curve_grid=checkpoint["adaln_curve_grid"], time_embed_dim=checkpoint["time_embed_dim"], adaln_dtype=checkpoint["adaln_dtype"],
                                      hybrid_ref2va_blocks=hybrid_ref2va_blocks, pdd_num_steps=pdd_num_steps,
                                      pdd_block_size=pdd_block_size, vdn=vdn, vsa=vsa, control_layers=control_layers,
                                      control_in_dim=control_in_dim, dropped_blocks=checkpoint.get("dropped_blocks", ()),
                                      endpoint_gate=checkpoint.get("endpoint_gate"), step_heads=checkpoint["step_heads"],
-                                     audio_enabled=checkpoint["audio_enabled"], dtype=dtype, device="meta")
+                                     audio_enabled=checkpoint["audio_enabled"], dwd_head=dwd_steps is not None, dtype=dtype, device="meta")
         if veda:
             transformer.veda_attention = veda_policy
             for layer, block in enumerate(transformer.blocks):
@@ -224,6 +234,8 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
             transformer.vsa_attention = VSAPolicy(fasth3_inference)
             for layer, block in enumerate(transformer.blocks):
                 block.attn.vsa = VSAAttention(transformer.vsa_attention, layer)
+    if dwd_steps is not None:
+        transformer.dwd_head.refiner.reset_rope()
     qkv_layout = _qkv_layout(filenames, qkv_layout)
     split_map = get_linear_split_map(transformer.attention_inner_size, qkv_layout=qkv_layout) if qkv_splitting and not any(path.lower().endswith(".gguf") for path in filenames) else None
     if split_map is not None:
@@ -240,6 +252,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
                             fused_split_map=split_map)
     transformer.eval().requires_grad_(False)
     transformer.h3_checkpoint_info = checkpoint
+    transformer.dwd_steps = dwd_steps
     transformer.h3_lora_affine_package = lora_affine_package
     transformer.h3_lora_map_checked = hybrid_ref2va_blocks is None
     transformer.split_linear_modules_map = split_map
@@ -269,12 +282,16 @@ def _load_text_encoder(filename, dtype, distilled=False):
 
 def _load_video_vae(filename, qkv_splitting=True, upsampling=False, single_frame=False, image_decoder=False):
     lightvae = filename in (VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
+    sol = filename == VIDEO_VAE_SOL_INT8_FILE
+    qkv_splitting = qkv_splitting and not sol  # Sol's windows read the fused q / k / v projection
     filename = fl.locate_file(filename)
     dtype = quant_router.load_metadata_state_dict(filename)[0]["encoder.conv_in.weight"].dtype
     dtype = torch.float16 if dtype == torch.float32 else dtype  # checkpoint-native FP16/BF16; FP32 wastes VRAM for little precision
     print(f"Loading MiniMax H3 Video VAE '{filename}'...")
     with init_empty_weights(include_buffers=False):
-        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=12 if lightvae else 36, single_frame=single_frame, image_decoder=image_decoder)
+        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=12 if lightvae else 36, single_frame=single_frame, image_decoder=image_decoder, sol=sol)
+    if sol:  # its output head and LayerNorm are stored and run in FP32
+        vae.decoder.proj_out._lock_dtype = vae.decoder.norm_out._lock_dtype = torch.float32
     decoder_heads = vae.decoder.transformer_blocks[0].attn.heads
     split_map = get_video_vae_linear_split_map(decoder_heads * 64) if qkv_splitting else None
     if split_map is not None:
@@ -299,12 +316,14 @@ def _load_video_vae(filename, qkv_splitting=True, upsampling=False, single_frame
                             fused_split_map=split_map)
     vae.split_linear_modules_map = split_map
     vae._model_dtype = dtype
+    vae.weights_bytes = os.path.getsize(filename)  # in VRAM as stored: what the VAE Tiling budget counts before the activations
     vae.upsampling_set = X2_VAE_VALUE if upsampling else None
     vae.eval().requires_grad_(False)
     return vae
 
 
 def _load_audio_vae(filename):
+    from .audio_vae import MiniMaxH3AudioVAE  # here: built on diffusers' model classes, which the handler's import would load at startup
     filename = fl.locate_file(filename)
     with init_empty_weights(include_buffers=False):
         vae = MiniMaxH3AudioVAE()
@@ -368,4 +387,4 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
 
 
 __all__ = ["ADALN_CURVE_DIM", "AUDIO_VAE_FILE", "LATENT_UPSCALER_FILE", "LATENT_UPSCALER_FOLDER", "TEXT_ENCODER_FOLDER",
-           "VIDEO_VAE_FILE", "VIDEO_VAE_FP8MIX_FILE", "VIDEO_VAE_INT8_FILE", "VIDEO_VAE_LIGHT_FILE", "VIDEO_VAE_LIGHT_INT8_FILE", "model_factory", "probe_h3_checkpoint"]
+           "VIDEO_VAE_FILE", "VIDEO_VAE_FP8MIX_FILE", "VIDEO_VAE_INT8_FILE", "VIDEO_VAE_LIGHT_FILE", "VIDEO_VAE_LIGHT_INT8_FILE", "VIDEO_VAE_SOL_INT8_FILE", "model_factory", "probe_h3_checkpoint"]

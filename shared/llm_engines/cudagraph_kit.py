@@ -6,6 +6,8 @@ from typing import Callable, Iterable
 
 import torch
 
+from mmgp import cuda_graphs
+
 
 @dataclass
 class GraphKVIndexWriter:
@@ -47,7 +49,7 @@ class CUDAGraphRunner:
             if tensor.device.type != "cuda":
                 raise ValueError(f"[{self._name}] CUDAGraphRunner requires CUDA tensors.")
         self._static_inputs = [tensor.detach().clone() for tensor in inputs]
-        self._graph = torch.cuda.CUDAGraph()
+        self._graph = cuda_graphs.Graph()
         try:
             with torch.inference_mode():
                 with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):
@@ -200,6 +202,7 @@ class AutoRegressiveCudaGraphKit:
         self._runners.clear()
         for stage in self._stages.values():
             self._resident.__dict__.pop(stage.attribute, None)
+            stage.fn = None  # MMGP may keep the step function as a key (per-method caches): its caller's state must not stay reachable
         self._stages.clear()
         if self._state_registered:
             from mmgp import cuda_graphs

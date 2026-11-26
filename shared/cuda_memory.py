@@ -32,8 +32,8 @@ def compute_cache_folder(path):
 
 
 def mmgp_vram_allocator():
-    """The MMGP VRAM allocator runs: without the fragmentation the VAE tiling presets were made against, VAEs offer two levels,
-    Default (fast, about 2-3 GB of VRAM) and Low VRAM (Configuration > RAM/VRAM Management > VAE Tiling, values 0 and 3)."""
+    """The MMGP VRAM allocator runs: no fragmentation, and RAM spilling where chosen. VAE tiling then takes the largest tile within
+    its VRAM budget (shared.image_vae.tiling); without it (AMD GPUs, --vram-allocator default), one tile size smaller."""
     return VRAM_ALLOCATOR in ("vmm", "vmm_spill")
 
 
@@ -98,6 +98,8 @@ def _stress(argv, option):
 
 
 def apply_startup_settings(argv, config_filename):
+    from shared.kernels.triton_cache import purge_if_requested
+    purge_if_requested(_argv_value(argv, "--config") or ".")
     ram_stress_value, max_ram = _stress(argv, "--ram-stress"), _argv_value(argv, "--max-ram")
     max_vram, vram_stress_value = _argv_value(argv, "--max-vram"), _stress(argv, "--vram-stress")
     if max_vram is not None and vram_stress_value is not None:
@@ -132,6 +134,9 @@ def apply_startup_settings(argv, config_filename):
         _apply_compute_cache(argv, config_filename)
     if torch.version.hip is None and torch.cuda.is_available():
         _apply_cuda_settings(argv, config_filename, torch)
+    if torch.cuda.is_available():  # after the allocator and any emulated card: they apply to the probes' allocations
+        from shared.kernels import startup_probes
+        startup_probes.start()
     if (max_vram is not None or vram_stress_value is not None) and torch.cuda.is_available() and VRAM_ALLOCATOR not in ("vmm", "vmm_spill"):
         from mmgp import virtual_gpu
         virtual_gpu.limit_torch_allocator()

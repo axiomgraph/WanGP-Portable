@@ -3,7 +3,9 @@ import os
 import time
 import torch
 
-from ..layers.draft_chain import CompactDrafts
+from mmgp import cuda_graphs
+
+from .draft_sources import CompactDrafts
 
 _COMPACT = "compact_accept" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # the acceptance on the target's top-k support (compact_acceptance), until validated
 
@@ -26,7 +28,7 @@ def can_batch_acceptance(runner, seq):
 def capture_sampling_graph(runner, compute):
     """The sampling graphs are captured when a shape or rule first comes up, with the model already filling the VRAM, and replayed one at a time, their retained outputs
     read at once: they share one graph pool, as a pool holds whole 32 MiB chunks however little its graph needs (about 1.4 MiB each, up to 8 + 8 of them)."""
-    graph = torch.cuda.CUDAGraph()
+    graph = cuda_graphs.Graph(runner)
     with torch.cuda.graph(graph, pool=runner._sampling_graph_pool, capture_error_mode="thread_local"):
         result = compute()
     runner._sampling_graph_pool = graph.pool()
@@ -76,7 +78,8 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
         penalty = 1.  # inside code, quotes or backticks: copied text, not repetition (drafted tokens of the block are approximated as outside)
     exempt = seq.repetition_exempt_ids if penalty != 1 else None
     compact = isinstance(draft_distributions, CompactDrafts)
-    from . import compact_acceptance
+    if _COMPACT:  # Triton kernels
+        from . import compact_acceptance
     support = _COMPACT and seq.top_k != 1 and compact_acceptance.supported(seq, logits)
     key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
            tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)), compact, support)
@@ -96,14 +99,16 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
             if valid:
                 value.index_fill_(0, torch.tensor(valid, device=logits.device), True)
             return value
-        state = dict(logits=logits.clone(), drafts=draft_tokens.clone(),
-                     q=draft_distributions.chain.q[:n] if compact else torch.zeros((n, vocab), dtype=torch.float32, device=logits.device),
-                     length=torch.full((), n, dtype=torch.int64, device=logits.device),
-                     history=mask(()), bias=torch.zeros_like(logits[0]),
-                     suppressed=mask(rules["suppressed"]), thinking_stops=mask(rules["thinking_stops"]),
-                     thinking=torch.tensor(rules["thinking"], dtype=torch.int64, device=logits.device),
-                     stops=mask(stop_ids), uniforms=torch.ones(n, device=logits.device),
-                     noise=torch.ones(vocab, device=logits.device), exempt=None if exempt is None else mask(exempt))
+        from mmgp import allocator
+        with allocator.pool_allocations(self._state_pool):  # its fixed inputs with the sequence state: out of VRAM while the runtime is suspended
+            state = dict(logits=logits.clone(), drafts=draft_tokens.clone(),
+                         q=draft_distributions.chain.q[:n] if compact else torch.zeros((n, vocab), dtype=torch.float32, device=logits.device),
+                         length=torch.full((), n, dtype=torch.int64, device=logits.device),
+                         history=mask(()), bias=torch.zeros_like(logits[0]),
+                         suppressed=mask(rules["suppressed"]), thinking_stops=mask(rules["thinking_stops"]),
+                         thinking=torch.tensor(rules["thinking"], dtype=torch.int64, device=logits.device),
+                         stops=mask(stop_ids), uniforms=torch.ones(n, device=logits.device),
+                         noise=torch.ones(vocab, device=logits.device), exempt=None if exempt is None else mask(exempt))
         def compute():
             if support:
                 ids, probabilities, unsafe = compact_acceptance.target_probabilities(state["logits"], state["drafts"], state["history"], state["bias"], state["suppressed"], state["thinking_stops"],

@@ -38,11 +38,15 @@ QWEN38_27B_GGUF_REPO_SUBFOLDER = "Qwen3_8_27B_Uncensored"
 QWEN38_27B_TEXT_GGUF_FILENAME = "Qwen3.8-27B-Uncensored-Q4_K_M.gguf"
 QWEN38_27B_TEXT_GGUF_Q3_FILENAME = "Qwen3.8-27B-Uncensored-noMTP-IQ3_S.gguf"
 QWEN38_27B_TEXT_GGUF_Q2_FILENAME = "Qwen3.8-27B-Uncensored-IQ2_M.gguf"
-QWEN38_27B_TEXT_GGUF_PTQ1_FILENAME = "Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf"
+QWEN38_27B_TEXT_GGUF_PTQ1_FILENAME = "Ternary-Bonsai-2-27B-Abliterated-v2-PTQ1_0.gguf"  # BoldingBuilds v2: v1's refusal edit, and a </think> row that ends the reasoning
+QWEN38_27B_TEXT_GGUF_PTQ1_V1_FILENAME = "Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf"  # v1, until 11-24: it often wrote its answer inside its reasoning
 QWEN38_27B_MTP_GGUF_FILENAME = "Qwen3.8-27B-Uncensored-MTP-Q4_K_M.gguf"
 QWEN38_9B_TEXT_GGUF_FILENAME = "Qwen3.8-9B-Uncensored-Heretic-Q4_K_M.gguf"
 QWEN38_9B_TEXT_GGUF_Q8_FILENAME = "Qwen3.8-9B-Uncensored-Heretic-Q8_0.gguf"
 BONSAI2_27B_MTP_GGUF_FILENAME = "Ternary-Bonsai-2-27B-MTP-Q8_0.gguf"
+BONSAI25_27B_TEXT_GGUF_FILENAME = "Ternary-Bonsai-2.5-27B-PTQ1_0.gguf"  # the publisher's file, unchanged
+BONSAI25_27B_MTP_GGUF_FILENAME = "Ternary-Bonsai-2.5-27B-MTP-Q4_0.gguf"  # the publisher's own MTP head (blk.64 of its -mtp GGUF)
+BONSAI25_27B_REFUSAL_FILENAME = "Ternary-Bonsai-2.5-27B-Uncensored-direction.safetensors"  # the refusal direction projected out at run time
 QWEN38_27B_VISION_FILENAME = "Qwen3.8-27B-Uncensored-vision-f16.gguf"
 QWEN38_VARIANT_FLASH_NEXT = "flash_next"
 QWEN38_FLASH_NEXT_FOLDER = "Qwen3_8_Flash_Next"
@@ -50,6 +54,12 @@ QWEN38_FLASH_NEXT_TEXT_FILENAME = "Qwen3.8-Flash-Next-Uncensored-q8g-main-IQ3_S.
 QWEN38_FLASH_NEXT_NGRAM_FILENAME = "Qwen3.8-Flash-Next-ngram-table-IQ4_NL.gguf"
 QWEN38_FLASH_NEXT_VISION_FILENAME = "Qwen3.8-Flash-Next-vision-BF16.gguf"
 QWEN38_FLASH_NEXT_MTP_FILENAME = "Qwen3.8-Flash-Next-drafter-MTP-Q2_0.safetensors"
+INKLING2_VARIANT_MINI = "inkling2_mini"
+INKLING2_REPO = "DeepBeepMeep/Inkling_2"
+INKLING2_MINI_FOLDER = "Inkling_2_Mini"
+INKLING2_MINI_TEXT_FILENAME = "Inkling-2-Mini-Uncensored-NVFP4.safetensors"  # the language model: BF16 dense weights, NVFP4 / MXFP8 experts
+INKLING2_MINI_VISION_FILENAME = "Inkling-2-Mini-vision-BF16.safetensors"  # the vision tower (model.visual.*), shared by every quantization of the language model
+INKLING2_MINI_DRAFTER_FILENAME = "Inkling-2-Mini-drafter-DSpark-BF16.safetensors"  # the DSpark block drafter
 QWEN35_VARIANT_SPECS = {
     QWEN35_VARIANT_9B: {
         "display_name": "Qwen3.5-9B Abliterated",
@@ -159,6 +169,9 @@ QWEN35_VARIANT_SPECS = {
         "text_gguf_ptq1_filename": QWEN38_27B_TEXT_GGUF_PTQ1_FILENAME,
         "text_gguf_q3_mtp_filename": QWEN38_27B_MTP_GGUF_FILENAME,
         "text_gguf_ptq1_mtp_filename": BONSAI2_27B_MTP_GGUF_FILENAME,
+        "text_gguf_ptq1_25_filename": BONSAI25_27B_TEXT_GGUF_FILENAME,
+        "text_gguf_ptq1_25_mtp_filename": BONSAI25_27B_MTP_GGUF_FILENAME,
+        "quantization_extra_files": {"gguf_ptq1_25": [BONSAI25_27B_REFUSAL_FILENAME]},
         "vision_filename": QWEN38_27B_VISION_FILENAME,
         "backend": "gguf",
         "supports_mtp": True,
@@ -210,17 +223,57 @@ QWEN35_VARIANT_SPECS = {
         "embedding_budget": 2500,
         "llm_budget": 18000,
     },
+    INKLING2_VARIANT_MINI: {
+        # 24 looped blocks of routed experts
+        "display_name": "Inkling 2 Mini",
+        "architecture": "inkling2",
+        "assets_dir_name": INKLING2_MINI_FOLDER,
+        "root_repo": INKLING2_REPO,
+        "repo_subfolder": INKLING2_MINI_FOLDER,
+        "root_files": [
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "processor_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ],
+        "text_repo": None,
+        "text_required_files": [],
+        "gguf_repo": INKLING2_REPO,
+        "text_safetensors_filename": INKLING2_MINI_TEXT_FILENAME,
+        "text_mtp_filename": INKLING2_MINI_DRAFTER_FILENAME,  # the key every model declares its drafter file with
+        "vision_filename": INKLING2_MINI_VISION_FILENAME,
+        "backend": "safetensors",
+        "supports_mtp": True,
+        "tie_word_embeddings": False,
+        "llm_budget": 18000,
+    },
 }
 
 
 QWEN_CHECKPOINTS = {
     "quanto_int8": ("text_int8_filename", "Quanto INT8"),
+    "safetensors": ("text_safetensors_filename", "NVFP4"),
     "gguf": ("text_gguf_filename", "GGUF Q4_K_M"),
     "gguf_q8": ("text_gguf_q8_filename", "GGUF Q8_0"),
     "gguf_q3": ("text_gguf_q3_filename", "GGUF IQ3_S"),
     "gguf_q2": ("text_gguf_q2_filename", "GGUF IQ2_M"),
     "gguf_ptq1": ("text_gguf_ptq1_filename", "GGUF PTQ1_0"),
+    "gguf_ptq1_25": ("text_gguf_ptq1_25_filename", "GGUF PTQ1_0"),
 }
+BONSAI_MODELS = {"gguf_ptq1": "Bonsai 2.0 27B", "gguf_ptq1_25": "Bonsai 2.5 27B"}  # the Bonsai checkpoints of Qwen3.8 27B, by quantization
+
+
+def qwen_draft_key(backend):
+    """The spec key of a checkpoint's MTP drafter file."""
+    return {"gguf_q3": "text_gguf_q3_mtp_filename", "gguf_ptq1": "text_gguf_ptq1_mtp_filename", "gguf_ptq1_25": "text_gguf_ptq1_25_mtp_filename"}.get(backend, "text_mtp_filename")
+
+
+def qwen_extra_files(spec, backend):
+    """The files a checkpoint reads beside its weights: the model's own, then those of this quantization."""
+    return [*spec.get("text_gguf_extra_files", ()), *spec.get("quantization_extra_files", {}).get(backend, ())]
 
 
 def _files(repo, folder, names, target=None):
@@ -234,22 +287,22 @@ def qwen_download_defs(spec, backend, speculative_decoding=False):
     folder = spec.get("repo_subfolder", "")
     shared_files = list(spec["root_files"])
     gguf = backend.startswith("gguf")
-    key = QWEN_CHECKPOINTS[backend][0] if gguf else "text_int8_filename"
+    key = QWEN_CHECKPOINTS[backend][0]
     filename = spec[key]
     checkpoint_folder = spec.get("gguf_repo_subfolder", folder) if gguf else folder
-    draft_key = {"gguf_q3": "text_gguf_q3_mtp_filename", "gguf_ptq1": "text_gguf_ptq1_mtp_filename"}.get(backend, "text_mtp_filename")
+    draft_key = qwen_draft_key(backend)
     draft = [spec[draft_key]] if speculative_decoding and draft_key in spec else []
     defs = []
     if spec["root_repo"] == spec["gguf_repo"]:
         if checkpoint_folder != folder:
-            defs.append(_files(spec["gguf_repo"], checkpoint_folder, [filename], spec["assets_dir_name"]))
+            defs.append(_files(spec["gguf_repo"], checkpoint_folder, [filename]))
         shared_files.append(spec["vision_filename"])
         if checkpoint_folder == folder:
             shared_files.append(filename)
         shared_files.extend(draft)
     defs.append(_files(spec["root_repo"], folder, shared_files, None if folder else spec["assets_dir_name"]))
     if spec["root_repo"] != spec["gguf_repo"]:
-        defs.append(_files(spec["gguf_repo"], checkpoint_folder, [spec["vision_filename"], filename, *spec.get("text_gguf_extra_files", ()), *draft]))
+        defs.append(_files(spec["gguf_repo"], checkpoint_folder, [spec["vision_filename"], filename, *qwen_extra_files(spec, backend), *draft]))
     if spec.get("text_required_files"):
         defs.append(_files(spec["text_repo"], folder, spec["text_required_files"]))
     return defs
@@ -267,7 +320,6 @@ def checkpoint_inventory():
 
     for number, label in [(1, "Llama 3.2 3B"), (2, "Llama Joy 8B")]:
         yield {"name": "Florence 2", "variant": label, "download_defs": [florence_llama_download_def(number)]}
-    bonsai = "Bonsai 2 27B"
     for spec in QWEN35_VARIANT_SPECS.values():
         for backend, (key, label) in QWEN_CHECKPOINTS.items():
             if key in spec:
@@ -278,16 +330,16 @@ def checkpoint_inventory():
                     source = definition["sourceFolderList"][0]
                     target = definition.get("targetFolderList", [""])[0]
                     for filename in definition["fileList"][0]:
-                        if filename in (spec[key], spec["vision_filename"]):
+                        if filename in (spec[key], spec.get("vision_filename")):
                             path = "/".join(part for part in (target, source, filename) if part)
                             aliases[path] = [filename, f"{spec['assets_dir_name']}/{filename}"]
-                model = bonsai if backend == "gguf_ptq1" else spec["display_name"]
+                model = BONSAI_MODELS.get(backend, spec["display_name"])
                 yield {"name": model, "variant": label, "download_defs": defs, "alternate_paths": aliases}
-        for key, model, label in [("text_mtp_filename", spec["display_name"], "MTP"), ("text_gguf_q3_mtp_filename", spec["display_name"], "Q3 MTP"), ("text_gguf_ptq1_mtp_filename", bonsai, "MTP")]:
+        for key, model, label in [("text_mtp_filename", spec["display_name"], "MTP"), ("text_gguf_q3_mtp_filename", spec["display_name"], "Q3 MTP"), ("text_gguf_ptq1_mtp_filename", BONSAI_MODELS["gguf_ptq1"], "MTP"), ("text_gguf_ptq1_25_mtp_filename", BONSAI_MODELS["gguf_ptq1_25"], "MTP")]:
             if key in spec:
                 yield {"name": model, "variant": label, "download_defs": [_files(spec["gguf_repo"], spec["assets_dir_name"], [spec[key]])]}
     for name, spec in BLOCK_DRAFT_ASSETS.items():
-        model = bonsai if name.endswith("_bonsai") else QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["display_name"]
+        model = BONSAI_MODELS["gguf_ptq1"] if name.endswith("_bonsai") else QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["display_name"]
         method = BLOCK_DRAFT_LABELS[name.removesuffix("_bonsai")]
         yield {"name": model, "variant": f"{method} Draft", "download_defs": [draft_download_def(spec)]}
 
@@ -300,6 +352,17 @@ def checkpoint_inventory():
             installed = [path for path in paths if installed_copies(path)]
             if installed:
                 yield {"name": spec["display_name"], "variant": label, "files": installed}
+    # Bonsai 2.0 Abliterated v1, replaced by v2 on 11-24
+    spec = QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]
+    installed = [path for path in (f"{spec['assets_dir_name']}/{QWEN38_27B_TEXT_GGUF_PTQ1_V1_FILENAME}", QWEN38_27B_TEXT_GGUF_PTQ1_V1_FILENAME) if installed_copies(path)]
+    if installed:
+        yield {"name": BONSAI_MODELS["gguf_ptq1"], "variant": "GGUF PTQ1_0 v1 (earlier release)", "files": installed}
+    # Qwen3.8-9B GGUFs downloaded before 11-23 went one folder too deep, where Deepy never read them
+    spec = QWEN35_VARIANT_SPECS[QWEN38_VARIANT_9B]
+    for key, label in [("text_gguf_filename", "GGUF Q4_K_M (earlier location)"), ("text_gguf_q8_filename", "GGUF Q8_0 (earlier location)")]:
+        installed = installed_copies(f"{spec['assets_dir_name']}/{spec['gguf_repo_subfolder']}/{spec[key]}")
+        if installed:
+            yield {"name": spec["display_name"], "variant": label, "files": installed}
 
 
 def query_prompt_enhancer_download_defs() -> list[dict[str, Any]]:

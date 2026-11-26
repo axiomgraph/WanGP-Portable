@@ -1,6 +1,8 @@
 """Parallel drafters using the established target verification/rejection sampler."""
 import torch
 
+from mmgp import cuda_graphs
+
 from .model_runner import ModelRunner
 from ..utils.context import reset_context, set_context
 
@@ -26,7 +28,9 @@ class BlockDraftRunner(ModelRunner):
                 end = min(count, start + chunk)
                 seq.token_ids, seq.num_tokens, seq.num_cached_tokens = tokens[:end], end, start
                 ids, positions, embeds = self.prepare_prefill([seq])
-                hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
+                hidden = self._prompt_graph_pass(ids, embeds)  # (a short pass replayed as a graph, or None)
+                if hidden is None:
+                    hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
                 keep = end - start - int(end == count)
                 self.model.mtp.append_context(self.model._draft_features[:, :keep], positions[..., :keep])
                 reset_context()
@@ -46,7 +50,9 @@ class BlockDraftRunner(ModelRunner):
         if pending is not None:
             self.model.mtp.append_context(pending["features"], pending["positions"])
         ids, positions, embeds = self.prepare_prefill([seq])
-        hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
+        hidden = self._prompt_graph_pass(ids, embeds)  # (a short pass replayed as a graph, or None)
+        if hidden is None:
+            hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
         self.model.mtp.append_context(self.model._draft_features[:, :-1], positions[..., :-1])
         self._store_speculative_pending(seq, self.model.compute_logits(hidden)[0], hidden, positions)
         seq.clear_prompt_data()
@@ -68,6 +74,7 @@ class BlockDraftRunner(ModelRunner):
     def _build_mtp_drafts(self, seq, sample_params, draft_count, start_position, profile=None):
         drafter = self.model.mtp
         self._window_lookup, self._window_confidences = 0, ()  # the window statistics of the native chain: no repeated-text lookup, no per-draft confidences
+        self._draft_confidences = None  # the GPU chain's probabilities of its drafts, when the drafter asks for them (ConfidentDrafts)
         hidden, unary = drafter.propose(seq.last_token, start_position, self.model.token_embd, self.model.output)
         if drafter.method == "dflash2":
             return self._build_dflash_drafts(seq, sample_params, draft_count, hidden, unary, profile)
@@ -83,8 +90,9 @@ class BlockDraftRunner(ModelRunner):
         previous = seq.last_token
         penalty = 1.0 if sample_params[-1] is None else float(sample_params[-1][0].item())
         confidence_threshold = float(self.model._prompt_enhancer_speculative_confidence)
+        state = None
         for index in range(draft_count):
-            logits, confidence = drafter.proposal_logits(hidden[index], unary[index], previous)
+            logits, confidence, state = drafter.proposal_step(index, hidden[index], unary[index], previous, state)
             # Confidence scheduling only shortens a proposed block; verification
             # always applies the target distribution and existing rejection rule.
             if confidence is not None and index > 0 and confidence_threshold > 0 and confidence.item() < confidence_threshold:
@@ -100,17 +108,18 @@ class BlockDraftRunner(ModelRunner):
             previous = token
         return tokens, drafter.get_cache_length(), distributions
 
-    def _dspark_gpu_chain(self, seq, hidden, unary, anchor, bias, noise, threshold):
+    def _dspark_gpu_chain(self, seq, hidden, unary, anchor, bias, noise, threshold, confident=False):
         from .dflash_sampling import target_probabilities
-        tokens, probabilities, valid_prefix = [], [], []
+        tokens, probabilities, valid_prefix, confidences = [], [], [], []
         previous = anchor
         active = torch.ones((), dtype=torch.bool, device=hidden.device)
         top_k = None if seq.top_k is None else min(seq.top_k, unary.shape[-1])
+        state = None  # of a recurrent head (Inkling 2), carried along the chain
         for index in range(noise.shape[0]):
-            scores, confidence = self.model.mtp.proposal_logits(hidden[index], unary[index], previous)
+            scores, confidence, state = self.model.mtp.proposal_step(index, hidden[index], unary[index], previous, state)
             scores = scores + bias
             valid = torch.isfinite(scores).any()
-            if index and threshold > 0:
+            if index and threshold > 0 and confidence is not None:
                 # Match the reference confidence.item() comparison with a Python
                 # float, including thresholds just above a representable score.
                 valid = valid & (confidence.double().reshape(()) >= threshold)
@@ -123,15 +132,19 @@ class BlockDraftRunner(ModelRunner):
                 probabilities.append(probs)
             else:
                 previous = scores.argmax()  # lowest token ID among ties, as the reference argmax
+            if confident:  # the drafted token's probability under the head at the run's temperature (ConfidentDrafts' bins)
+                scaled = scores.float() / (seq.temperature if seq.top_k != 1 and seq.temperature else 1.0)
+                confidences.append(torch.exp(scaled.gather(0, previous.reshape(1))[0] - torch.logsumexp(scaled, 0)))
             tokens.append(previous)
-        return torch.stack(tokens), probabilities, torch.stack(valid_prefix).sum()
+        return torch.stack(tokens), probabilities, torch.stack(valid_prefix).sum(), torch.stack(confidences) if confident else None
 
     def _build_dspark_gpu_chain(self, seq, draft_count, hidden, unary):
         # One graph for the dependent Markov chain. Confidence exits shorten the
         # valid prefix instead of synchronizing after every draft; inactive
         # suffix drafts are discarded before acceptance.
         threshold = float(self.model._prompt_enhancer_speculative_confidence)
-        key = (draft_count, threshold, seq.top_k, seq.top_p, seq.min_p, seq.temperature)
+        confident = bool(getattr(self.model.mtp, "confident_drafts", False))
+        key = (draft_count, threshold, seq.top_k, seq.top_p, seq.min_p, seq.temperature, confident)
         graphs = getattr(self, "_dspark_sampling_graphs", None)
         if graphs is None:
             graphs = self._dspark_sampling_graphs = {}
@@ -146,20 +159,24 @@ class BlockDraftRunner(ModelRunner):
         if state is None:
             if len(graphs) >= 8:
                 graphs.pop(next(iter(graphs)))
-            inputs = hidden[:draft_count].clone()
-            logits = unary[:draft_count].clone()
-            anchor = torch.tensor(seq.last_token, dtype=torch.long, device=hidden.device)
-            fixed_bias = torch.zeros_like(unary[0])
+            from mmgp import allocator
+            with allocator.pool_allocations(self._state_pool):  # the chain's inputs go with the sequence state: out of VRAM while the runtime is suspended
+                inputs = hidden[:draft_count].clone()
+                logits = unary[:draft_count].clone()
+                anchor = torch.tensor(seq.last_token, dtype=torch.long, device=hidden.device)
+                fixed_bias = torch.zeros_like(unary[0])
+                noise = torch.ones((draft_count, unary.shape[-1]), dtype=torch.float32, device=hidden.device)
             if bias is not None:
                 fixed_bias.copy_(bias.reshape(-1))
-            noise = torch.ones((draft_count, unary.shape[-1]), dtype=torch.float32, device=hidden.device)
-            self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-                tokens, probabilities, length = self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
-            state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
+            self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold, confident)
+            graph = cuda_graphs.Graph(self)
+            if getattr(self, "_dspark_chain_pool", None) is None:
+                self._dspark_chain_pool = torch.cuda.graph_pool_handle()  # one pool for the chains of every draft count: they never run together
+            with torch.cuda.graph(graph, pool=self._dspark_chain_pool, capture_error_mode="thread_local"):
+                tokens, probabilities, length, confidences = self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold, confident)
+            state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length, confidences)
             graphs[key] = state
-        graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length = state
+        graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length, confidences = state
         inputs.copy_(hidden[:draft_count])
         logits.copy_(unary[:draft_count])
         anchor.fill_(seq.last_token)
@@ -167,7 +184,7 @@ class BlockDraftRunner(ModelRunner):
         if seq.top_k != 1:
             noise.exponential_(1, generator=self._sampling_generator).clamp_min_(1e-10)
         graph.replay()
-        self._draft_valid_length = length
+        self._draft_valid_length, self._draft_confidences = length, confidences
         return tokens, self.model.mtp.get_cache_length(), probabilities if seq.top_k != 1 else None
 
     def _compact_draft_distribution(self, seq, scores, temperature):
@@ -271,7 +288,7 @@ class BlockDraftRunner(ModelRunner):
                 fixed_bias.copy_(bias.reshape(-1))
             noise = torch.ones((draft_count, self.model.mtp.candidate_selector.top_k), dtype=torch.float32, device=hidden.device)
             self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
             state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
@@ -363,7 +380,7 @@ class BlockDraftRunner(ModelRunner):
                 fixed_bias.copy_(bias.reshape(-1))
             noise = torch.ones((draft_count, candidates.shape[1]), dtype=torch.float32, device=table.device)
             self._dspine_gpu_chain(seq, inputs, ids, fixed_bias, noise)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dspine_gpu_chain(seq, inputs, ids, fixed_bias, noise)
             state = (graph, inputs, ids, fixed_bias, noise, tokens, probabilities, length)
@@ -530,5 +547,6 @@ class BlockDraftRunner(ModelRunner):
         self._tree_graph_vars = None
         self._tree_commit_graphs = None
         self._dspark_sampling_graphs = {}
+        self._dspark_chain_pool = None  # its pool goes with its graphs (PyTorch's allocator frees it with the last one)
         self._draft_valid_length = None
         self.model._draft_features = None

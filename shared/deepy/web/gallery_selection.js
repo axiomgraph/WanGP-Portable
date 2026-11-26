@@ -5,7 +5,18 @@
     const value = document.querySelector('#wangp-gallery-view textarea')?.value;
     return value ? JSON.parse(value) : null;
   }
-  let sequence = 0, pendingView = null, acceptedView = null, viewing = null;
+  let sequence = 0, pendingView = null, acceptedView = null, viewing = null, repairedView = null;
+  // True when the gallery shows other files than the view its clicks resolve through
+  // (a gallery value written by another response than the view refresh). Thumbnails are compared by
+  // the listed file's name (data-wangp-name), not by their URL: Gradio's cache copy strips characters
+  // such as brackets from file names and fast video previews are served under another name.
+  function stale(state = view()) {
+    if (!state || !document.querySelector('#gallery')) return false;
+    const thumb = document.querySelector('#gallery .thumbnail-item');
+    const names = thumb ? [...thumb.parentElement.querySelectorAll('.thumbnail-item')].map(node => node.dataset.wangpName) : [];
+    if (names.some(name => !name)) return false;
+    return names.length !== state.video.length || names.some((name, index) => name !== state.video[index].split(/[\\/]/).pop());
+  }
   // `index`: position in the whole gallery `source`.
   function request(state, source, index, path) {
     pendingView = state;
@@ -16,6 +27,16 @@
     if (!state) return;
     const paths = state[source];
     if (index !== null && (index < 0 || index >= paths.length)) return;
+    if (source === 'video' && index !== null && stale(state)) {
+      // The clicked thumbnail is not view.video[index]: render the gallery again rather than select
+      // another file. Once per view, so that an unforeseen difference never blocks selection.
+      const value = document.querySelector('#wangp-gallery-view textarea').value;
+      if (value !== repairedView && window.__wangpAssistantChatNS?.repairGallery) {
+        repairedView = value;
+        window.__wangpAssistantChatNS.repairGallery();
+        return;
+      }
+    }
     request(state, source, index === null ? null : index + state[source + '_offset'], index === null ? null : paths[index]);
   }
   function selectedSource() {
@@ -58,6 +79,7 @@
     return sources[(index + step + sources.length) % sources.length].id;
   }
   window.WanGPGallerySelection = {
+    stale: () => stale(),
     // A strip gallery thumbnail click: index in the visible window of gallery `source`.
     select: (source, index) => {const state = view(); if (state) select(source, Number(index) - state[source + '_offset']);},
     acceptView(value) {

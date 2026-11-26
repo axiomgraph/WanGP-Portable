@@ -3,6 +3,7 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import functools
 import gc
+import importlib.util
 import os
 import time
 import math
@@ -13,12 +14,10 @@ from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
 from . import chain_verdicts
-from .draft_sources import SuffixDrafter, WindowCosts
+from .draft_sources import CompactDrafts, ConfidentDrafts, DeviceDrafts, MeasuredDrafts, SuffixDrafter, WindowCosts
 from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
-from ..layers import draft_chain
-from ..layers.draft_chain import CompactDrafts, DeviceDrafts
 from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_min_p_mask_, apply_sparse_repetition_penalty_
-from ..utils.context import set_context, get_context, reset_context
+from ..utils.context import set_context, get_context, reset_context, use_context
 
 _OUTPUT_STAGE = "output_stage" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the logits of a window in a graph, until the switches are removed
 _DRAFT = "draft" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafter of models with routed experts as MMGP stages (decoding A/B: specs/QWEN38_FLASH_NEXT_STRATA_DRAFT.md)
@@ -26,6 +25,7 @@ _SUFFIX = "suffix" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # drafts f
 _FIRST_ALWAYS = "firstdraft" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # measuring only: the first draft always goes out, another while the one before was sure
 _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafts of a window read from mapped RAM, the switch goes with the others at the end
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
+_TRITON = importlib.util.find_spec("triton") is not None  # its kernels (sampling, draft chains, the single decode's context) are optional
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
 _GPU_CHAIN = "gpu_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # a sampled window's drafts drawn on the GPU in one graph, no host wait per draft: MTP-4 on Deepy's prose 17.1 -> 16.75 ms per pass
 _LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B Q4_K_M on Deepy's tool calls: 4.6 -> 5.8 tokens per pass, 12% faster)
@@ -62,6 +62,9 @@ def long_chain_rate(usual: int, long: int, cost_ratio: float) -> float:
 _DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
+
+_PROMPT_GRAPH_MIN_SIZE = 0  # (a comparison: the smallest padded size a prompt pass may take, to measure what more padding changes)
+_PROMPT_GRAPHS = "prompt_graphs" not in os.environ.get("WGP_LMGP_DISABLE", "").split(",")  # short prompt passes of the models that offer it padded and replayed as MMGP graphs (lm_engine_prompt_graph_rows)
 
 class _DraftStage:
     """A pass of a drafter as an MMGP stage, under the replay() of the graphs it stands for."""
@@ -136,6 +139,21 @@ def _advance_spans(span: tuple[bool, bool, bool], text: str) -> tuple[bool, bool
     return fence, inline, quote
 
 
+_HELD_STATE = ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales")  # the runtime buffers suspend_runtime gives back
+
+
+def _held_zeros(shape, dtype, device):
+    """A runtime buffer of zeros on an MMGP held buffer, whose VRAM suspend_runtime gives back with its addresses kept (a plain tensor without
+    the VMM allocator)."""
+    from mmgp import allocator
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    with torch.inference_mode(False):  # also written outside inference mode (an assistant's runner thread)
+        buffer = allocator.held_empty(nbytes, device) if nbytes and torch.device(device).type == "cuda" else None
+    if buffer is None:
+        return torch.zeros(shape, device=device, dtype=dtype)
+    return buffer.view(dtype).view(shape).zero_()
+
+
 class ModelRunner:
 
     _MAX_SPECULATIVE_DRAFT_TOKENS = 8
@@ -148,7 +166,7 @@ class ModelRunner:
         
         self.config = config
         hf_config = config.hf_config
-        self.use_triton_sampling = not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False))
+        self.use_triton_sampling = _TRITON and not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False))
         self.block_size = config.kvcache_block_size
         self.kv_layout = kvf.layout_of(config)  # None: BF16 cache; otherwise the body formats and exact overlays
         self.enforce_eager = config.enforce_eager
@@ -183,6 +201,11 @@ class ModelRunner:
         self.dtype = config_dtype  # Save for later use
         self._runtime_ready = False
         self._runtime_initializing = False
+        self._suspended = False  # suspend_runtime: its held buffers and graph pools gave their VRAM back, resumed by ensure_runtime_ready
+        self.rebuilt = 0  # executables of its graphs made again from their templates (mmgp.cuda_graphs.Graph)
+        self._state_pool = None  # the pool of the models' sequence state (recurrent states, drafter cache), suspended with its contents in RAM
+        self._saved_state = []  # while suspended: (storage on the GPU, its contents in RAM)
+        self._saved_graph_pools = []  # while suspended: the graph pools cuda_graphs.suspend_graph_pools suspended, with their contents
         self._graph_cache = {}
         self._graph_cache_order = []
         self._logits_bias_cache = {}
@@ -224,6 +247,7 @@ class ModelRunner:
             model_object._mm_graph_placement_key = True
         self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2)), self._long_chain_tokens()))
         self.speculative_stats = self._new_speculative_stats()
+        self._window_counts = [0, 0, 0]  # since the last report (suspend_runtime): decoding passes, those that verified drafts, tokens they gave
         self.sampler = Sampler()
         
         # Pre-allocate buffers for sampling (optimization: avoid repeated tensor creation)
@@ -235,6 +259,8 @@ class ModelRunner:
 
 
     def ensure_runtime_ready(self):
+        if self._suspended:
+            self._resume_runtime()
         if self.mmgp_graphs:
             from mmgp import runtime
             runtime.ensure_loaded(self.model)  # the base block's addresses are those the engine's graphs capture
@@ -260,7 +286,11 @@ class ModelRunner:
         self._runtime_initializing = True
         try:
             self.allocate_kv_cache()
-            self._prepare_model_sequence_state()
+            from mmgp import allocator
+            if self._state_pool is None and allocator.active == "vmm":
+                self._state_pool = torch.cuda.graph_pool_handle()
+            with allocator.pool_allocations(self._state_pool):  # suspend_runtime gives this state's VRAM back, its contents saved
+                self._prepare_model_sequence_state()
             if not self.enforce_eager:
                 self.capture_cudagraph()
             self._register_graph_state()
@@ -272,6 +302,67 @@ class ModelRunner:
         finally:
             self._runtime_initializing = False
 
+    def _held_state(self):
+        return [tensor for tensor in (getattr(self, name, None) for name in _HELD_STATE) if tensor is not None]
+
+    def suspend_runtime(self):
+        """The runtime stays prepared and gives its VRAM back, its addresses kept, so that its graphs replay once it resumes
+        (ensure_runtime_ready) instead of being captured again: its KV cache (held buffers, contents lost: the sequences go), the models'
+        sequence state (its pool, contents copied to RAM and back) and the pools of its own graphs (cuda_graphs.suspend_graph_pools: the
+        contents of their live allocations, such as the state the MTP drafter keeps between replays, copied to RAM and back). Without the MMGP
+        VRAM allocator, it is reset."""
+        if not self._runtime_ready or self._suspended:
+            return
+        from mmgp import allocator
+        held = self._held_state()
+        if allocator.active != "vmm" or not all(allocator.held_mapped(tensor) for tensor in held):
+            self.reset_runtime_state()
+            return
+        torch.cuda.synchronize()
+        for tensor in held:
+            allocator.suspend_held(tensor)
+        if self._state_pool is not None:
+            self._saved_state = allocator.save_pool(self._state_pool)
+            if not allocator.suspend_pool(self._state_pool):  # it keeps its VRAM, and its contents
+                self._saved_state = []
+        self._saved_graph_pools = cuda_graphs.suspend_graph_pools(self)
+        self._suspended = True
+        cuda_graphs.owners_changed()  # its graphs idle: their executables give their VRAM to the next graphs made
+        self._report(f"suspended: its graphs kept ({self.rebuilt} rebuilt from their templates since it resumed), its KV cache and state out of VRAM")
+        passes, drafted, tokens = self._window_counts
+        self._window_counts = [0, 0, 0]
+        from mmgp import runtime
+        if passes and runtime.verbose_level(self.model) >= 1:  # what the drafts gave since the model was loaded, at each unload
+            from tqdm import tqdm
+            tqdm.write(f"[LM Engine] Speculative decoding since the model was loaded: {passes:,} passes, {100 * drafted / passes:.0f} % of them with drafts, {tokens / passes:.2f} tokens per pass.")
+        self.rebuilt = 0
+
+    def _resume_runtime(self):
+        from mmgp import allocator
+        self._suspended = False
+        held = self._held_state()
+        saved, self._saved_state = self._saved_state, []
+        graph_pools, self._saved_graph_pools = self._saved_graph_pools, []
+        if (not all(allocator.resume_held(tensor) for tensor in held) or self._state_pool is not None and not allocator.resume_pool(self._state_pool)
+                or not cuda_graphs.resume_graph_pools(graph_pools)):
+            self._note_guard("runtime_resume_no_room", "VRAM had no room for the suspended runtime: prepared again, graphs captured again")
+            self.reset_runtime_state()
+            return
+        for tensor in held:  # zeros, as at their allocation (the attention reads the unwritten slots of a sequence's last page)
+            tensor.zero_()
+        allocator.restore_pool(saved)
+        self._report("resumed: its graphs replay without a capture")
+
+    def _report(self, text):
+        from mmgp import runtime
+        if runtime.verbose_level(self.model) >= 2:
+            from tqdm import tqdm
+            tqdm.write(f"[LM Engine] Runtime {text}.")
+
+    @property
+    def graphs_idle(self):
+        return self._suspended
+
     def _register_graph_state(self):
         """MMGP mode: the CUDA tensors the target model's graphs read besides weights and arguments (KV pages, recurrent and speculative
         states, the context buffers of the decoding passes), read in place at their fixed addresses until the runtime is reset."""
@@ -279,7 +370,8 @@ class ModelRunner:
             return
         from mmgp import cuda_graphs
         tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales", "kv_index_pool")]
-        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values(), getattr(self, "_tree_graph_vars", None) or {}):
+        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values(), getattr(self, "_tree_graph_vars", None) or {},
+                           *(getattr(self, "prompt_graph_vars", None) or {}).values()):
             tensors.extend(graph_vars.values())
         if isinstance(getattr(self, "mtp_graph", None), _DraftStage):
             for graph_vars in (self.mtp_graph_vars, *self.mtp_refresh_graphs.values()):
@@ -289,6 +381,60 @@ class ModelRunner:
                 if name not in ("_parameters", "_buffers", "_modules", "_hf_hook") and not name.startswith("_mm_"):  # MMGP's own records hold the weights
                     tensors.extend(_state_tensors(value))
         cuda_graphs.register_state(self.model, "lmgp", tensors)
+
+    def _prompt_graph_pass(self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None) -> torch.Tensor | None:
+        """MMGP mode: a short prompt pass of a model with prompt graphs (lm_engine_prompt_graph_rows) padded to the smallest of its sizes and replayed as an MMGP graph, recorded at
+        its first use: the hidden states of its real rows [1, rows, hidden]; None where it runs eagerly (another model, embeddings, a pass longer than the largest size, the model
+        not ready: experts out of VRAM). The padded rows write nothing: their KV slots are -1 and the model's rings take the real rows only (real)."""
+        buckets = getattr(self, "prompt_graph_vars", None)
+        stats = self.__dict__.setdefault("prompt_graph_stats", {})  # why each prompt pass ran as it did (diagnostics)
+        if not buckets or inputs_embeds is not None or input_ids is None:
+            stats["no buckets or embeddings"] = stats.get("no buckets or embeddings", 0) + 1
+            return None
+        rows = input_ids.numel()
+        size = next((size for size in sorted(buckets) if size >= rows and size >= _PROMPT_GRAPH_MIN_SIZE), None)
+        context = get_context()
+        if size is None or context.block_tables is None or context.cu_seqlens_q is None or context.cu_seqlens_q.numel() != 2:
+            stats["size or context"] = stats.get("size or context", 0) + 1
+            return None
+        from mmgp import runtime
+        if not runtime.weights_resident(self.model) or not self.model.lm_engine_prompt_graph_ready():
+            stats["not resident"] = stats.get("not resident", 0) + 1
+            return None
+        with cuda_graphs.scope(gated=False):
+            ready = cuda_graphs.is_enabled(self.model)
+        if not ready:  # no graph manager now (released, being rebuilt): run() would run the pass eagerly in its scope, where the blocks capture their own graphs
+            stats["graphs off"] = stats.get("graphs off", 0) + 1
+            return None
+        stats[size] = stats.get(size, 0) + 1
+        graph_vars = buckets[size]
+        graph_vars["input_ids"][:rows].copy_(input_ids.reshape(-1))
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:rows].copy_(context.slot_mapping)
+        graph_vars["overlay_mapping"].fill_(-1)
+        if context.overlay_mapping is not None:
+            graph_vars["overlay_mapping"][:rows].copy_(context.overlay_mapping)
+            graph_vars["overlay_base"].copy_(context.overlay_base[:1])
+            graph_vars["ring_start"].copy_(context.ring_start[:1])
+        else:
+            graph_vars["overlay_base"].fill_(-1)
+            graph_vars["ring_start"].fill_(1 << 30)
+        table = context.block_tables[0]
+        graph_vars["block_tables"][0, :table.shape[0]].copy_(table)
+        graph_vars["cu_seqlens_k"].copy_(context.cu_seqlens_k)
+        graph_vars["cu_seqlens_k"][1:].add_(size - rows)  # the padded rows after the real ones: the first position stays
+        graph_vars["real"].fill_(rows)
+        draft_features = self._draft_feature_buffer(graph_vars, size, register=False)
+        set_context(True, graph_vars["cu_seqlens_q"], graph_vars["cu_seqlens_k"], size, self.config.max_model_len, graph_vars["slot_mapping"], None, graph_vars["block_tables"],
+                    has_previous_state=context.has_previous_state, overlay_mapping=graph_vars["overlay_mapping"], overlay_base=graph_vars["overlay_base"], ring_start=graph_vars["ring_start"])
+        try:
+            with cuda_graphs.scope(gated=False):
+                cuda_graphs.run(self.model, graph_vars["input_ids"], graph_vars["positions"], graph_vars["outputs"], graph_vars["real"], draft_features, method="lm_engine_prompt_forward")
+        finally:
+            use_context(context)
+        if draft_features is not None:
+            self.model._draft_features = draft_features[:, :rows]
+        return graph_vars["outputs"][:, :rows].clone()
 
     def _run_target_stage(self, input_ids: torch.Tensor, positions: torch.Tensor, outputs: torch.Tensor, draft_features: torch.Tensor | None = None) -> None:
         """MMGP mode: a decoding pass of the target model into outputs, one MMGP graph while its weights are all in VRAM; otherwise its
@@ -303,9 +449,13 @@ class ModelRunner:
                                ring_start: torch.Tensor) -> None:
         """MMGP mode, the model in VRAM: the decoding passes run once on dummy pages (as the engine's own graphs are captured), which
         records their MMGP graphs before the first request instead of during its decoding."""
-        from mmgp import runtime
+        from mmgp import allocator, runtime
         for rows, graph_vars in [(self.graph_bs[-1], self.graph_vars), *self.speculative_graph_vars.items()]:
             self._draft_feature_buffer(graph_vars, rows, register=False)  # all made before the state is registered once
+        if _OUTPUT_STAGE and getattr(getattr(self.model, "output", None), "lm_engine_graph_forward", None) is not None:
+            for graph_vars in self.speculative_graph_vars.values():  # the logits of the verification windows too: a buffer made at a window's first pass registers the state again, which drops the model's graphs
+                with allocator.pool_allocations(self._state_pool):  # (with the sequence state: out of VRAM while the runtime is suspended)
+                    graph_vars["verify_logits"] = torch.empty_like(self.model.output(graph_vars["outputs"]))
         self._register_graph_state()
         if not runtime.weights_resident(self.model):
             return  # the runs of resident blocks change with the dynamic preload: their graphs are recorded as they run
@@ -638,6 +788,8 @@ class ModelRunner:
         for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales", "kv_index_pool"):
             if hasattr(self, name):
                 delattr(self, name)
+        self._suspended = False
+        self._saved_state, self._saved_graph_pools = [], []  # (their pools go with the graphs cleared below)
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
         # Force recapture on next prepare to avoid stale-pointer illegal memory access.
         try:
@@ -689,6 +841,9 @@ class ModelRunner:
     def invalidate_graphs_if_model_storage_changed(self) -> bool:
         if not self._runtime_ready or self.enforce_eager:
             return False
+        if self.mmgp_graphs:  # its base back in VRAM first: unloaded (suspended), its tensors are their RAM copies until it loads again
+            from mmgp import runtime
+            runtime.ensure_loaded(self.model)
         current_signature = self._get_model_storage_signature()
         if current_signature == self._model_storage_signature:
             return False
@@ -941,27 +1096,27 @@ class ModelRunner:
         config, layout = self.config, self.kv_layout
         blocks = config.num_kvcache_blocks
         if layout is None or not layout.mixed:
-            self.kv_cache = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8 if config.kv_cache_int8 else self.dtype)
+            self.kv_cache = _held_zeros((2, layers, blocks, self.block_size, num_kv_heads, head_dim), torch.int8 if config.kv_cache_int8 else self.dtype, runtime_device)
             self.kv_views = (self.kv_cache[0], self.kv_cache[1])
             self.kv_min_views = (None, None)
             if config.kv_cache_int8:
-                self.kv_cache_scales = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+                self.kv_cache_scales = _held_zeros((2, layers, blocks, self.block_size, num_kv_heads, scale_elements), torch.float16, runtime_device)
             return
         shape = lambda width: (layers, blocks, self.block_size, num_kv_heads, width)
         widths = (layout.k.width(head_dim), layout.v.width(head_dim))
         sizes = [math.prod(shape(width)) for width in widths]
-        self.kv_cache = torch.zeros(sum(sizes), device=runtime_device, dtype=torch.uint8)
+        self.kv_cache = _held_zeros((sum(sizes),), torch.uint8, runtime_device)
         self.kv_views = tuple(self.kv_cache[offset:offset + size].view(fmt.dtype).view(shape(width))
                               for fmt, width, size, offset in zip((layout.k, layout.v), widths, sizes, (0, sizes[0])))
-        self.kv_cache_scales = torch.zeros(2, *shape(scale_elements), device=runtime_device, dtype=torch.float16)
+        self.kv_cache_scales = _held_zeros((2, *shape(scale_elements)), torch.float16, runtime_device)
         asymmetric = [fmt.asymmetric for fmt in (layout.k, layout.v)]
-        self.kv_cache_mins = torch.zeros(sum(asymmetric), *shape(scale_elements), device=runtime_device, dtype=torch.float16) if any(asymmetric) else None
+        self.kv_cache_mins = _held_zeros((sum(asymmetric), *shape(scale_elements)), torch.float16, runtime_device) if any(asymmetric) else None
         mins = iter(self.kv_cache_mins) if self.kv_cache_mins is not None else None
         self.kv_min_views = tuple(next(mins) if flag else None for flag in asymmetric)
         if layout.overlay and getattr(self, "kv_overlay", None) is None:
             rows = config.max_num_seqs * layout.overlay_rows(self.block_size) + 1  # plus a scratch row for tokens without an overlay (PyTorch store path)
-            self.kv_overlay = torch.zeros(2, layers, rows, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8)
-            self.kv_overlay_scales = torch.zeros(2, layers, rows, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+            self.kv_overlay = _held_zeros((2, layers, rows, num_kv_heads, head_dim), torch.int8, runtime_device)
+            self.kv_overlay_scales = _held_zeros((2, layers, rows, num_kv_heads, scale_elements), torch.float16, runtime_device)
 
     def _allocate_index_pool(self, modules, runtime_device) -> None:
         """The paged cache of indexed attention (attention_indexed): a row per block of tokens, per layer."""
@@ -1205,6 +1360,12 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         has_previous_state = any(int(getattr(seq, "num_cached_tokens", 0) or 0) > 0 for seq in seqs)
+        if has_previous_state and getattr(self.model, "_lm_engine_adaptive_experts", False):
+            # the suffix of a live context (a turn): its working storage exists, so the experts are placed in VRAM first when the model has just come back, and the pass is
+            # computed as when the model stays loaded (a first prompt keeps its measuring pass: the placement follows it)
+            from mmgp import runtime
+            runtime.ensure_loaded(self.model)  # (its blocks first: the placement waits for them, and a pass replayed as a kept graph would then run before it)
+            runtime.place_experts(self.model)
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -1274,7 +1435,8 @@ class ModelRunner:
     def prefill_only(self, seqs: list[Sequence]) -> None:
         self.ensure_runtime_ready()
         input_ids, positions, inputs_embeds = self.prepare_prefill(seqs)
-        self.run_model(input_ids, positions, True, inputs_embeds=inputs_embeds)
+        if self._prompt_graph_pass(input_ids, inputs_embeds) is None:  # (a short prompt pass replayed as a graph: its logits are not read here)
+            self.run_model(input_ids, positions, True, inputs_embeds=inputs_embeds)
         for seq in seqs:
             seq.clear_prompt_data()
         reset_context()
@@ -1299,7 +1461,7 @@ class ModelRunner:
     def _single_decode_supported(self) -> bool:
         if self._single_decode is None:
             from shared.kernels import host_doorbell
-            self._single_decode = self.mmgp_graphs and not self.enforce_eager and self.graph_vars["input_ids"].shape[0] == 1 and host_doorbell.supported(self._get_runtime_device())
+            self._single_decode = _TRITON and self.mmgp_graphs and not self.enforce_eager and self.graph_vars["input_ids"].shape[0] == 1 and host_doorbell.supported(self._get_runtime_device())
         return self._single_decode
 
     def _prepare_single_decode(self, seq: Sequence):
@@ -1631,8 +1793,8 @@ class ModelRunner:
         return int(self._sample_distribution_tensor(probabilities).item())
 
     def _commit_speculative_target_state(self, processed_tokens: int, verified_tokens: int) -> None:
-        if processed_tokens == verified_tokens:
-            return
+        if processed_tokens == verified_tokens or not self._speculative_commit_destinations and not self._speculative_replay_modules:
+            return  # (a model whose state is kept by position has nothing to commit: its rejected rows are overwritten)
         graph = self.speculative_commit_graphs.get(int(processed_tokens))
         if graph is not None:
             graph.replay()
@@ -1731,7 +1893,9 @@ class ModelRunner:
         previous_pending = self._speculative_pending.pop(seq.seq_id, None)
         seq.num_cached_tokens = previous_token_count if previous_pending is not None else previous_token_count - 1
         input_ids, positions, inputs_embeds = self.prepare_prefill([seq])
-        hidden_states = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
+        hidden_states = self._prompt_graph_pass(input_ids, inputs_embeds)
+        if hidden_states is None:
+            hidden_states = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
         target_logits = self.model.compute_logits(hidden_states)[0]
         suffix_ids = torch.tensor(seq.token_ids[previous_token_count:], dtype=torch.long, device=hidden_states.device).unsqueeze(0)
         if previous_pending is None:
@@ -1918,6 +2082,8 @@ class ModelRunner:
         entry[0] += 1
         entry[1] += milliseconds
         entry[2] += accepted
+        counts = self._window_counts
+        counts[0], counts[1], counts[2] = counts[0] + 1, counts[1] + (rows > 1), counts[2] + accepted + 1
         lookup = getattr(self, "_window_lookup", 0)
         if lookup:
             stats["lookup_windows"] += 1
@@ -1927,8 +2093,22 @@ class ModelRunner:
             stats["recent_accepted"] = _LONG_CHAIN_FADE * stats["recent_accepted"] + accepted
             stats["recent_verified"] = _LONG_CHAIN_FADE * stats["recent_verified"] + min(accepted + 1, rows - 1)
         costs = self._draft_costs()
+        if rows > 1 and not lookup:
+            self._measured_drafts().observe(rows - 1, accepted)
         costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
         costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
+
+    def _measured_drafts(self) -> MeasuredDrafts:
+        measured = getattr(self, "_measured_draft_counts", None)
+        if measured is None:
+            measured = self._measured_draft_counts = MeasuredDrafts(self._draft_costs(), self._max_speculative_draft_tokens)
+        return measured
+
+    def _confident_drafts(self) -> ConfidentDrafts:
+        confident = getattr(self, "_confident_draft_counts", None)
+        if confident is None:
+            confident = self._confident_draft_counts = ConfidentDrafts(self._measured_drafts())
+        return confident
 
     def _long_chain_rate(self, usual: int, long: int) -> float:
         ratio = self._draft_costs().pass_ratio(usual, long, _LONG_CHAIN_SAMPLES)
@@ -2039,7 +2219,7 @@ class ModelRunner:
         # the warmup compiles the kernels; its drafter passes write the cache rows past its length, which every replay rewrites before reading
         with torch.cuda.stream(stream), allocator.graph_warmup(pool):
             run()
-        graph = torch.cuda.CUDAGraph()
+        graph = cuda_graphs.Graph(self)
         with torch.cuda.graph(graph, pool, stream=stream, capture_error_mode="thread_local"):
             run()
         torch.cuda.synchronize()
@@ -2051,8 +2231,10 @@ class ModelRunner:
             device = self._get_runtime_device()
             vocab = int(graph_vars["logits"].shape[-1])
             self._draft_chain = False
-            if _CHAIN and not (_SUFFIX or _DRAFT_COSTS or _FIRST_ALWAYS) and self.use_triton_sampling and draft_chain.supported(device, vocab):
-                self._draft_chain = draft_chain.DraftChain(device, vocab, target_vocab, self._max_speculative_draft_tokens)
+            if _CHAIN and not (_SUFFIX or _DRAFT_COSTS or _FIRST_ALWAYS) and self.use_triton_sampling:
+                from ..layers import draft_chain  # Triton kernels
+                if draft_chain.supported(device, vocab):
+                    self._draft_chain = draft_chain.DraftChain(device, vocab, target_vocab, self._max_speculative_draft_tokens)
         return self._draft_chain is not False
 
     def _build_mtp_drafts(self, seq: Sequence, sample_params, draft_count: int, start_position: int, profile: dict | None = None) -> tuple[list[int] | torch.Tensor, int, list[torch.Tensor] | None]:
@@ -2150,13 +2332,14 @@ class ModelRunner:
             draft_logits = draft_logits[0, -1]
         return torch.cat(draft_tokens) if sample_drafts_on_device and draft_tokens else draft_tokens, cache_length, draft_distributions
 
-    def _run_native_mtp_target_token(self, seq: Sequence, sample_params) -> list[list[int]]:
-        started = time.perf_counter()
+    def _run_native_mtp_target_token(self, seq: Sequence, sample_params, started: float | None = None) -> list[list[int]]:
+        started = time.perf_counter() if started is None else started  # a pass whose drafts were computed then not verified counts their time
         input_ids, positions = self.prepare_decode([seq])
         hidden_states = self._run_decode_hidden(input_ids, positions)
         target_token = self._sample_speculative_target(seq, self.model.compute_logits(hidden_states)[0], sample_params, [])
         self._window_lookup, self._window_confidences = 0, ()
         self._observe_window(1, started, 0)
+        self._measured_drafts().observe_pass(0, 1000.0 * (time.perf_counter() - started))
         self._advance_mtp(seq, [target_token], positions, hidden_states)
         reset_context()
         self.speculative_stats["target_passes"] += 1
@@ -2178,7 +2361,11 @@ class ModelRunner:
             draft_tokens = self.model._prompt_enhancer_speculative_sampling_tokens if seq.top_k != 1 else self.model._prompt_enhancer_speculative_tokens
             method = self.model.mtp.method if getattr(self.model, "_block_draft", False) else "native MTP"
             long_chain = f", {self._long_chain_tokens()} while they are accepted" if self._long_chain_tokens() > draft_tokens else ""
-            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens{long_chain}, {execution} verification).")
+            if long_chain and getattr(self.model, "_lm_engine_measured_drafts", False):
+                drafts = f"0 to {self._long_chain_tokens()} draft tokens per window, chosen from the measured passes and acceptance"
+            else:
+                drafts = f"up to {draft_tokens} draft tokens{long_chain}"
+            print(f"[Deepy][Speculative] method={method} ({sampling_method}, {drafts}, {execution} verification).")
             self.model._prompt_enhancer_speculative_method_logged = True
         sample_key = (seq.temperature, seq.cfg_scale, seq.top_k, seq.top_p, seq.min_p, seq.repetition_penalty)
         if self._mtp_sample_params is None or self._mtp_sample_params[0] != sample_key:
@@ -2200,7 +2387,13 @@ class ModelRunner:
             max_drafts = min(max_drafts, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_sampling_tokens", max_drafts))))
         stats = self.speculative_stats
         long_drafts = min(self._max_speculative_draft_tokens, self._long_chain_tokens())
-        if long_drafts > max_drafts:
+        confident = None
+        if long_drafts > max_drafts and getattr(self.model, "_lm_engine_measured_drafts", False) and getattr(self.model.mtp, "confident_drafts", False):
+            confident = self._confident_drafts()
+            max_drafts = confident.span(long_drafts, seq.top_k != 1)  # the chain the count is chosen from, once its drafts' probabilities are known
+        elif long_drafts > max_drafts and getattr(self.model, "_lm_engine_measured_drafts", False):
+            max_drafts = self._measured_drafts().choose(long_drafts)  # an automatic count of a drafter whose block comes in one pass: 0 to all its drafts, by what they bring here
+        elif long_drafts > max_drafts:
             self._record_long_chain(max_drafts, long_drafts, len(seq))
             if stats["recent_accepted"] >= self._long_chain_rate(max_drafts, long_drafts) * stats["recent_verified"] > 0:
                 max_drafts = long_drafts  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too, often enough for what they cost here
@@ -2221,6 +2414,27 @@ class ModelRunner:
         if len(draft_tokens) == 0:
             self._cancel_mtp_stage_profile(profile)
             return self._run_native_mtp_target_token(seq, sample_params)
+        window_confidences = None
+        if confident is not None and getattr(self, "_draft_confidences", None) is not None:
+            # the window's count from its drafts' probabilities: one readback of the chain's few values, before the verification it sizes
+            values = torch.cat((self._draft_confidences[:len(draft_tokens)], self._draft_valid_length.reshape(1).to(self._draft_confidences.dtype))).tolist()
+            available = min(len(draft_tokens), int(values[-1]))
+            chosen = confident.choose(values[:available], available, seq.top_k != 1)
+            if chosen == 0:
+                self._cancel_mtp_stage_profile(profile)
+                return self._run_native_mtp_target_token(seq, sample_params, started=pass_started)
+            draft_tokens, window_confidences = draft_tokens[:chosen], values[:chosen]
+            draft_distributions = None if draft_distributions is None else draft_distributions[:chosen]
+            self._draft_valid_length = self._draft_valid_length.clamp(max=chosen)
+        elif confident is not None:  # drafts of the reference chain (rules the GPU chain cannot take): the count from the measured history
+            chosen = self._measured_drafts().choose(len(draft_tokens))
+            if chosen == 0:
+                self._cancel_mtp_stage_profile(profile)
+                return self._run_native_mtp_target_token(seq, sample_params, started=pass_started)
+            draft_tokens = draft_tokens[:chosen]
+            draft_distributions = None if draft_distributions is None else draft_distributions[:chosen]
+            if torch.is_tensor(getattr(self, "_draft_valid_length", None)):
+                self._draft_valid_length = self._draft_valid_length.clamp(max=chosen)
         stage_started = window_started = time.perf_counter()
         input_ids, positions = self._prepare_speculative_verify(seq, draft_tokens)
         self._mark_mtp_stage_profile(profile, 2, "verify_setup", stage_started)
@@ -2237,8 +2451,11 @@ class ModelRunner:
         self.speculative_stats["target_passes"] += 1
         emitted, accepted_count = self._sample_verified_block(seq, logits, draft_tokens, draft_distributions, sample_params, profile)
         self._observe_window(len(draft_tokens) + 1, window_started, accepted_count)
+        if window_confidences is not None:
+            confident.observe(window_confidences, len(draft_tokens), accepted_count, seq.top_k != 1)
         if not self._window_lookup:
             self._draft_costs().observe_pass(len(draft_tokens), 1000.0 * (time.perf_counter() - pass_started))
+            self._measured_drafts().observe_pass(len(draft_tokens), 1000.0 * (time.perf_counter() - pass_started))
         stage_started = time.perf_counter()
         self._commit_speculative_target_state(len(emitted), len(draft_tokens) + 1)
         self._mark_mtp_stage_profile(profile, 7, "commit", stage_started)
@@ -2610,6 +2827,7 @@ class ModelRunner:
                 self.graph_bs = cached["bs"]
                 self.speculative_graphs = cached.get("speculative_graphs", {})
                 self.speculative_graph_vars = cached.get("speculative_vars", {})
+                self.prompt_graph_vars = cached.get("prompt_vars", {})
                 self.speculative_commit_graphs = cached.get("speculative_commit_graphs", {})
                 self.mtp_graph = cached.get("mtp_graph")
                 self.mtp_graph_pool = cached.get("mtp_pool")
@@ -2665,7 +2883,7 @@ class ModelRunner:
             choose_short_batch_kernels()
             choose_short_batch_kernels = None
         for bs in reversed(self.graph_bs if not self.mmgp_graphs else ()):
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                         overlay_mapping=overlay_mapping[:bs], overlay_base=overlay_base[:bs], ring_start=ring_start[:bs])
             capture_stream.wait_stream(torch.cuda.current_stream(model_device))
@@ -2723,7 +2941,7 @@ class ModelRunner:
                 speculative_overlay_base = torch.full((1,), -1, dtype=torch.int32, device=model_device)
                 speculative_ring_start = torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device)
                 if not self.mmgp_graphs:
-                    graph = torch.cuda.CUDAGraph()
+                    graph = cuda_graphs.Graph(self)
                     set_context(True, speculative_cu_seqlens_q, speculative_cu_seqlens_k, verify_length, config.max_model_len, speculative_slot_mapping, None, speculative_block_tables, has_previous_state=True, speculative_verify=True,
                                 overlay_mapping=speculative_overlay_mapping, overlay_base=speculative_overlay_base, ring_start=speculative_ring_start)
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
@@ -2754,7 +2972,7 @@ class ModelRunner:
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream):
                         self._commit_speculative_target_state_eager(processed_tokens)    # warmup
-                    graph = torch.cuda.CUDAGraph()
+                    graph = cuda_graphs.Graph(self)
                     with torch.cuda.graph(graph, pool, stream=capture_stream, capture_error_mode="thread_local"):
                         self._commit_speculative_target_state_eager(processed_tokens)
                     self.speculative_commit_graphs[processed_tokens] = graph
@@ -2779,7 +2997,7 @@ class ModelRunner:
                 mtp_pool = torch.cuda.graph_pool_handle()
                 with torch.cuda.stream(capture_stream), allocator.graph_warmup(mtp_pool):
                     self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
-                mtp_graph = torch.cuda.CUDAGraph()
+                mtp_graph = cuda_graphs.Graph(self)
                 with torch.cuda.graph(mtp_graph, mtp_pool, stream=capture_stream, capture_error_mode="thread_local"):
                     mtp_outputs, mtp_logits = self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
                     mtp_next_token = torch.argmax(mtp_logits[0, -1]).reshape(1)
@@ -2802,7 +3020,7 @@ class ModelRunner:
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream), allocator.graph_warmup(self.mtp_graph_pool):
                         self.model.mtp(refresh_ids, refresh_positions, refresh_hidden, last_logits_only=True, cache_prepared=True)
-                    refresh_graph = torch.cuda.CUDAGraph()
+                    refresh_graph = cuda_graphs.Graph(self)
                     with torch.cuda.graph(refresh_graph, self.mtp_graph_pool, stream=capture_stream, capture_error_mode="thread_local"):
                         refresh_outputs, refresh_logits = self.model.mtp(refresh_ids, refresh_positions, refresh_hidden, last_logits_only=True, cache_prepared=True)
                         refresh_next_token = refresh_logits[0, -1].argmax().reshape(1)
@@ -2819,9 +3037,21 @@ class ModelRunner:
                 self.model.mtp._cache.cache_seqlens.zero_()
                 if self._speculative_replay_modules and defer_commits:
                     capture_commits(self.mtp_graph_pool)
+        self.prompt_graph_vars = {}
+        if self.mmgp_graphs and _PROMPT_GRAPHS:
+            for rows in getattr(self.model, "lm_engine_prompt_graph_rows", ()):  # short prompt passes padded to these sizes: MMGP graphs recorded at their first use
+                graph_vars = self.prompt_graph_vars[rows] = dict(
+                    input_ids=torch.zeros(rows, dtype=torch.int64, device=model_device), positions=torch.zeros(rows, dtype=torch.int64, device=model_device),
+                    slot_mapping=torch.full((rows,), -1, dtype=torch.int32, device=model_device), cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32, device=model_device),
+                    cu_seqlens_k=torch.tensor([0, rows], dtype=torch.int32, device=model_device), block_tables=torch.full((1, max_num_blocks), -1, dtype=torch.int32, device=model_device),
+                    overlay_mapping=torch.full((rows,), -1, dtype=torch.int32, device=model_device), overlay_base=torch.full((1,), -1, dtype=torch.int32, device=model_device),
+                    ring_start=torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device), real=torch.zeros(1, dtype=torch.int32, device=model_device),
+                    outputs=torch.zeros(1, rows, output_size, device=model_device, dtype=self.dtype))
+                self._draft_feature_buffer(graph_vars, rows, register=False)
         if self.mmgp_graphs:
             self._capture_target_stages(slot_mapping, context_lens, block_tables, overlay_mapping, overlay_base, ring_start)
         self._graph_cache[cache_key] = {
+            "prompt_vars": self.prompt_graph_vars,
             "graphs": self.graphs,
             "pool": self.graph_pool,
             "vars": self.graph_vars,

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import math
 import re
 import hashlib
 import json
@@ -89,7 +90,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
         normalize_shot(shot)
         shot["cast"] = cast_ids(doc, shot["cast"])
     edit = doc.setdefault("edit", {})
-    for key, value in {"audio_mode": "song" if brief["kind"] == "music_video" else "clips", "audio_tracks": [], "subtitles": [], "overlays": [], "fps": None, "level_voices": False}.items():
+    for key, value in {"audio_mode": "song" if brief["kind"] == "music_video" else "clips", "audio_tracks": [], "subtitles": [], "overlays": [], "fps": None, "level_voices": False, "song_subtitles": False}.items():  # song_subtitles: a song cut's lyrics as a subtitle track, only on request
         edit.setdefault(key, copy.deepcopy(value))
     for overlay in edit["overlays"]:
         for key, value in {"text": "", "subtitle": "", "style": "", "design": "", "start_s": 0.0, "end_s": 3.0, "fade_s": 0.5, "by": "user"}.items():
@@ -110,7 +111,9 @@ def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"title": "", "section": "", "intent": "", "camera": "", "cast": [], "dialogue": [], "duration_s": 5.0, "audio_slice": None, "generation": {},
                        "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None], "speed": 1.0, "sound": True,
                        "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0, "cut_extra_words": True, "line_cut": None,
-                       "rendering_with": None}.items():  # rendering_with: the shot whose render renders this one too, while it runs
+                       "rendering_with": None, "continues": False, "start_from": None, "end_on": None, "audio_part": None}.items():  # rendering_with: the shot whose render renders this one too, while it runs
+        # continues: the shot goes on from the one before it in the edit; start_from / end_on: {shot, at: start|end}, a frame of another shot's take as its first or last frame
+        # audio_part: [start_s, end_s | None], the seconds of its own audio_guide a part of a split shot plays (None: all of it)
         shot.setdefault(key, copy.deepcopy(value))
     generation = shot["generation"]
     generation.setdefault("template", "gen_video")
@@ -122,7 +125,100 @@ def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
             take.setdefault(key, copy.deepcopy(value))
         # the showrunner's own verdict, kept beside the user's (takes judged before it was kept: the verdict when it is the showrunner's)
         take.setdefault("showrunner_verdict", copy.deepcopy(take["verdict"]) if (take["verdict"] or {}).get("by", "user") != "user" else None)
+    return shot_times(shot)
+
+
+def _seconds(value: Any, field: str) -> Any:
+    """A time written as text ("12.5", "12.5s") as its number; numbers and None stay as they are."""
+    if not isinstance(value, str):
+        return value
+    try:
+        seconds = float(value.strip().removesuffix("s"))
+    except ValueError:
+        raise OperationError(f"{field} takes seconds as numbers, not {value!r}.") from None
+    if not math.isfinite(seconds):
+        raise OperationError(f"{field} takes seconds as numbers, not {value!r}.")
+    return seconds
+
+
+def shot_times(shot: dict[str, Any]) -> dict[str, Any]:
+    """A shot's times as numbers: a director may write them as text ("12.5", or a range "42.0-48.1" for a [start, end] pair), which the song
+    alignment after every take cannot subtract."""
+    shot["duration_s"] = _seconds(shot["duration_s"], "duration_s")
+    for key in ("audio_slice", "trim", "line_cut", "audio_part"):
+        if isinstance(shot[key], str):
+            pair = re.fullmatch(r"\s*\[?\s*([\d.]+)\s*s?\s*(?:-|–|to|,)\s*([\d.]+|null|None)?\s*s?\s*\]?\s*", shot[key])
+            if pair is None:
+                raise OperationError(f"{key} is [start_s, end_s], not {shot[key]!r}.")
+            shot[key] = [pair[1], None if pair[2] in (None, "null", "None") else pair[2]]
+        if isinstance(shot[key], list):
+            shot[key] = [_seconds(value, key) for value in shot[key]]
+    if "duration_s" in shot["transition"]:
+        shot["transition"]["duration_s"] = _seconds(shot["transition"]["duration_s"], "transition duration_s")
     return shot
+
+
+def previous_shot(doc: dict[str, Any], shot: dict[str, Any]) -> dict[str, Any] | None:
+    """The shot before this one in the edit, which a continued shot goes on from."""
+    order = [item for item in doc["shots"] if item.get("included", True) or item["id"] == shot["id"]]
+    index = next(index for index, item in enumerate(order) if item["id"] == shot["id"])
+    return order[index - 1] if index else None
+
+
+def frame_links(doc: dict[str, Any], shot: dict[str, Any]) -> dict[str, str | None]:
+    """The other shots a shot's take is made from, with what it uses of each (their chosen take and where the edit cuts it): "continue:s2" (the end of
+    the shot before it), "start:s2@end" and "end:s5@start" (one frame of theirs). A take keeps these: one that differs says the take no longer joins them."""
+    linked = []
+    if shot.get("continues") and (before := previous_shot(doc, shot)) is not None:
+        linked.append(("continue:" + before["id"], before))
+    for key, kind in (("start_from", "start"), ("end_on", "end")):
+        if link := shot.get(key):
+            linked.append((f"{kind}:{link['shot']}@{link['at']}", find(doc["shots"], link["shot"], "shot")))
+
+    def used(other):
+        take = chosen_take(other)
+        return None if take is None else f"{take['id']}@{_trim_of(other)[0]:g}-{_plays_until(other):g}"
+    return {key: used(other) for key, other in linked}
+
+
+def stale_frames(doc: dict[str, Any], shot: dict[str, Any]) -> str | None:
+    """Why the shot's take no longer joins the shots it was made from, if it does not: one of them has another take or cut, or the shot's start or end changed."""
+    take = chosen_take(shot)
+    if take is None or not take.get("settings") or take.get("kept_source"):  # a file of the user's is theirs to judge
+        return None
+    made, now = take.get("links") or {}, frame_links(doc, shot)
+    if made == now:
+        return None
+    changed = [key for key in now if key in made and now[key] != made[key]]
+    if not changed:
+        return f"{shot['id']} starts or ends differently since its take: render it again."
+    names = {"continue": "the shot it continues", "start": "the shot it starts on", "end": "the shot it ends on"}
+    return f"{shot['id']}: " + ", ".join(f"{names[key.split(':')[0]]} ({key.split(':')[1].split('@')[0]})" for key in changed) + " changed since its take: render it again to join it."
+
+
+def stale_shots(doc: dict[str, Any], skip: tuple[str, ...] | list[str] = ()) -> list[str]:
+    """The included shots whose take no longer joins the shots it was made from (stale_frames), one line each."""
+    return [reason for shot in doc["shots"] if shot.get("included", True) and shot["id"] not in skip and (reason := stale_frames(doc, shot))]
+
+
+def _check_frames(doc: dict[str, Any], shot: dict[str, Any]) -> None:
+    """A shot starts one way and ends one way: on its own, on a picture, or on a frame of another shot (a continued shot starts on the one before it)."""
+    settings = shot["generation"].get("settings") or {}
+    for key in ("start_from", "end_on"):
+        link = shot.get(key)
+        if link is None:
+            continue
+        if not isinstance(link, dict) or link.get("at") not in ("start", "end"):
+            raise OperationError(f"{key} is {{shot, at: start|end}}: a frame of another shot's take.")
+        if link.get("shot") == shot["id"]:
+            raise OperationError(f"{shot['id']} cannot start or end on a frame of its own.")
+        find(doc["shots"], link.get("shot"), "shot")
+    if shot.get("continues") and (shot.get("start_from") or settings.get("image_start")):
+        raise OperationError(f"{shot['id']} continues the shot before it, which is its start: remove its start picture first.")
+    if shot.get("start_from") and settings.get("image_start"):
+        raise OperationError(f"{shot['id']} starts on a frame of {shot['start_from']['shot']} and on a picture: keep one.")
+    if shot.get("end_on") and settings.get("image_end"):
+        raise OperationError(f"{shot['id']} ends on a frame of {shot['end_on']['shot']} and on a picture: keep one.")
 
 
 def _next_id(prefix: str, items: list[dict[str, Any]]) -> str:
@@ -544,7 +640,7 @@ def planned_length(shot: dict[str, Any]) -> float:
     """How long a shot without a take will play: its planned length, or less when someone it shows speaks, as the shot ends after the line (about 0.37 s a word until the line is spoken)."""
     planned = float(shot.get("duration_s") or 0.0)
     lines = [line for line in shot.get("dialogue") or [] if line.get("line") and line.get("speaker") in (shot.get("cast") or [])]
-    if not lines or not planned:
+    if not lines or not planned or (shot.get("generation") or {}).get("settings", {}).get("audio_guide") and not shot.get("audio_slice"):  # a shot given audio plays all of it
         return planned
     spoken = sum(float(line.get("duration_s") or 0.37 * len(_lyric_words(line["line"]))) for line in lines)
     return min(planned, spoken + BETWEEN_LINES * (len(lines) - 1) + AFTER_LINE)
@@ -706,6 +802,8 @@ def edit_key(doc: dict[str, Any]) -> str:
     edit["overlays"] = [{key: item.get(key) for key in ("path", "start_s", "end_s", "fade_s")} for item in doc["edit"].get("overlays", [])]
     if doc["edit"].get("level_voices") and doc["brief"].get("voices_from_model"):  # listed only when set: older exports stay up to date
         edit["level_voices"] = True
+    if doc["edit"].get("song_subtitles") and on_the_song(doc):
+        edit["song_subtitles"] = True
     return hashlib.sha1(json.dumps([cut, edit, doc["brief"].get("song")], sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
@@ -740,8 +838,26 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "source", "script", "references", "duration_s", "aspect", "resolution", "draft_resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
                 "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model", "group_renders", "render_min_s", "render_max_s", "song_voices"}
-DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
+DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length, longer when its script needs it
+SCRIPT_LINE_S = 0.8  # what a line of the script adds to the time its words take: the pause, a cut, a reaction
 RENDER_MIN_S = 8.0  # a remake's shorter renders lose the lips: Skate Queen s3 alone (5.8 s) did not follow the singing, with its neighbour (9.5 s) it did
+
+
+def script_length(doc: dict[str, Any]) -> float | None:
+    """About how long the brief's spoken script lasts, up to the next 5 s (0.37 s a word, as planned_length, and SCRIPT_LINE_S a line; brief.js
+    scriptLength counts it the same way); None without spoken lines, for lyrics (they are sung) and for a remake (it lasts as long as its source)."""
+    if doc["brief"].get("kind") in ("music_video", "remake"):
+        return None
+    lines = [words for line in script_speech(doc) if (words := _script_words(line))]
+    return 5.0 * math.ceil(sum(0.37 * len(words) + SCRIPT_LINE_S for words in lines) / 5.0) if lines else None
+
+
+def wanted_length(doc: dict[str, Any]) -> float | None:
+    """The length the production plans for: the user's, None when a song sets it, else the default or the time the script needs when longer."""
+    brief = doc["brief"]
+    if brief.get("duration_s") or brief.get("song"):
+        return brief.get("duration_s") or None
+    return max(DEFAULT_LENGTH_S, script_length(doc) or 0.0)
 
 
 def shot_range(doc: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -755,7 +871,7 @@ def shot_range_words(doc: dict[str, Any]) -> str:
     return f"{low:g} to {high:g} s" if low and high else f"at least {low:g} s" if low else f"at most {high:g} s" if high else ""
 GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
-               "transition", "notes", "cut_extra_words", "source_range", "source_poster", "painted_frames", "seen", "looked", "rendering_with"}
+               "transition", "notes", "cut_extra_words", "source_range", "source_poster", "painted_frames", "seen", "looked", "rendering_with", "continues", "start_from", "end_on", "audio_part"}
 SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
 CAST_FIELDS = {"name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "lora", "locked", "looks"}
 MEDIA_SETTINGS = {"image_refs", "image_start", "image_end", "image_guide", "image_mask", "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
@@ -808,6 +924,9 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
     if unknown:
         raise OperationError(f"Unknown shot fields: {', '.join(sorted(unknown))}.")
     changed = []
+    if "audio_part" not in fields and ((fields.get("generation") or {}).get("settings") or {}).get("audio_guide", shot["generation"].get("settings", {}).get("audio_guide")) \
+            != shot["generation"].get("settings", {}).get("audio_guide"):  # other audio is played whole
+        fields["audio_part"] = None
     for key, value in fields.items():
         if key == "generation":
             generation = shot["generation"]
@@ -835,6 +954,7 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
         else:
             shot[key] = copy.deepcopy(value)
         changed.append(key)
+    shot_times(shot)
     if {"chosen_take", "cut_extra_words"} & set(fields):
         follow_line_cut(shot)
     if by == "user" and set(fields) - {"status"}:  # the user's last change of the shot: it protects it from the director's stale writes and replans
@@ -842,7 +962,7 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
     return changed
 
 
-LINE_AUDIO = ("audio", "voice", "spoken", "duration_s")  # a line's spoken audio: its file, the voice sample it was spoken from, the words it says
+LINE_AUDIO = ("audio", "voice", "spoken", "duration_s", "own")  # a line's spoken audio: its file, the voice sample it was spoken from, the words it says, own: the user's recording
 
 
 def line_key(line: dict[str, Any]) -> str:
@@ -850,14 +970,15 @@ def line_key(line: dict[str, Any]) -> str:
 
 
 def _dialogue(old: list[dict[str, Any]], lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """New dialogue lines; a line keeps its spoken audio while its speaker, words and note stay the same (audio of other words is dropped)."""
+    """New dialogue lines; a line keeps its spoken audio while its speaker, words and note stay the same (audio of other words is dropped). A line
+    given with "audio": null loses its recording."""
     spoken = {item.get("spoken"): item for item in old if item.get("audio")}
     result = []
     for item in lines:
         line = {"speaker": str(item.get("speaker") or ""), "line": str(item.get("line") or ""), "note": str(item.get("note") or "")}
         if not line["line"].strip():
             continue
-        source = item if item.get("audio") and item.get("spoken") == line_key(line) else spoken.get(line_key(line))
+        source = None if "audio" in item and item["audio"] is None else item if item.get("audio") and item.get("spoken") == line_key(line) else spoken.get(line_key(line))
         result.append({**line, **({key: source.get(key) for key in LINE_AUDIO} if source else {})})
     return result
 
@@ -874,8 +995,8 @@ def speaker(doc: dict[str, Any], name: str) -> dict[str, Any] | None:
 
 
 def spoken_lines(doc: dict[str, Any], shot: dict[str, Any]) -> list[dict[str, Any]]:
-    """The shot's dialogue lines whose recording is in their speaker's current voice."""
-    return [line for line in shot.get("dialogue") or [] if line.get("audio") and line.get("voice") == ((speaker(doc, line["speaker"]) or {}).get("voice") or "")]
+    """The shot's dialogue lines whose recording is in their speaker's current voice, or is the user's own (whatever voice the speaker has)."""
+    return [line for line in shot.get("dialogue") or [] if line.get("audio") and (line.get("own") or line.get("voice") == ((speaker(doc, line["speaker"]) or {}).get("voice") or ""))]
 
 
 def cast_ids(doc: dict[str, Any], cast: list[str]) -> list[str]:
@@ -914,7 +1035,8 @@ def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str, choose: bool 
               "gpu_s": take.get("gpu_s")}  # gpu_s: the measured generation time, for shoot estimates
     if take.get("base_loras"):  # its LoRAs before the cast's (activated, multipliers): a new take adds the cast's as they are then
         record["base_loras"] = copy.deepcopy(take["base_loras"])
-    record.update({key: take[key] for key in ("tier", "kept_source") if take.get(key)})  # tier: "draft" until it is shot final; kept_source: the edit reads the shot from the source itself
+    record.update({key: take[key] for key in ("tier", "kept_source", "links") if take.get(key)})  # tier: "draft" until it is shot final; kept_source: the edit reads the shot from the source itself;
+    # links: the takes of other shots it was made from (frame_links), to tell when one of them changed
     shot["takes"].append(record)
     if choose or shot["chosen_take"] is None:  # not chosen: another shot's render gave it this take, beside the one it uses
         shot["chosen_take"] = record["id"]
@@ -944,6 +1066,9 @@ def apply_ops(doc: dict[str, Any], ops: list[dict[str, Any]], *, by: str = "user
                 results[-1] = {**results[-1], "on_the_song": notes}
                 _op_log(work, {"text": "To keep the song in place: " + " ".join(notes)}, "system", revision, base_revision)
         _follow_cut(work, cut, doc["edit"])
+    for shot in work["shots"]:  # why its take no longer joins the shots it was made from, for the page and the showrunner
+        if (reason := stale_frames(work, shot)) or shot.get("stale"):
+            shot["stale"] = reason
     work["revision"], work["updated"] = revision, now()
     work["edit_key"] = edit_key(work)  # the page compares it with the last export's to say whether that export is current
     doc.clear()
@@ -1068,6 +1193,7 @@ def _op_add_shots(doc, op, by, revision, base_revision):
         take = fields.pop("take", None)  # a shot made from a file of the user's arrives with it as its take
         shot = _new_shot(doc, fields, by, revision)  # inserted at once: the next shot's id accounts for it
         doc["shots"].insert(len(doc["shots"]) if position is None else int(position) + offset, shot)
+        _check_frames(doc, shot)
         if take:
             _add_take(shot, take, by)
         added.append(shot["id"])
@@ -1104,13 +1230,46 @@ def _op_update_shot(doc, op, by, revision, base_revision):
         fields["cast"] = cast_ids(doc, fields["cast"])
     if "dialogue" in fields:
         fields["dialogue"] = speaker_ids(doc, fields["dialogue"])
-    return {"changed": _set_shot_fields(shot, fields, by, revision)}
+    changed = _set_shot_fields(shot, fields, by, revision)
+    _check_frames(doc, shot)
+    return {"changed": changed}
+
+
+def _op_split_shot(doc, op, by, revision, base_revision):
+    """A shot cut in two at at_s seconds of its plan: the second part continues the first and takes over its end (its end picture or frame, the
+    seconds after the cut, its part of the song). The first keeps its takes, dialogue and start. One model window holds an end picture: a longer
+    shot ends on it this way, the second part rendered from the first one's end."""
+    shot = find(doc["shots"], op.get("shot"), "shot")
+    _check_shot_write(shot, by, set(), op.get("revision", base_revision))
+    at, length = float(_seconds(op.get("at_s"), "at_s") or 0.0), float(shot["duration_s"])
+    if not 0.5 <= at <= length - 0.5:
+        raise OperationError(f"Split {shot['id']} between 0.5 and {length - 0.5:g} s of its {length:g} s.")
+    settings = shot["generation"].get("settings") or {}
+    fields = {"title": f"{shot['title']} (2)" if shot["title"] else "", **{key: copy.deepcopy(shot[key]) for key in ("section", "intent", "camera", "cast")},
+              "duration_s": round(length - at, 3), "continues": True, "end_on": copy.deepcopy(shot.get("end_on")),
+              "generation": {"template": shot["generation"].get("template", "gen_video"),
+                             "settings": {key: copy.deepcopy(value) for key, value in settings.items() if key not in ("image_start", "video_length", "duration_seconds")}}}
+    if shot.get("audio_slice"):
+        start, end = shot["audio_slice"]
+        fields["audio_slice"], shot["audio_slice"] = [round(start + at, 3), end], [start, round(start + at, 3)]
+    elif settings.get("audio_guide"):  # its own audio: the second part follows what comes after the cut, the first part what comes before it
+        start, end = shot.get("audio_part") or [0.0, None]
+        fields["audio_part"], shot["audio_part"] = [round(start + at, 3), end], [start, round(start + at, 3)]
+    second = _new_shot(doc, fields, by, revision)
+    shot["duration_s"], shot["end_on"] = round(at, 3), None
+    settings.pop("image_end", None)
+    doc["shots"].insert(doc["shots"].index(shot) + 1, second)
+    return {"shots": [second["id"]]}
 
 
 def _op_remove_shot(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     _check_shot_write(shot, by, set(), op.get("revision", base_revision))
     doc["shots"].remove(shot)
+    for other in doc["shots"]:  # a shot that started or ended on one of its frames is on its own again (its take keeps that frame)
+        for key in ("start_from", "end_on"):
+            if (other.get(key) or {}).get("shot") == shot["id"]:
+                other[key] = None
     for number, take in enumerate(shot["takes"], 1):  # its takes wait in the bin, to come back as a shot or a take of another
         if take.get("path") and not any(item["path"] == take["path"] for item in doc["bin"]):
             doc["bin"].append({"id": _next_id("b", doc["bin"]), "created": now(), "by": take.get("by") or by, "name": f"{shot['title'] or shot['id']} T{number}",
@@ -1356,6 +1515,8 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
         lines.append(f"Soundtrack: {old['edit'].get('audio_mode')} → {new['edit'].get('audio_mode')}")
     if bool(old["edit"].get("level_voices")) != bool(new["edit"].get("level_voices")):
         lines.append("Voices evened out" if new["edit"].get("level_voices") else "Voices as the model made them")
+    if bool(old["edit"].get("song_subtitles")) != bool(new["edit"].get("song_subtitles")):
+        lines.append("Lyrics as subtitles" if new["edit"].get("song_subtitles") else "No lyrics subtitles")
     cuts = lambda doc: [[track.get(key) for key in ("in_s", "out_s", "fade_in_s", "fade_out_s")] for track in doc["edit"].get("audio_tracks", [])]
     if [track.get("path") for track in old["edit"].get("audio_tracks", [])] != [track.get("path") for track in new["edit"].get("audio_tracks", [])]:
         counts = len(old["edit"].get("audio_tracks", [])), len(new["edit"].get("audio_tracks", []))
@@ -1541,7 +1702,7 @@ def _op_bin_to_shot(doc, op, by, revision, base_revision):
 
 _OPS = {"heard": _op_heard, "remake": _op_remake, "brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
         "add_shots": _op_add_shots, "replace_plan": _op_replace_plan, "update_shot": _op_update_shot, "remove_shot": _op_remove_shot, "move_shots": _op_move_shots,
-        "reorder": _op_reorder, "add_take": _op_add_take, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
+        "reorder": _op_reorder, "add_take": _op_add_take, "split_shot": _op_split_shot, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
         "director": _op_director, "line_audio": _op_line_audio, "bring_back": _op_bring_back, "restore_version": _op_restore_version, "outline": _op_outline, "add_overlay": _op_add_overlay, "update_overlay": _op_update_overlay,
         "remove_overlay": _op_remove_overlay, "deliverable": _op_deliverable, "budget": _op_budget, "audio": _op_audio, "lyrics": _op_lyrics, "review": _op_review, "bin_add": _op_bin_add, "bin_remove": _op_bin_remove,
         "bin_to_take": _op_bin_to_take, "bin_to_track": _op_bin_to_track, "bin_to_shot": _op_bin_to_shot}

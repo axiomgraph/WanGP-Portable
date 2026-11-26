@@ -1,8 +1,9 @@
+import contextlib
 from collections.abc import Callable
 from enum import Enum
 
 import torch
-from mmgp import cuda_graphs
+from mmgp import cuda_graphs, runtime
 
 from ...guidance.perturbations import BatchedPerturbationConfig
 from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
@@ -10,6 +11,7 @@ from .attention import AttentionCallable, AttentionFunction
 from .modality import Modality
 from .rope import LTXRopeType
 from .transformer import BasicAVTransformerBlock, TransformerConfig
+from shared import attention_kit
 from shared.kernels import ops as kernels
 from .transformer_args import (
     MultiModalTransformerArgsPreprocessor,
@@ -382,6 +384,15 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    def _plan_extreme(self, video: TransformerArgs | None):
+        """attention_kit.plan_extreme for the video self-attention of the blocks (Smart Inputs Chunker Auto), its inputs given by ranges of
+        rows; nothing without video."""
+        if video is None:
+            return contextlib.nullcontext()
+        attn, x = self.transformer_blocks[0].attn1, video.x
+        return attention_kit.plan_extreme(attn, x.device, x.dtype, x.shape[0] * x.shape[1], x.shape[-1], attn.heads, attn.heads, attn.dim_head,
+                                          (attn.to_q, attn.to_k, attn.to_v), attn.to_out[0])
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
@@ -391,7 +402,7 @@ class LTXModel(torch.nn.Module):
         """Process transformer blocks for LTXAV."""
 
         # Process transformer blocks
-        with cuda_graphs.scope():
+        with self._plan_extreme(video), cuda_graphs.scope():
             for block in self.transformer_blocks:
                 if self.interrupt_check is not None and self.interrupt_check():
                     self.interrupted = True
@@ -426,7 +437,7 @@ class LTXModel(torch.nn.Module):
         perturbations_list = perturbations if isinstance(perturbations, list) else None
         if perturbations_list is not None and len(perturbations_list) != len(video_list):
             raise ValueError("Perturbations list must match number of joint-pass conditions.")
-        with cuda_graphs.scope():
+        with self._plan_extreme(next((video for video in video_list if video is not None), None)), cuda_graphs.scope():
             for block in self.transformer_blocks:
                 if self.interrupt_check is not None and self.interrupt_check():
                     self.interrupted = True
@@ -494,6 +505,15 @@ class LTXModel(torch.nn.Module):
                 raise ValueError("Joint-pass inputs must have the same number of video and audio entries.")
             if isinstance(perturbations, list) and len(perturbations) != len(video_list):
                 raise ValueError("Perturbations list must match number of joint-pass conditions.")
+            first_video = next((v for v in video_list if v is not None), None)
+            tokens, width = (first_video.latent.shape[1], self.inner_dim) if first_video is not None else (next(a for a in audio_list if a is not None).latent.shape[1], self.audio_inner_dim)
+            if len(video_list) > 1 and not runtime.joint_pass_useful(self, tokens, width, len(video_list)):  # one prediction after the other
+                outputs = []
+                for index, (v, a) in enumerate(zip(video_list, audio_list)):
+                    outputs.append(self._forward(v, a, perturbations[index] if isinstance(perturbations, list) else perturbations))
+                    if self.interrupted:
+                        return [None] * len(video_list), [None] * len(audio_list)
+                return [output[0] for output in outputs], [output[1] for output in outputs]
 
             if self.model_type.is_video_enabled():
                 video_args_list = [
@@ -626,6 +646,10 @@ class X0Model(torch.nn.Module):
     Returns fully denoised outputs based on the velocities produced by the base model.
     Applies scaled denoising to the video and audio according to the timesteps = sigma * denoising_mask.
     """
+
+    # MMGP keeps the timestep embedders with the model's base: their weights are read outside their forward (transformer_args._embed_timestep_functional)
+    _offload_base_modules = tuple(f"velocity_model.{name}adaln_single.emb.timestep_embedder" for name in ("", "prompt_", "audio_", "audio_prompt_", "av_ca_video_scale_shift_",
+                                                                                                         "av_ca_audio_scale_shift_", "av_ca_a2v_gate_", "av_ca_v2a_gate_"))
 
     def __init__(self, velocity_model: LTXModel):
         super().__init__()

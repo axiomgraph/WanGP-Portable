@@ -20,10 +20,11 @@ from shared.utils.generation_overrides import get_override, set_override
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
                         H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA,
-                        h3_grouped_masking_enabled)
+                        H3_VEDA_FULL_LAYERS_CHOICES, H3_VEDA_FULL_LAYERS_SETTING, h3_grouped_masking_enabled, h3_veda_full_layers)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
-from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
-                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
+from .constants import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
+                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE,
+                              VIDEO_VAE_SOL_INT8_FILE)
 from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
                          P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
                          P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
@@ -32,7 +33,7 @@ from .h3_image import (H3_IMAGE_ARCHITECTURE, H3_IMAGE_ARCHITECTURES, H3_IMAGE_F
 from .hyperflow import HYPERFLOW_DEFAULT_STEPS, HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
-from .dmad import DMAD_SOLVER
+from .dmad import DMAD_SOLVER, LCM_SOLVER
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import (VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REMAKE_ARCHITECTURE, VIGGLE_REMAKE_DEEPY_INFOS, VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
@@ -200,7 +201,7 @@ H3 is designed for 24 FPS, although WanGP can generate at another frame rate. Mi
 
 REF2VA_DEEPY_INFOS = """Generate video and 32 kHz stereo audio from `prompt` and references. Ordered `image_refs` guide identity, objects or setting; reference flags in `video_prompt_type`: `I` preserves chosen output dimensions, `KI` derives them from the first image. `image_start` / `image_end` are timeline anchors shown before general image references. `FI` injects the first `image_refs` at `frames_positions` (`1` = first frame, `L` = window end, `X` = skip a window); remaining images are references; not with `GV`. Per window, pictures are numbered: start or continued frame (`<Picture 1>`), end image, that window's injected frames by time, then references. `video_source` and sliding windows provide continuation. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image.
 
-`video_guide`, `video_guide2` and `video_guide3` supply up to three reference videos for appearance, motion or camera; choose the corresponding video mode. `V1-U` instead takes up to three excerpts from `video_guide` at `custom_settings.h3_video_excerpt_positions`: frame numbers or seconds such as `5.2s`, each optionally followed by `/duration` (default 3s), for example `3 5.2s/4s 12s`. Reference videos preserve the chosen output size and are given whole to every sliding window. Control videos (`VU`, `GV`) use the control video's aspect ratio and are split across sliding windows, each window receiving its own section. Use Reference Video for motion transfer to image-reference characters; for depth, pose or edge control use the MiniMax H3 FL2VA ControlNet-Union model. `VU` supplies the control video's unchanged frames as `<Video 1>`: an in-context guide for LoRAs that transform a source video, such as character swap; name it `<Video 1>` in the prompt and state what to do with it. `GV` (Denoise Control Video) edits through denoising: lower strength preserves more source content; at strength 1 without a mask, the source supplies no visual conditioning. `GV` does not supply a video reference.
+`video_guide`, `video_guide2` and `video_guide3` supply up to three reference videos for appearance, motion or camera; choose the corresponding video mode. `V1-U` instead takes up to three excerpts from `video_guide` at `custom_settings.h3_video_excerpt_positions`: frame numbers or seconds such as `5.2s`, each optionally followed by `/duration` (default 3s), for example `3 5.2s/4s 12s`. Reference videos preserve the chosen output size and are given whole to every sliding window. Control videos (`VU`, `VU2`, `GV`) use the control video's aspect ratio and are split across sliding windows, each window receiving its own section. `VU2` is the aligned guide (ComfyUI Add Guide at frame 0): control frame i guides output frame i, not shown to the prompt encoder; only for LoRAs trained with it (BFS Character Swap / Head Swap / Motion Transfer Guide Latents), otherwise H3 tends to copy the control video. Use Reference Video for motion transfer to image-reference characters; for depth, pose or edge control use the MiniMax H3 FL2VA ControlNet-Union model. `VU` supplies the control video's unchanged frames as `<Video 1>`: an in-context guide for LoRAs that transform a source video, such as character swap; name it `<Video 1>` in the prompt and state what to do with it. `GV` (Denoise Control Video) edits through denoising: lower strength preserves more source content; at strength 1 without a mask, the source supplies no visual conditioning. `GV` does not supply a video reference.
 
 `audio_prompt_type`: empty = no audio input. References, whose voice or sound H3 reuses in newly generated audio: `A` = `audio_guide`, `AB` = two audio guides, `ABD` = three audio guides, `K` = reference-video soundtracks (not with excerpts);  `K1` = up to three soundtrack excerpts at `custom_settings.h3_audio_excerpt_positions`, same syntax, independent of the video excerpts; the prompt defines each reference's role. Soundtrack, kept as the output audio and followed by the video across sliding windows: `AS` = `audio_guide`, `KS` = the whole audio track of the reference video or of a control video (`GV`, `VU`). `K` / `K1` need reference videos (`K1` a single one or excerpts from one); `KS` also accepts a control video. A kept soundtrack is not a reference: give it no <Audio N> label.
 
@@ -244,6 +245,7 @@ Each excerpt lasts at least 2 seconds, the excerpts total at most 15 seconds, an
 
 - **Reference Video:** reuse subjects, appearance, or motion without changing the selected output resolution. Choose this mode to transfer motion from a video to characters supplied in reference images; describe the subject replacements in the prompt. Reference videos do not use Denoising Strength.
 - **Use Control Video as In-Context Guide:** H3 receives the control video's unchanged frames as `<Video 1>` and generates a new video from them. Choose this mode for LoRAs that transform a source video, such as a character swap: name the video `<Video 1>` in the prompt and say what to change and what to keep. Without such a LoRA, it behaves like a Reference Video that follows the control video section by section.
+- **Use Control Video as Aligned Guide (for LoRAs trained with it):** each frame of the control video guides the same frame of the output, as ComfyUI's **Add Guide** node does. Choose it only for LoRAs trained this way, such as the BFS Character Swap, Head Swap and Motion Transfer (Guide Latents) LoRAs: with them the result keeps the control video's scene, framing and performance and changes what the LoRA and prompt ask. Write the prompt as the LoRA's author recommends. Without such a LoRA, H3 tends to reproduce the control video. The control video is not numbered among the reference videos.
 - **Denoise Control Video (Video-to-Video Edit):** edit the source video using the prompt and **Denoising Strength**. Lower strength preserves more source content. At `1.0` with **Whole Frame** selected, the source video supplies no visual conditioning. Choose **Masked Area** or **Non Masked Area** to edit part of the frame. This mode does not supply the video as a motion/appearance reference.
 
 Reference videos adapt to your chosen output size and guide the result creatively, without guaranteeing exact motion reproduction. Each sliding window receives the whole reference video (up to its first 15 seconds).
@@ -327,10 +329,12 @@ A kept soundtrack stays in the saved output, but visible speech also depends on 
 
 The branch is guidance-distilled: keep **Guidance** at 1. Upstream demonstrations use 40 steps; 20 steps already give usable results. Keep each window within 15 seconds (362 frames), the duration the control branch was trained on. Two-phase generation and text-to-image are not available with this model.
 
+The FL2VA LoRA Accelerator profiles apply, including **Pika H3 Flex FL2VA 6 Steps** and **DMAD 8 Steps** / **DMAD 4 Steps** with their re-noise samplers. With a control video, DMAD stays closest to the control's motion but can smear fast movement, such as flying hair or fabric edges. Pika gives a clean picture but follows the control more loosely, for example raising arms that the source keeps down.
+
 See the [ControlNet-Union 2.0 model card](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0) for upstream details.
 """
 
-CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `AS` = keep `audio_guide` as soundtrack; `KS` = keep the control video's soundtrack; `A` or `K` alone mean the same. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue); face pose and gestures compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. Read `prompt_infos` for H3's structured prompt syntax."""
+CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `AS` = keep `audio_guide` as soundtrack; `KS` = keep the control video's soundtrack; `A` or `K` alone mean the same. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue); face pose and gestures compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. FL2VA accelerator profiles apply: Lightx2v (euler), `pika_renoise` 6 steps and `dmad_renoise` 8 / 4 steps with their LoRAs; with a control video dmad follows the control's motion most closely but smears fast movement, pika is clean but follows the control loosely. Read `prompt_infos` for H3's structured prompt syntax."""
 
 CONTROL_DEEPY_INFOS += """\n\nSpatial outpainting: use `video_prompt_type: V` (Use Control Video as is), the original RGB `video_guide`, and `video_guide_outpainting` as four space-separated percentages (top bottom left right), e.g. `0 0 25 25`. No `video_mask` is needed for borders alone. Alternatively, set `video_guide_outpainting_ratio`, e.g. `16:9`, with `video_guide_outpainting: 0 0 0 0` for balanced expansion; `#` disables expansion. `resolution` is the final canvas. Enabling expansion routes the visible source and automatic border mask through ControlNet inpainting, not FL2VA denoising; no Grouped Rows requirement. With expansion disabled, `V` retains its normal prepared-control-map behavior. For simultaneous interior edits, use `VA` or `MVA` plus `video_mask`; masked pose/depth/edge/shape/grayscale modes also support expansion. Describe the completed scene and new surroundings; the original rectangle is guided, not copied pixel for pixel."""
 
@@ -431,6 +435,9 @@ H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting pr
 More aggressive quantization can slightly affect prompt interpretation.
 """
 
+H3_VEDA_FULL_LAYERS = {"id": H3_VEDA_FULL_LAYERS_SETTING, "name": "Veda Full Attention Layers", "label": "Veda Full Attention Layers", "type": "dropdown",
+                       "default": "none", "choices": H3_VEDA_FULL_LAYERS_CHOICES}
+
 H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into frames.
 
 - **Auto:** follows Transformer Quantization: INT8 selects INT8 ConvRot Decoder, FP8 selects FP8 Mixed Precision, and other choices select BF16.
@@ -438,6 +445,7 @@ H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into fra
 - **FP8 Mixed Precision:** use the mixed-precision version of the full H3 VAE.
 - **INT8 ConvRot Decoder:** use the quantized full decoder.
 - **LightVAE Lite BF16** and **LightVAE Lite INT8 ConvRot:** use a smaller 12-layer decoder. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE.
+- **Sol VAE INT8 ConvRot:** a 24-layer decoder distilled from the full one, which decodes whole frames instead of small tiles: about four times faster than the full VAE and, from 720p, faster than LightVAE, with almost the full VAE's detail. It keeps the original H3 encoder. Its decoding memory grows with the resolution and length of the video: about 4.3 GB for 5 seconds at 1080p, 1 GB more than the INT8 ConvRot Decoder.
 
 Selecting **MiniMax H3 VAE** spatial upsampling replaces the selected decoder, including LightVAE, with the X2 decoder.
 """
@@ -519,6 +527,20 @@ HYPERFLOW_DEEPY_INFOS = (" HyperFlow H3 Flash (Video Rebirth's compressed few-st
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_ACCELERATOR_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_HYPERFLOW_RUNTIME_INFOS = HYPERFLOW_INFOS.rstrip("\n") + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
+DWD_INFOS = """
+### pi-H3 DWD (Decoding Without Decoder)
+
+This model generates a video in a fixed, very small number of steps, and its last step draws the frames directly instead of handing a latent to the Video VAE: no separate video decoding phase follows.
+
+- **Steps, sampler and schedule are fixed:** the number of steps shown, the Euler sampler and the model's own schedule. There is no guidance pass, second phase, step skipping or custom sigmas.
+- **Video VAE choice:** it only encodes the start and end images. The VAE upsampler is not available, since the frames do not come from the VAE.
+- **LoRAs:** LoRAs made for H3 FL2VA can be added; they act on the denoising, not on how the frames are drawn. Lower their multipliers if the result degrades.
+- **Limits:** the frames are drawn from a state that is still slightly noisy, so fine texture can differ from a VAE decode of the same generation; its authors mark this variant as experimental. For the same speed with the regular VAE decode, use the **pi-H3** accelerator profiles of the FL2VA models.
+"""
+H3_DWD_RUNTIME_INFOS = DWD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
+DWD_DEEPY_INFOS = (" pi-H3 DWD: exactly {steps} inference steps, sample_solver=euler, flow_shift=12, guidance_phases=1, guidance_scale=1, custom_sigmas='', "
+                   "skip_steps_cache_type='' (all forced). The last step predicts the frames itself: no VAE decode, no VAE upsampling, no audio refinement. "
+                   "Its built-in LoRA loads automatically; H3 FL2VA LoRAs can be added.")
 H3_FASTH3_RUNTIME_INFOS = FASTH3_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 
 PRUNED_INFOS = """
@@ -808,7 +830,6 @@ class family_handler:
             pruned = base_model_type == CONTROL_PRUNED_ARCHITECTURE
             result = family_handler.query_model_def(FL2VA_PRUNED_ARCHITECTURE if pruned else FL2VA_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
-            result["sample_solvers"] = [choice for choice in result["sample_solvers"] if choice[1] not in (PIKA_SOLVER, DMAD_SOLVER)]
             for key in ("guide_custom_choices", "custom_frames_injection", "one_image_ref_only", "switch_threshold"):
                 result.pop(key)
             result.update({
@@ -817,8 +838,8 @@ class family_handler:
                                   "description": "Drive motion and structure with a pose, depth, edge, shape or grayscale control video."},
                                  {"name": "video inpainting", "description": "Regenerate a masked area of a video."},
                                  {"name": "video outpainting", "description": "Extend the video canvas using ControlNet's visible-source and border-mask conditioning."}],
-                "infos": CONTROL_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS + (PRUNED_INFOS if pruned else ""),
-                "deepy_infos": CONTROL_DEEPY_INFOS,
+                "infos": CONTROL_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + PIKA_INFOS + DMAD_INFOS + H3_COMMON_RUNTIME_INFOS + (PRUNED_INFOS if pruned else ""),
+                "deepy_infos": CONTROL_DEEPY_INFOS + PIKA_DEEPY_INFOS + DMAD_DEEPY_INFOS,
                 "prompt_infos": FL2VA_PROMPT_INFOS, "deepy_prompt_infos": FL2VA_DEEPY_PROMPT_INFOS,
                 "v2i_switch_supported": False, "image_outputs": False,
                 "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1, "phase_2_spatial_tiling": False, "inference_steps2": False,
@@ -852,8 +873,11 @@ class family_handler:
         hyperflow = model_def.get("hyperflow", False)
         if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
             raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
-        fixed_schedule = pdd or fasth3 or hyperflow
-        single_phase = pdd or fasth3  # HyperFlow Flash takes a second, higher-resolution phase (Regenerate 2K IC)
+        dwd = model_def.get("dwd", 0)  # pi-H3 Decoding Without Decoder: the step count the model was trained for
+        if dwd and (reference_mode or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow"))):
+            raise ValueError("pi-H3 DWD is declared on the FL2VA architectures, without other acceleration flags")
+        fixed_schedule = pdd or fasth3 or hyperflow or bool(dwd)
+        single_phase = pdd or fasth3 or bool(dwd)  # HyperFlow Flash takes a second, higher-resolution phase (Regenerate 2K IC)
         pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
@@ -864,7 +888,7 @@ class family_handler:
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow or dwd else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -914,10 +938,10 @@ class family_handler:
             },
             "inference_steps": True,
             "inference_steps2": not single_phase,
-            "lock_inference_steps": pdd or fasth3,
-            "flow_shift": not hyperflow,
-            "spectrum_cache": not hyperflow,
-            "first_block_cache": not hyperflow,
+            "lock_inference_steps": pdd or fasth3 or bool(dwd),
+            "flow_shift": not hyperflow and not dwd,
+            "spectrum_cache": not hyperflow and not dwd,
+            "first_block_cache": not hyperflow and not dwd,
             "skip_steps_multiplier_choices": FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
             "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
@@ -951,7 +975,7 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_RUNTIME_INFOS))
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_DWD_RUNTIME_INFOS if dwd else H3_RUNTIME_INFOS))
                      + (PRUNED_INFOS if pruned and not hyperflow else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
@@ -973,7 +997,7 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd or dwd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets", "minimax_h3_ref2va_presets"] if reference_mode else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
@@ -1005,6 +1029,7 @@ class family_handler:
                 "int8_convrot": {"name": "INT8 ConvRot Decoder", "video_vae_file": VIDEO_VAE_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
                 "lightvae": {"name": "LightVAE Lite BF16", "video_vae_file": VIDEO_VAE_LIGHT_FILE, "x2_vae_file": X2_VAE_FILE},
                 "lightvae_int8": {"name": "LightVAE Lite INT8 ConvRot", "video_vae_file": VIDEO_VAE_LIGHT_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
+                "sol_int8": {"name": "Sol VAE INT8 ConvRot", "video_vae_file": VIDEO_VAE_SOL_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
             },
             "system_configs3": {
                 "_name": "DiT Denoising Priority",
@@ -1013,15 +1038,17 @@ class family_handler:
                 "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
             },
         }
-        if pdd or hyperflow:
+        if pdd or hyperflow or dwd:
             result["custom_settings"] = result["custom_settings"][:1]
+        if dwd:  # its pixel head replaces the VAE decoders
+            del result["vae_upsamplers"]
         if reference_mode:
             result.update({
                 "sliding_window": True,
                 "video_continuation": True,
                 "deepy_infos": REF2VA_DEEPY_INFOS,
                 "deepy_prompt_infos": REF2VA_DEEPY_PROMPT_INFOS,
-                "sliding_window_defaults": {"window_min": 124, "window_max": 481, "window_step": 17, "window_default": 362,
+                "sliding_window_defaults": {"window_min": 124, "window_max": 736, "window_step": 17, "window_default": 362,
                                             "overlap_min": 1, "overlap_max": 120, "overlap_step": 17, "overlap_offset": 1, "overlap_default": 18,
                                             "discard_step": 1},
                 "frames_selection_maximum": 737,
@@ -1051,8 +1078,9 @@ class family_handler:
                                 # ("Transfer Depth Map From Control Video", "DV"),  # superseded by the FL2VA ControlNet-Union model
                                 # ("Transfer Edges Map From Control Video", "EV"),
                                 ("Denoise Control Video (Video-to-Video Edit)", "GV"),
-                                ("Use Control Video as In-Context Guide", "VU")],
-                    "letters_filter": "GPDEV+*-U1",
+                                ("Use Control Video as In-Context Guide", "VU"),
+                                ("Use Control Video as Aligned Guide (for LoRAs trained with it)", "VU2")],
+                    "letters_filter": "GPDEV+*-U12",
                     "default": "",
                     "label": "Reference / Control Video",
                 },
@@ -1099,7 +1127,7 @@ class family_handler:
                 "video_continuation": True,
                 "deepy_infos": FL2VA_DEEPY_INFOS,
                 "deepy_prompt_infos": FL2VA_DEEPY_PROMPT_INFOS,
-                "sliding_window_defaults": {"window_min": 124, "window_max": 481, "window_step": 17, "window_default": 362,
+                "sliding_window_defaults": {"window_min": 124, "window_max": 736, "window_step": 17, "window_default": 362,
                                             "overlap_min": 1, "overlap_max": 120, "overlap_step": 17, "overlap_offset": 1, "overlap_default": 18,
                                             "discard_step": 1},
                 "image_prompt_types_allowed": "TSEVL",
@@ -1147,6 +1175,8 @@ class family_handler:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler. LoRAs trained for the matching base model apply."
         elif hyperflow:
             result["deepy_infos"] += HYPERFLOW_DEEPY_INFOS
+        elif dwd:
+            result["deepy_infos"] += DWD_DEEPY_INFOS.format(steps=dwd)
         else:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. LoRA Accelerators before `|` with any nonzero phase-2 multiplier replace the automatic LoRA Accelerator (Lightx2v 4 Steps) together, at their specified multipliers; if all are zero, the automatic one is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
@@ -1164,7 +1194,13 @@ class family_handler:
             result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it uses phase-1 audio as frozen phase-2 conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
         if veda:
             result["compile"] = False
+            result["custom_settings"] = result["custom_settings"] + [H3_VEDA_FULL_LAYERS]
             help_text = " Veda variants always use learned sparse attention in the H3 transformer; the attention override is locked to Veda. Other attention operations use the application attention backend. It reuses the standard H3 settings, LoRAs and step counts. The predictor follows Transformer Quantization (BF16 or INT8 ConvRot). Sparsity can change fine detail or motion; compare with a standard H3 variant at the same seed. Speed benefits are greatest for large videos. Requires Triton and an NVIDIA SM80+ GPU. Veda runs without CUDA graphs or transformer compilation."
+            result["infos"] += ("\n\n**Veda Full Attention Layers:** if white or overexposed frames flash in your Veda videos, choose **Full Attention on the First "
+                                "Two and Last Layers**. These three layers then use full attention instead of Veda, which ComfyUI users reported removes the "
+                                "flashes, for a little of Veda's speed gain. **Veda on Every Layer**, the default, keeps the full speed gain.")
+            result["deepy_infos"] += (f" `custom_settings.{H3_VEDA_FULL_LAYERS_SETTING}`: `none` (default, Veda on all 50 layers) or `0,1,49` (layers 0, 1 and 49 on "
+                                      "full attention, reported to remove white flash frames, slightly slower).")
             result["infos"] += "\n\n### Veda Sparse Attention\n\n" + help_text.strip()
             result["deepy_infos"] += help_text
         if pika_supported:
@@ -1176,7 +1212,7 @@ class family_handler:
         result["deepy_infos"] += still_infos + " Set `image_mode` to `1`."
         result["infos"] += "\n\n**MiniMax H3 VAE:** " + X2_VAE_DESCRIPTION
         result["deepy_infos"] += " MiniMax H3 VAE replaces the default VAE and handles decoding and upsampling together. Choose `h3_vae*2` to double the output width and height, `h3_vae*1.5` to enlarge them by half, or `h3_vae*1` to keep the original size."
-        result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. VAE upsampling overrides this choice with the X2 decoder."
+        result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. `sol_int8` selects Sol-H3-VAE's 24-layer decoder distilled from the full one (whole frames, no tiles): about 4x faster than the full VAE, faster than LightVAE from 720p, much closer to the full VAE than LightVAE; decode VRAM grows with resolution and length (about 4.3 GB for 5 s at 1080p, 1 GB more than `int8_convrot`). VAE upsampling overrides this choice with the X2 decoder."
         result["prompt_infos"] += still_prompt_infos
         result["deepy_prompt_infos"] += still_prompt_infos
         if ptd:
@@ -1187,7 +1223,32 @@ class family_handler:
                 "spectrum_cache": False, "first_block_cache": False, "flow_shift": False,
                 "custom_settings": [setting for setting in result["custom_settings"] if setting["id"] != H3_AUDIO_REFINEMENT_SETTING],
             })
+        if model_def.get("world_outputs", False):  # a pi-H3 world (models/minimax_h3/world.py): segments continued from their own latents
+            if not dwd or reference_mode:
+                raise ValueError("pi-H3 worlds are declared on a pi-H3 DWD FL2VA model")
+            from .world_texts import H3_WORLD_DEEPY_INFOS, H3_WORLD_DEEPY_PROMPT_INFOS, H3_WORLD_INFOS, H3_WORLD_PROMPT_INFOS
+            for key in ("sliding_window_defaults", "guide_custom_choices", "audio_prompt_type_sources", "mask_preprocessing", "video_guide_outpainting",
+                        "video_guide_outpainting_label", "custom_frames_injection", "audio_prompt_choices", "any_audio_prompt", "prompt_enhancer_def",
+                        "prompt_enhancer_button_label", "spoken_line_prompt", "end_frames_always_enabled", "output_audio_is_input_audio", "audio_guide_label",
+                        "audio_guide_window_slicing", "video_length_not_limited_by_audio", "video_guide_label", "one_image_ref_only"):
+                result.pop(key, None)
+            result.update({
+                "world_outputs": True, "recycle_latents": "frames", "sliding_window": False, "video_continuation": False, "v2i_switch_supported": False,
+                # no CUDA graphs: each move's prompt has its own length, a new graph capture (+1.6 s) for every new key combination or event,
+                # against 0.1 s saved per pass once captured (5090, 832x480)
+                "cuda_graphs": [],
+                "image_prompt_types_allowed": "TS",  # a new world starts from text or a start image; a continued world from its own latents
+                "custom_guide": {"id": "custom_guide", "name": "World", "label": "Continue a World (.wgpworld of the Worlds gallery)", "type": "file", "default": None,
+                                 "required": False, "file_types": [".wgpworld"]},
+                "custom_settings": [],
+                "infos": H3_WORLD_INFOS, "prompt_infos": H3_WORLD_PROMPT_INFOS, "deepy_infos": H3_WORLD_DEEPY_INFOS, "deepy_prompt_infos": H3_WORLD_DEEPY_PROMPT_INFOS,
+            })
         return result
+
+    @staticmethod
+    def query_world_explorer(base_model_type, manifest, memory):
+        from .world import explorer_menus
+        return explorer_menus(manifest)
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
@@ -1203,8 +1264,8 @@ class family_handler:
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
             if len(inputs["image_refs"] or []) > P_H3_IMAGE_MAX_IMAGES:
                 return f"P-H3-Image edits with at most {P_H3_IMAGE_MAX_IMAGES} images"
-            if inputs["sample_solver"] != "euler":
-                return "P-H3-Image requires the Euler sampler"
+            if inputs["sample_solver"] not in ("euler", LCM_SOLVER):
+                return "P-H3-Image samples with Euler or LCM"
             return None
         if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
             if inputs["video_guide"] is None:
@@ -1236,15 +1297,15 @@ class family_handler:
             return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
-                return "Pika H3 Flex requires a standard FL2VA or Ref2VA model"
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, *CONTROL_ARCHITECTURES) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
+                return "Pika H3 Flex requires a standard FL2VA, Ref2VA or ControlNet-Union model"
             if inputs["num_inference_steps"] != PIKA_STEPS or inputs["flow_shift"] != PIKA_VIDEO_SHIFT or inputs["guidance_phases"] != 1:
                 return "Pika H3 Flex requires 6 steps, flow shift 12 and one generation phase; apply its matching accelerator profile"
             if inputs["custom_sigmas"] or inputs["skip_steps_cache_type"]:
                 return "Pika H3 Flex requires empty Custom Sigmas and No Skipping"
         if inputs["sample_solver"] == DMAD_SOLVER:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
-                return "The DMAD re-noise sampler requires a standard FL2VA or Ref2VA model"
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, *CONTROL_ARCHITECTURES) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
+                return "The DMAD re-noise sampler requires a standard FL2VA, Ref2VA or ControlNet-Union model"
             if inputs["skip_steps_cache_type"]:
                 return "The DMAD re-noise sampler requires No Skipping"
         if model_def.get("ptd", False):
@@ -1305,6 +1366,20 @@ class family_handler:
             if inputs["sample_solver"] != "euler":
                 return "MiniMax H3 PDD requires the Euler sampler"
             inputs["num_inference_steps"] = required_steps
+        if model_def.get("dwd", 0):
+            if inputs["sample_solver"] != "euler":
+                return "pi-H3 DWD requires the Euler sampler"
+            inputs.update({"num_inference_steps": model_def["dwd"], "flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
+        if model_def.get("world_outputs", False):
+            from shared.utils.world_instructions import split_instructions
+            from .world import WORLD_CONTROLS
+            try:
+                description = split_instructions(inputs["prompt"], WORLD_CONTROLS)[0]
+            except ValueError as error:
+                return str(error)
+            if inputs["custom_guide"] is None and not description:
+                return "A new pi-H3 world needs a description of the scene before its moves"
+            return None
         if model_def.get("hyperflow", False):
             if inputs["num_inference_steps"] not in HYPERFLOW_STEPS:
                 return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
@@ -1321,6 +1396,11 @@ class family_handler:
         inputs["sliding_window_overlap"] = min(overlap, 107) if H3_CONTROL_LATENT_CONTINUATION and base_model_type in CONTROL_ARCHITECTURES else overlap
         from shared.utils.utils import get_outpainting_dims
 
+        if model_def.get("veda", False):
+            try:
+                h3_veda_full_layers(inputs.get("custom_settings"))
+            except ValueError as error:
+                return str(error)
         grouped_masking = base_model_type not in CONTROL_ARCHITECTURES and h3_grouped_masking_enabled(inputs.get("custom_settings"))
         outpainting = get_outpainting_dims(inputs.get("video_guide_outpainting"), inputs.get("video_guide_outpainting_ratio", "")) is not None
         if outpainting and base_model_type not in CONTROL_ARCHITECTURES and not grouped_masking:
@@ -1517,8 +1597,8 @@ class family_handler:
                      "fileList": [[H3_IMAGE_VAE_FILE.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"]]}]
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
             vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE)
-            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER],
-                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"]]}]
+            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER, LATENT_UPSCALER_FOLDER],
+                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"], [LATENT_UPSCALER_FILE]]}]
         source_folders = []
         file_lists = []
         if model_def.get("ptd", False):
@@ -1528,7 +1608,7 @@ class family_handler:
         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
         if video_vae_file in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE):
             vae_files.append(video_vae_file)
-        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE):
+        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE, VIDEO_VAE_SOL_INT8_FILE):
             source_folders.append("minimax_h3")
             file_lists.append([video_vae_file.rsplit("/", 1)[-1]])
         if "audio_vae_file" not in model_def:
@@ -1595,6 +1675,10 @@ class family_handler:
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
                                  image_model=image_model, distilled_text_encoder=distilled_text_encoder, remake_mode=remake_mode)
         pipeline.ptd = model_def.get("ptd", False)
+        pipeline.recycle_latents = model_def.get("recycle_latents", False)
+        if model_def.get("world_outputs", False):
+            from .world import H3World
+            pipeline.world = H3World(pipeline, model_type)
         pipe = {"transformer": pipeline.transformer}
         if image_model:
             pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,
@@ -1628,7 +1712,15 @@ class family_handler:
             pipe = BorrowingPipe(pipe)
             pipe.update({name: shared_h3_offloadobj.models[name] for name in borrowed_names})
             pipe._mmgp_ignore_models = borrowed_names
-        return pipeline, {"pipe": pipe, "pinnedMemory": False} if disable_pinning else pipe
+        offload_kwargs = {"pipe": pipe, **({"pinnedMemory": False} if disable_pinning else {})}
+        if shared_h3_pipeline is None and (sys.modules["wgp"].server_config.get("keep_models_loaded", False) or model_def.get("world_outputs", False)):
+            # Keep Models in VRAM: the audio VAE decodes beside the transformer, whose preloaded blocks stay for the next sample (models
+            # without a video decoding, such as pi-H3 DWD, then keep only the transformer between samples); a world's segments alternate
+            # them within one generation
+            offload_kwargs["coTenantsMap"] = {"audio_vae": ["transformer"], "transformer": ["audio_vae"]}
+            if model_def.get("recycle_latents") == "frames":  # each continuation encodes its overlap beside the transformer
+                offload_kwargs["coTenantsMap"] = {"audio_vae": ["transformer", "video_encoder"], "video_encoder": ["transformer", "audio_vae"], "transformer": ["audio_vae", "video_encoder"]}
+        return pipeline, offload_kwargs
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
@@ -1756,5 +1848,10 @@ class family_handler:
             ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if model_def.get("hyperflow", False):
             ui_defaults.update({"num_inference_steps": HYPERFLOW_DEFAULT_STEPS, "flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("dwd", 0):
+            ui_defaults.update({"num_inference_steps": model_def["dwd"], "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("world_outputs", False):
+            ui_defaults.update({"video_length": 107, "resolution": "832x480", "image_prompt_type": "T", "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "",
+                                "multi_prompts_gen_type": "FG"})  # the whole prompt is one world description, whatever its lines
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

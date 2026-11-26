@@ -83,6 +83,60 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
+
+## 24th of November 2026: WanGP v20.20 - No Time to Wait for a Gen
+
+- **Faster WanGP Startup**: WanGP should be twice as fast to launch
+
+- **Less Time Between Gens**: unchanged LoRAs remains loaded in RAM between two gens, output video can be saved asynchronously when starting a new gen, Hardware NVidia encoding for faster h264/h265 video save. Thanks to *@space3* for the suggestions.
+
+- **Maintenance Tools**: In **Config > Performance** purge your Triton cache (sometime solves performance issues), **Config > Outputs > Gradio Media Cache**, purge temp gradio files, thanks to *@JedsDeadBaby* for the original PlugIn
+
+- **Sensenova u1.6**: the **Best Infographics Generator** has been upgraded. It contains an optional **Self Correcting** tool that will fix automatically bad spelling or layout errors. Note that to get the best speed the correcting tool needs Memory Profiles 0/1/3
+
+- **Inkling 2 Mini SpeedUp**: up to 50% faster
+
+- **Qwen3.8 27B - Bonsai 2.5**: the smallest Qwen 3.8 used by Deepy Prime has been upgraded and now is much smarter while still being able to run with only 8GB of VRAM
+
+## 22nd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
+
+- **pi-H3 with optional DWD**: new H3 FL2VA variant **2 or 4 steps**, that claims to be the fastest. **pi-H3 DWD** draws the frames in its last step, so it is **Decoding Without a Decoder**. Choose 2 steps for quick experiments and 4 for more detail. The new **pi-H3 FL2VA 2 Steps / 4 Steps** accelerator profiles bring the same step counts to standard and Pruned FL2VA models while keeping the regular video decoder.
+
+- **Extreme Chunker: One More Squeeze of VRAM**: with low VRAM GPU if ordinary chunking is not enough, **Auto** can now switch to **Extreme** for supported models. It processes smaller pieces to lower peak VRAM further, at the cost of speed (10-30% slowdown). Still much faster than spilling to RAM. With Extreme Chunker **H3 1080 15s requires now 5.9 GB of VRAM !**
+
+- **SageGP**: It is a new kernels wheel that is a drop in replacement for Sage2/Sage3. RTX 50XX owners get three attention choices in *Configuration > Performance*: **sage2 gp** for SageAttention 2-level precision with a *10% speed boost*,**sage3 gp** for sage 3 speed but at *twice the precision* and **sage 2/3 adaptative gp** to balance speed and precision with the current content,  **Run the First Denoising Step in Precise**, enabled by default, helps keep the composition closer. Install **SageGP 1.0.2** for the PyTorch 2.10 environment; the adaptive and sage3 modes also need **Triton 3.6+**. [Installation and mode guide](docs/INSTALLATION.md#sagegp-attention-modes-rtx-50xx). SageGP is also installed by WanGP Manager for RTX20xx / RTX30xx / RTX40xx. Although there is no speed up or precision gain for these GPUs, it contains extra kernels used by Extreme Chunker.
+
+- **Inkling 2 Mini Joins Deepy**: a new **Uncensored LLM** for **Deepy Zero, Deepy Prime and the Prompt Enhancer**. Choose **Inkling 2 Mini VL Uncensored** in *Configuration > Deepy / Prompt Enhancer*. Checkpoint requires 20GB  but it can run on 10GB-16GB VRAM cards at a speed cost. Its optional **DSpark** speculative decoding adds about 1 GB of VRAM; with **Number of Tokens** on **Auto**, it adjusts how many tokens it predicts ahead. Mini name, grown-up appetite.
+
+### Showrunner: Keep the Cameras Rolling
+
+- **Shots That Pick Up Where You Left Off**: choose a shot's **Start and end** pictures, take a frame from a neighbouring shot, or **Go on from the shot before it** to continue its movement and sound. Shared frames are removed from the new take so the edit avoids a repeated overlap. A long shot with an end picture can be **Split** into connected shots. Choices depend on the video model, and Showrunner flags when a changed neighbouring take or trim means a connected shot needs another render.
+
+- **“And After That…”**: queue your next request with the **clock button** beside Send, or **Ctrl+Enter**, while Showrunner finishes the current task. Requests run in order after successful completion and stay waiting after a pause, stop or error.
+
+- **Upscale this version** on Deliver creates a larger version of the finished edit using an enabled upsampler. **Lyrics as subtitles** is now a separate, **off-by-default** choice for cuts playing the song; spoken dialogue and narration still produce automatic subtitles. [Showrunner guide](docs/SHOWRUNNER.md).
+
+
+## 17th of November 2026: WanGP v20.00 - VRAM and RAM so Low You Can't Measure Them !
+
+- **Even Less VRAM, Again!** Thought VRAM usage couldn't get any lower? The new **Smart Inputs Chunker**, which replaces the Attention Head Splitter, lets you generate **15 seconds of H3 video at 1080p with only 8 GB of VRAM!** Best of all, generation takes in the worst case **1-2% longer**. Find it in *Configuration > Performance > Smart Inputs Chunker* and choose **Auto** to use chunking only when VRAM would otherwise run short.
+
+- **VAE RAM/VRAM Reduction**: GPUs with limited VRAM just got a free quality upgrade. VAE decoders can now use much larger tiles within the same memory budget, improving output quality. WanGP automatically picks the largest tiles that fit, or skips tiling when the whole frame fits. Choose **Auto** in *Configuration > VRAM Management > VAE Tiling*, or set a fixed share of VRAM. As a bonus, some VAE decoders, including LTX-2.x, get an **extra 10-20% speedup**. You will need to install new *WGPKernels 1.5.0*.
+
+- **Infinite Sliding Windows**: Low on RAM? Say goodbye to the **3,000-frame limit**! Keep extending your video - forever and ever - while **RAM usage stays steady** as the video grows. Each new window is appended without re-encoding the earlier ones. 
+
+- **LongCat Avatar 1.6**: Put Infinite Sliding Windows to work with talking-head videos featuring **one or two people**. Animate a reference image from speech and generate several minutes with little visual degradation. All LongCat models also gain an optional **KV Cache** accelerator; paired with the distilled model, it can generate several seconds of video in just a few minutes.
+
+- **RMBG 3.0**: Generate detailed **grayscale alpha mattes in 4 steps**, preserving fine details, soft edges and transparency for cutouts and compositing. Select **Fibo 2 > RMBG-3.0** under the Fibo 2.0 family, supply a reference image and use the default prompt.
+
+- **ZONOS3 Mini**: Fast, expressive speech in **43 languages**, with **27 built-in voices** or a voice cloned from a short recording. Shape the delivery with voice presets and cues such as `[happy]` or `[whisper]`, adjust voice characteristics, or create dialogues with up to **three speakers**. The small model generates speech much faster than real time.
+
+- **Background Remover**: Choose from **U²-Net**, **BiRefNet General** and **Bria RMBG-2.0** in *Configuration > Extensions > Image Preprocessors*. Use U²-Net for speed and a smaller memory footprint, or try the alternatives for finer edges and difficult cutouts. Your choice applies to reference-image cleanup.
+
+- **Deepy Skills**: Teach **Deepy Prime** reusable workflows, from your preferred character-sheet layout to the checks you want before a video is finished. Import a `SKILL.md` file or a skill ZIP, then read, edit or delete it in *Configuration > Deepy / Prompt Enhancer > Skills*. You can also ask Prime to save a successful method as a skill. Prime reads matching skills when needed, and connected MCP agents can use the same skills.
+
+- **H3 Ref2VA: Swaps and Control Video Injection**: Choose the **BFS Character Swap v1.1 (Aligned Guide)** preset to replace the main person in a **Control Video** with a character from a **Reference Image**, keeping the scene, camera and performance. The new **Aligned Guide** process uses each control-video frame to guide the matching output frame, with LoRAs trained for this mode.
+
 ## 12th of November 2026: WanGP v19.292 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
@@ -102,7 +156,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Showrunner: choose who sings**: have an uploaded or generated song sung by a cast member or a supplied voice sample, including **two voices for a duet**. Use **Change the voice** on an existing song or **Sung by** before composing. The music, lyrics and timing stay, so existing shots keep their lip sync. Requires **SeedVC v1.0 Singing** in **Configuration > Extensions**.
 
-- **Low RAM Continue Video & Late Post Processing**: extend or post-process long videos without loading them whole into RAM. Continue Video reads only the ending frames for generation and adds each new window without re-encoding earlier ones; a source needing conversion is processed once, in chunks. Now supports **Lanczos, FlashVSR, SeedVR2, RelayVSR and DLSS 5**, plus **RIFE / DLSS frame interpolation and Film Grain**. HDR continuation, LTX-2 upscalers / Detail Refiner, face refiners, and interpolation combined with an AI upscaler still need the whole video in memory. Use **Media Flow** which it still best suited for very long video as it supports pause/resume, manual chunk sizing and keep original audio not reencoded.
+- **Low RAM Continue Video & Late Post Processing**: extend or post-process long videos without loading them whole into RAM. Continue Video reads only the ending frames for generation and adds each new window without re-encoding earlier ones; a source needing conversion is processed once, in chunks. Now supports **Lanczos, FlashVSR, SeedVR2, RelayVSR, DLSS 5, LTX-2 upscalers and LTX 2.5 Detail Refiner**, plus **RIFE / DLSS frame interpolation and Film Grain**. LTX-2 uses the same window handling as Media Flow, with aligned audio for upscaling and detail carried across refiner windows. HDR continuation, face refiners, and interpolation combined with an AI upscaler still need the whole video in memory. **Media Flow** remains best suited to very long videos, with pause/resume, manual chunk sizing where supported, and original audio preserved without re-encoding.
 
 
 ## 8th of November 2026: WanGP v19.25 - Showrunner Makes and Remakes
@@ -274,12 +328,11 @@ See full changelog: **[Changelog](docs/CHANGELOG.md)**
 
 ## 🚀 Quick Start
 
-Choose one of these four guided installation methods:
+Choose a guided installation method from the list below.
 
 1. **[Bat/SH scripts](#one-click-batsh-script-auto-installer)** — install and maintain WanGP from the included scripts.
 2. **[Pinokio](#one-click-installers)** — use the community installer in Pinokio.
-3. **[Wan2GP Desktop](#one-click-installers)** — use GKArtist's desktop launcher.
-4. **[WanGP Manager](#wangp-manager-experimental-windows)** — the experimental official Windows app for guided installation, launching, updates and rollback.
+3. **[WanGP Manager](#wangp-manager-experimental-windows)** — the experimental official Windows app for guided installation, launching, updates and rollback.
 
 Manual installation instructions follow these options below.
 
@@ -334,16 +387,12 @@ Use this script to manage and switch between your sandboxed environments safely.
 ---
 
 ### One-click Installers
-- Pinokio installer
-Get started instantly with [Pinokio App](https://pinokio.computer/)\
-It is recommended to use in Pinokio the Community Scripts *wan2gp* or *wan2gp-amd* by **Morpheus** rather than the official Pinokio install.
 
-- Wan2GP Desktop by GKArtist
-[Wan2GP Desktop](https://github.com/GKartist75/Wan2GP-Desktop-Tauri) is a desktop launcher for Wan2GP that installs, updates, and runs it from one window — handling Git, Python, CUDA, and PyTorch setup so you don't have to configure them manually.
+In [Pinokio](https://pinokio.computer/), use the *wan2gp* or *wan2gp-amd* community script by **Morpheus**.
 
 ### WanGP Manager (Experimental, Windows)
 
-**The fourth installation method is an experimental Windows x64 app.** WanGP Manager guides you through choosing an installation folder, a WanGP version and the recommended profile for your detected GPU. It installs Python and dependencies for you, then lets you launch WanGP in its own app window or your browser. You can also update a managed installation, try an older build or roll back to a saved version.
+**WanGP Manager is an experimental Windows x64 app.** It guides you through choosing an installation folder, a WanGP version and the recommended profile for your detected GPU. It installs Python and dependencies for you, then lets you launch WanGP in its own app window or your browser. You can also update a managed installation, try an older build or roll back to a saved version.
 
 **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release.
 
@@ -491,7 +540,7 @@ This automated script will:
 
 ## 📦 Installation
 
-See the [four guided installation methods](#-quick-start), including **[WanGP Manager (Experimental, Windows)](#wangp-manager-experimental-windows)** and its permanent download link. The guides below cover manual installation and optional components.
+See the [guided installation methods](#-quick-start), including **[WanGP Manager (Experimental, Windows)](#wangp-manager-experimental-windows)** and its permanent download link. The guides below cover manual installation and optional components.
 
 ### Nvidia
 For detailed installation instructions for different GPU generations:

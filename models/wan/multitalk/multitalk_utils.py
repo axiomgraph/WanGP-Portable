@@ -15,7 +15,6 @@ import soundfile as sf
 import torchvision
 import binascii
 import os.path as osp
-from skimage import color
 from mmgp.offload import get_cache, clear_caches
 
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
@@ -297,7 +296,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
         f'{duration}',
         save_path_crop_audio,
     ]
-    subprocess.run(final_command, check=True)
+    subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
 
     save_path = save_path + ".mp4"
     if high_quality_save:
@@ -313,7 +312,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
     else:
@@ -331,7 +330,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
 
@@ -394,6 +393,7 @@ def match_and_blend_colors(source_chunk: torch.Tensor, reference_image: torch.Te
     Returns:
         torch.Tensor: The color-corrected and blended video chunk.
     """
+    from skimage import color  # here: skimage and scipy load when colors are matched, not with every Wan model
     # print(f"[match_and_blend_colors] Input source_chunk shape: {source_chunk.shape}, reference_image shape: {reference_image.shape}, strength: {strength}")
 
     if strength == 0.0:
@@ -484,9 +484,6 @@ def match_and_blend_colors(source_chunk: torch.Tensor, reference_image: torch.Te
     return output_tensor
 
 
-from skimage import color
-from scipy import ndimage
-from scipy.ndimage import binary_erosion, distance_transform_edt
 
 
 def match_and_blend_colors_with_mask(
@@ -634,6 +631,7 @@ def get_border_sampling_regions(mask, source_border_distance, reference_border_d
     Returns:
         Dict with sampling regions and distance maps for blending
     """
+    from scipy.ndimage import distance_transform_edt  # here: skimage and scipy load when colors are matched, not with every Wan model
     # Convert to boolean for safety
     mask_bool = mask.astype(bool)
     
@@ -668,6 +666,7 @@ def compute_color_stats(image, sample_region):
     Returns:
         Dict with 'mean' and 'std' for Lab components
     """
+    from skimage import color  # here: skimage and scipy load when colors are matched, not with every Wan model
     if not np.any(sample_region):
         raise ValueError("No pixels in sampling region")
     
@@ -703,6 +702,7 @@ def apply_color_correction_with_mask(source_frame, mask, source_stats, reference
     Returns:
         Corrected RGB image (H, W, C)
     """
+    from skimage import color  # here: skimage and scipy load when colors are matched, not with every Wan model
     try:
         source_lab = color.rgb2lab(source_frame)
     except ValueError as e:

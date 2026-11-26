@@ -98,6 +98,12 @@ export const actions = {
       return status;
     } catch (error) { toast(error.message, 'error', 7000); }
   },
+  async queue(text) {  // for after the current task
+    try { await api.queue(state.pid, text); } catch (error) { toast(error.message, 'error', 6000); }
+  },
+  async unqueue(index) {
+    try { await api.unqueue(state.pid, index); } catch (error) { toast(error.message, 'error', 6000); }
+  },
   async steer(text) {
     try { await api.steer(state.pid, text); } catch (error) { toast(error.message, 'error', 6000); }
   },
@@ -229,7 +235,7 @@ const refreshDoc = debounce(async () => {
 }, 120);
 
 // The showrunner streams its words and steps many times a second, and a render its progress: the page shows them at most ten times a second.
-const drawLive = throttle(() => { director?.live?.(); renderTopbar(); });
+const drawLive = throttle(() => { director?.live?.(); inspector?.update?.(); renderTopbar(); });  // the shot panel redraws only when its buttons change
 const drawProgress = throttle(() => { mounted?.progress?.(); renderTopbar(); });  // the pill says how far the user's renders are
 
 function eventsFor(pid) {
@@ -274,6 +280,12 @@ function eventsFor(pid) {
       else if (event.done) toast('The song is sung in its new voice. The former version is in the bin.', 'ok');
       mounted?.songVoice?.();
     },
+    upscale: event => {  // a version made larger, from Deliver
+      state.upscaling = event.done ? null : { version: event.version, progress: event.progress, status: event.status };
+      if (event.error) toast(`The version could not be upscaled: ${event.error}`, 'error', 8000);
+      else if (event.done) toast('The upscaled version is ready: it is the newest in Versions.', 'ok');
+      mounted?.upscaling?.();
+    },
     assemble: event => {
       if (!state.userAssembling) {  // an assembly the user started reports on its own button
         if (event.state === 'done') toast('The edit is assembled: watch it in Deliver.', 'ok');
@@ -303,6 +315,7 @@ async function catchUp() {
   mounted?.progress?.();
   if (!changed) return;  // the showrunner's state is unchanged: its panel and the top bar stay as they are (no flash when the tab comes back)
   director?.live?.();
+  inspector?.update?.();
   conversation?.catchUp();
   renderTopbar();
 }
@@ -499,7 +512,7 @@ export function activity(live) {
   return shot ? `Shooting ${shot[1]} · ${shot[2]} of ${shot[3]}` : phase;
 }
 
-// Renders the user started without the showrunner (Render now, Reshoot): their shots show rendering from the click, the one WanGP works on
+// Renders the user started without the showrunner (Render now, Render again): their shots show rendering from the click, the one WanGP works on
 // reports its progress, with the neighbours a remake renders together with it.
 function userRenders(doc) {
   const shots = doc.shots.filter(shot => shot.status === 'rendering');

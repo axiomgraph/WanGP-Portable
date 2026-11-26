@@ -437,7 +437,7 @@ The Prompt Enhancer can use a local model on the WanGP machine or the same exter
 
 ### Where It Is Enabled
 
-Open **Configuration > Prompt Enhancer / Deepy**, then select **Prompt Enhancer / Deepy LLM Engine**.
+Open **Configuration > Deepy / Prompt Enhancer**, then select **Deepy / Prompt Enhancer LLM Engine**.
 
 That global configuration decides:
 
@@ -463,8 +463,9 @@ Depending on your configuration, it either:
 | **Florence 2 + Llama Joy 8B** | Produces richer local rewriting than the 3B option but uses more memory. | Use when you prefer this writing style and do not need Deepy Prime. |
 | **Qwen3.5 VL Abliterated 4B** | Handles text and images in one local model with relatively low memory use. | Recommended local starting point for most users. |
 | **Qwen3.5 VL Abliterated 9B** | Better instruction following and richer prompts than 4B, with higher VRAM/RAM use. | Use when quality matters and it fits comfortably beside your generation model. |
-| **Qwen3.8 VL Uncensored 27B** | Strongest local understanding and rewriting, but much heavier to load and run. It supports Deepy Prime. | Use for quality-first work and complex visual instructions on high-memory systems; on GPUs with less than 16 GB of VRAM, choose its Bonsai 2 PTQ1_0 quantization. |
+| **Qwen3.8 VL Uncensored 27B** | Strongest local understanding and rewriting, but much heavier to load and run. It supports Deepy Prime. | Use for quality-first work and complex visual instructions on high-memory systems; on GPUs with less than 16 GB of VRAM, choose one of its Bonsai PTQ1_0 quantizations (2.0 or 2.5). |
 | **Qwen3.8 VL Flash-Next 125B** | The largest local model, kept mostly in RAM and on the drive with what the text needs in VRAM. It supports Deepy Prime. | Use on a PC with about 64 GB of RAM and a fast SSD (an 80 GB download). |
+| **Inkling 2 Mini VL Uncensored** | A fast, uncensored local model for text and images that follows system instructions closely and reads text inside pictures. One version (a 20 GB download), about 20 GB of VRAM. It supports Deepy Prime. | Use on a GPU with 24 GB of VRAM or more when you want quick enhancements and a quick Deepy Prime. |
 | **Codex** | Uses the selected external Codex model and does not occupy WanGP's local GPU memory. | Use when you already have Codex configured and want strong remote instruction following. |
 | **Claude Code** | Uses the selected external Claude model and does not occupy WanGP's local GPU memory. | Use when Claude is your preferred writing/reasoning provider. |
 | **OpenCode** | Connects through OpenCode to its configured provider, including supported cloud or local OpenAI-compatible services. | Use when you need provider flexibility or already manage models through OpenCode. |
@@ -544,6 +545,8 @@ Speculative decoding can make supported local Qwen text generation faster by pre
 - **Disabled** saves the additional VRAM and is appropriate when the generation model needs that memory.
 - **A method with Number of Tokens on Auto** keeps that method on and lets WanGP choose the draft count for your model and GPU.
 - **A method with a fixed Number of Tokens** allows manual tuning. More draft tokens are not always faster; compare repeated prompts if you want to tune it.
+
+Inkling 2 Mini shows its own drafter, **DSpark**, as its method: with **Number of Tokens** on **Auto** it uses 0 to 7 draft tokens per prediction, by what they bring on your GPU (several on code and structured text, few or none on long prose).
 
 Qwen3.5 4B and the Florence/Llama engines do not support this option. Quantization, speculative decoding, local sampling controls, and local VRAM-loading controls are hidden when an external engine is selected because the external provider owns its runtime behavior.
 
@@ -712,7 +715,7 @@ Use this only when you know exactly what format you want. It is powerful, but ea
 
 ## Think Mode
 
-With local Qwen3.5- and Qwen3.8-based prompt enhancers, WanGP can show a `Think` checkbox. External engines use their configured model and reasoning-effort controls instead.
+With local Qwen3.5-, Qwen3.8- and Inkling 2-based prompt enhancers, WanGP can show a `Think` checkbox. External engines use their configured model and reasoning-effort controls instead.
 
 Practical use:
 
@@ -796,7 +799,7 @@ If your line-processing mode is set to add each new line as a new request, WanGP
 - If you want several separate prompt ideas queued at once, choose `Each New Line Will Add a new ... Request to the Generation Queue`.
 - If `Match images and text prompts` fails, the number of images and prompts must match cleanly.
 - If `@` or `@@` seems ignored, the Prompt Enhancer is probably disabled or not used for that run.
-- If an external engine cannot be saved, enable **Deepy Prime** and complete that engine's setup in **Configuration > Prompt Enhancer / Deepy**.
+- If an external engine cannot be saved, enable **Deepy Prime** and complete that engine's setup in **Configuration > Deepy / Prompt Enhancer**.
 - If remote enhancement cannot inspect an image, confirm that the selected provider/model accepts images and that the external tool is authenticated.
 - If you do not want prompts or visual inputs to leave the machine, select a local engine instead of Codex, Claude Code, or a cloud-backed OpenCode provider.
 
